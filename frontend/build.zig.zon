@@ -1,0 +1,16 @@
+.{
+    .name = .frontend,
+    .version = "0.0.0",
+    .fingerprint = 0xcc111e9cf5ffd43f,
+    .minimum_zig_version = "0.17.0",
+    .dependencies = .{
+        .common = .{
+            .path = "../common",
+        },
+    },
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+    },
+}
