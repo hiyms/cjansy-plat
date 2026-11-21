@@ -1,9 +1,15 @@
 //! 仓颉源码的词法单元标签。
 //!
-//! 标签对应 cangjie_compiler 中 `include/cangjie/Lex/Tokens.inc` 定义的词法单元。`??`、`>>`、`>>=`、`>=`
-//! 与其他符号重叠（`??` 与嵌套可空类型后缀，`>>`、`>>=`、`>=` 与泛型参数列表的 `>`），划分方式取决于
-//! 外层是否处于泛型参数列表，因此词法分析阶段只产生构成它们的单个字符标签（`?`、`>`、`=`），由语法
-//! 分析阶段按相邻标签组合得到。
+//! 标签对应 cangjie_compiler 中 `include/cangjie/Lex/Tokens.inc` 定义的词法单元。
+//!
+//! 以下标签在词法分析阶段不直接产出，交由语法分析阶段按上下文或相邻标签处理：
+//! - `??`、`>>`、`>>=`、`>=` 与嵌套可空类型后缀或泛型参数列表的 `>` 重叠，词法阶段仅产出
+//!   单个字符标签（`quest`、`greater`、`assign`）。
+//! - `unit_literal`（`()`）在词法阶段产出 `l_paren` 与 `r_paren`。
+//! - `annotation`（`@abc`）在词法阶段产出 `at` / `at_excl` 与后续标识符。
+//! - `sentinel` 仅作解析器内部占位。
+//!
+//! 含 `${...}` 插值的单行与多行字符串在词法阶段整体分别产出 `string_literal` 与 `multiline_string`。
 
 const std = @import("std");
 const Span = @import("common.zig").Span;
@@ -297,11 +303,9 @@ pub const TokenTag = enum {
     sentinel,
     /// 字符字面量
     rune_literal,
-    /// 字符串字面量
+    /// 单行字符串字面量（含插值时词法阶段保持整体）
     string_literal,
-    /// `j"..."`
-    jstring_literal,
-    /// 多行字符串字面量
+    /// 多行字符串字面量（含插值时词法阶段保持整体）
     multiline_string,
     /// 多行原始字符串字面量
     multiline_raw_string,

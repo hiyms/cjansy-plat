@@ -56,8 +56,6 @@ pub const SyntaxKind = enum {
     rune_byte_literal,
     /// 单行字符串字面量，不含插值
     string_literal,
-    /// `J"..."`
-    jstring_literal,
     /// 多行字符串字面量
     multiline_string,
     /// 多行原始字符串字面量，开头的若干 `#` 包含在节点文本内
@@ -646,9 +644,9 @@ pub const SyntaxKind = enum {
 
 /// 把词法单元标签转换为 CST 节点标签。
 ///
-/// 只有与 CST 节点一一对应的标签才有结果：`comment` 要看注释文本才能确定是单行、块还是文档注释，
-/// `sentinel` 是解析器内部的占位，两者返回 null。`??`、`>>`、`>>=`、`>=` 没有对应的词法单元标签，
-/// 它们由语法分析阶段按相邻的单字符标签组合得到。
+/// `comment` 需按注释文本区分单行、块注释与文档注释，`sentinel` 是解析器内部占位，两者返回 null。
+/// `??`、`>>`、`>>=`、`>=`、`unit_literal`、`annotation` 及带插值的 `str_interpolation_expr`
+/// 由语法分析阶段按上下文组合或展开。
 pub fn toSyntaxKind(token_tag: TokenTag) ?SyntaxKind {
     return switch (token_tag) {
         .nl => .newline,
