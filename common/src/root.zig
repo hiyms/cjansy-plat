@@ -1,18 +1,38 @@
 //! 供其它项目依赖的公共库。
 
-const std = @import("std");
+pub const common = @import("common.zig");
+pub const token = @import("token.zig");
+pub const syntax = @import("syntax.zig");
+pub const source = @import("source.zig");
+pub const utf8 = @import("utf8.zig");
 
-/// 解析器前端与公共库之间的通用错误集合。
-pub const ParseError = error{
-    UnexpectedToken,
-    UnexpectedEndOfInput,
-    InvalidCharacter,
-};
+pub const Span = common.Span;
+pub const ParseError = common.ParseError;
 
-pub fn add(a: i32, b: i32) i32 {
-    return a + b;
-}
+pub const TokenTag = token.TokenTag;
+pub const Token = token.Token;
 
-test "add" {
-    try std.testing.expectEqual(@as(i32, 10), add(3, 7));
+pub const SyntaxKind = syntax.SyntaxKind;
+pub const toSyntaxKind = syntax.toSyntaxKind;
+
+pub const Source = source.Source;
+pub const FileId = source.FileId;
+pub const File = source.File;
+pub const FileKind = source.FileKind;
+pub const FileExtraInfo = source.FileExtraInfo;
+pub const PackageNameConstraint = source.PackageNameConstraint;
+pub const FileType = source.FileType;
+pub const Edit = source.Edit;
+pub const TextRange = source.TextRange;
+pub const Position = source.Position;
+pub const LineIndex = source.LineIndex;
+
+pub const Codepoint = utf8.Codepoint;
+
+test {
+    _ = common;
+    _ = token;
+    _ = syntax;
+    _ = source;
+    _ = utf8;
 }

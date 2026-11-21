@@ -9,12 +9,18 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
 
+    const buffer_dep = b.dependency("buffer", .{
+        .target = target,
+        .optimize = optimize,
+    });
+
     const mod = b.addModule("frontend", .{
         .root_source_file = b.path("src/root.zig"),
         .target = target,
         .optimize = optimize,
         .imports = &.{
             .{ .name = "common", .module = common_dep.module("common") },
+            .{ .name = "buffer", .module = buffer_dep.module("buffer") },
         },
     });
 

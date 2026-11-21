@@ -7,6 +7,10 @@
         .common = .{
             .path = "../common",
         },
+        .buffer = .{
+            .url = "https://github.com/karlseguin/buffer.zig/archive/dfff55fbe761c8773970bc5c6e1d5fedf5fa5bf1.tar.gz",
+            .hash = "buffer-0.0.0-nwPMfQaQAAANYflnGJIBfrC0vUWscd8DHGRzHOr5rNU0",
+        },
     },
     .paths = .{
         "build.zig",
