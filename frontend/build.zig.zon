@@ -11,6 +11,11 @@
             .url = "https://github.com/karlseguin/buffer.zig/archive/dfff55fbe761c8773970bc5c6e1d5fedf5fa5bf1.tar.gz",
             .hash = "buffer-0.0.0-nwPMfQaQAAANYflnGJIBfrC0vUWscd8DHGRzHOr5rNU0",
         },
+        .clap = .{
+            .url = "https://github.com/Hejsil/zig-clap/archive/05faf3905e8548f5cc269a8836e154065e70128d.tar.gz",
+            .hash = "clap-0.12.0-oBajB4XpAQCF1WRKnD5KOKPsnwwT_NNdAJ7Ww3irYJac",
+            .lazy = true,
+        },
     },
     .paths = .{
         "build.zig",
