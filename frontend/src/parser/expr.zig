@@ -1,3 +1,7 @@
+// This Source Code Form is subject to the terms of the Mozilla Public
+// License, v. 2.0. If a copy of the MPL was not distributed with this
+// file, You can obtain one at https://mozilla.org/MPL/2.0/.
+
 //! 仓颉表达式、语句块、控制流、`quote(...)` 与字符串插值解析模块。
 //!
 //! 表达式二元与赋值层采用 Pratt 解析，优先级与结合性以 `cangjie_spec` 为基准，

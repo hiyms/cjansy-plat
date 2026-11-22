@@ -1,3 +1,7 @@
+// This Source Code Form is subject to the terms of the Mozilla Public
+// License, v. 2.0. If a copy of the MPL was not distributed with this
+// file, You can obtain one at https://mozilla.org/MPL/2.0/.
+
 //! 行首偏移缓存：把字节偏移映射到行号与列号，并支持编辑之后的增量更新。
 //!
 //! 只把 `'\n'` 当作换行符，`'\r'` 保留在行内容里。列号以字节为单位，

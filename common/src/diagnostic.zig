@@ -1,3 +1,7 @@
+// This Source Code Form is subject to the terms of the Mozilla Public
+// License, v. 2.0. If a copy of the MPL was not distributed with this
+// file, You can obtain one at https://mozilla.org/MPL/2.0/.
+
 //! 分析平台统一的诊断数据结构，用于描述词法、语法、名称解析、类型检查与 Linter 等阶段产生的诊断信息。
 
 const std = @import("std");

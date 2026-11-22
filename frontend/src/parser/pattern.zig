@@ -1,3 +1,7 @@
+// This Source Code Form is subject to the terms of the Mozilla Public
+// License, v. 2.0. If a copy of the MPL was not distributed with this
+// file, You can obtain one at https://mozilla.org/MPL/2.0/.
+
 //! 仓颉模式语法解析模块。
 //!
 //! 覆盖通配模式、变量绑定模式、常量字面量模式（含 `()` Unit 字面量）、元组模式、

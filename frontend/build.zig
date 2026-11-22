@@ -1,3 +1,7 @@
+// This Source Code Form is subject to the terms of the Mozilla Public
+// License, v. 2.0. If a copy of the MPL was not distributed with this
+// file, You can obtain one at https://mozilla.org/MPL/2.0/.
+
 const std = @import("std");
 
 /// 构建 `frontend` 库模块、单元测试，以及在启用可执行子命令选项时构建 `cjfrontend` 可执行文件。

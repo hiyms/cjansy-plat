@@ -1,3 +1,7 @@
+// This Source Code Form is subject to the terms of the Mozilla Public
+// License, v. 2.0. If a copy of the MPL was not distributed with this
+// file, You can obtain one at https://mozilla.org/MPL/2.0/.
+
 //! 解析器前端的库入口，供 `cjfrontend` 以及其它项目依赖。
 
 pub const lexer = @import("lexer.zig");

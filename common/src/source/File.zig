@@ -1,3 +1,7 @@
+// This Source Code Form is subject to the terms of the Mozilla Public
+// License, v. 2.0. If a copy of the MPL was not distributed with this
+// file, You can obtain one at https://mozilla.org/MPL/2.0/.
+
 //! 单个文件的表示：内容缓冲、附加信息、换行缓存，以及文件的可编辑性。
 
 const std = @import("std");

@@ -1,3 +1,7 @@
+// This Source Code Form is subject to the terms of the Mozilla Public
+// License, v. 2.0. If a copy of the MPL was not distributed with this
+// file, You can obtain one at https://mozilla.org/MPL/2.0/.
+
 //! 全局源文件管理：为每个文件分配 FileId，持有内容、附加信息与换行缓存。
 //!
 //! 文件分为两类：工作区文件允许在程序运行期间通过应用 Edit 变更内容；非工作区文件

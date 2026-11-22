@@ -1,3 +1,7 @@
+// This Source Code Form is subject to the terms of the Mozilla Public
+// License, v. 2.0. If a copy of the MPL was not distributed with this
+// file, You can obtain one at https://mozilla.org/MPL/2.0/.
+
 //! 仓颉源码的词法单元标签。
 //!
 //! 标签对应 cangjie_compiler 中 `include/cangjie/Lex/Tokens.inc` 定义的词法单元。

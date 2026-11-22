@@ -1,3 +1,7 @@
+// This Source Code Form is subject to the terms of the Mozilla Public
+// License, v. 2.0. If a copy of the MPL was not distributed with this
+// file, You can obtain one at https://mozilla.org/MPL/2.0/.
+
 //! 仓颉源码的语法解析器。
 //!
 //! 以事件流（`Event`）形式产出 Lossless CST 构建指令，交由下游 `GreenBuilder` 构造只读绿树。

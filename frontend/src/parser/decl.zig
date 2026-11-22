@@ -1,3 +1,7 @@
+// This Source Code Form is subject to the terms of the Mozilla Public
+// License, v. 2.0. If a copy of the MPL was not distributed with this
+// file, You can obtain one at https://mozilla.org/MPL/2.0/.
+
 //! 仓颉顶层结构、注解、宏调用与全部声明解析模块。
 //!
 //! 覆盖 `source_file`、`features_directive`、`package_header`、`import_spec`、内置注解、

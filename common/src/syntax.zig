@@ -1,3 +1,7 @@
+// This Source Code Form is subject to the terms of the Mozilla Public
+// License, v. 2.0. If a copy of the MPL was not distributed with this
+// file, You can obtain one at https://mozilla.org/MPL/2.0/.
+
 //! 仓颉源码的 Lossless CST（具体语法树）节点标签。
 //!
 //! CST 保留源文件的全部内容，注释、空白、换行同样是树中的节点，按原始文本重建源文件时不会丢失任何字节。
