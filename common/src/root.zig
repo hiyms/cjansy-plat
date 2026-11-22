@@ -4,6 +4,7 @@ pub const common = @import("common.zig");
 pub const token = @import("token.zig");
 pub const syntax = @import("syntax.zig");
 pub const source = @import("source.zig");
+pub const diagnostic = @import("diagnostic.zig");
 pub const utf8 = @import("utf8.zig");
 
 pub const Span = common.Span;
@@ -27,6 +28,11 @@ pub const TextRange = source.TextRange;
 pub const Position = source.Position;
 pub const LineIndex = source.LineIndex;
 
+pub const Severity = diagnostic.Severity;
+pub const DiagnosticSource = diagnostic.Source;
+pub const RelatedInfo = diagnostic.RelatedInfo;
+pub const Diagnostic = diagnostic.Diagnostic;
+
 pub const Codepoint = utf8.Codepoint;
 
 test {
@@ -34,5 +40,6 @@ test {
     _ = token;
     _ = syntax;
     _ = source;
+    _ = diagnostic;
     _ = utf8;
 }

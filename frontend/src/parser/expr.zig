@@ -1859,7 +1859,7 @@ fn parseInterpolationBlock(p: *Parser, local_start: u32, local_end: u32) std.mem
     try child.finishNode();
 
     try p.events.appendSlice(p.allocator, child.events.items);
-    p.error_count += child.error_count;
+    try p.errors.appendSlice(p.allocator, child.errors.items);
     if (local_end > p.emitted_pos) {
         p.emitted_pos = local_end;
     }

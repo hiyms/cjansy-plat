@@ -294,7 +294,7 @@ pub fn tryParseExprTypeArguments(p: *Parser) std.mem.Allocator.Error!bool {
     const cp = p.checkpoint();
     try parseTypeArgumentList(p);
 
-    if (p.error_count == cp.error_count and !closingGreaterFormsCombinedAssign(p) and isValidAfterExprTypeArgs(p)) {
+    if (p.errors.items.len == cp.error_len and !closingGreaterFormsCombinedAssign(p) and isValidAfterExprTypeArgs(p)) {
         return true;
     }
 
@@ -309,7 +309,7 @@ pub fn tryParsePatternTypeArguments(p: *Parser) std.mem.Allocator.Error!bool {
     const cp = p.checkpoint();
     try parseTypeArgumentList(p);
 
-    if (p.error_count == cp.error_count and !closingGreaterFormsCombinedAssign(p)) {
+    if (p.errors.items.len == cp.error_len and !closingGreaterFormsCombinedAssign(p)) {
         const next = p.peek();
         if (next == .dot or next == .l_paren or next == .double_arrow or
             next == .bit_or or next == .kw_where or next == .comma or

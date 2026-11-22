@@ -47,7 +47,124 @@ pub const ParseErrorCode = enum(u8) {
 pub const ParseError = struct {
     code: ParseErrorCode,
     range: common.TextRange,
+
+    /// 将当前 `ParseError` 转换为平台统一的 `common.Diagnostic`。
+    ///
+    /// 若错误消息可在编译期确定，则返回的 `Diagnostic.message` 为静态字符串切片（不经过
+    /// `allocator` 分配，不可单独释放）；仅当需拼接源码片段时通过 `allocator` 分配内存。
+    /// 推荐传入 `ArenaAllocator` 统一管理诊断消息的生命周期。
+    pub inline fn toDiagnostic(
+        self: ParseError,
+        allocator: std.mem.Allocator,
+        file: common.FileId,
+        source: []const u8,
+    ) std.mem.Allocator.Error!common.Diagnostic {
+        return parseErrorToDiagnostic(allocator, file, source, self);
+    }
 };
+
+/// 诊断消息中嵌入源码片段的最大字节长度（按合法 UTF-8 码点边界截断）。
+const max_snippet_bytes: usize = 32;
+
+/// 安全提取用于诊断展示的单行源码片段；区间越界、倒置、为空或首行仅空白时返回 `null`。
+///
+/// 返回的切片借用自 `source`，调用者不可释放，生命周期不超过 `source`。
+fn extractDiagnosticSnippet(source: []const u8, range: common.TextRange) ?[]const u8 {
+    if (range.start >= range.end or range.end > source.len) return null;
+    var slice = source[range.start..range.end];
+    if (std.mem.indexOfAny(u8, slice, "\r\n")) |nl_pos| {
+        slice = slice[0..nl_pos];
+    }
+    slice = std.mem.trim(u8, slice, " \t\x0c");
+    if (slice.len == 0) return null;
+    if (slice.len <= max_snippet_bytes) return slice;
+
+    // 按 UTF-8 码点边界截断，避免切断多字节字符
+    var pos: usize = 0;
+    while (pos < slice.len) {
+        const cp = common.utf8.decodeAt(slice, pos) orelse break;
+        if (pos + cp.len > max_snippet_bytes) break;
+        pos += cp.len;
+    }
+    return if (pos > 0) slice[0..pos] else null;
+}
+
+/// 将单个 `ParseError` 转换为平台统一的 `common.Diagnostic`。
+///
+/// 遵循诊断消息混合所有权约定：
+/// - 对于编译期可完全确定的错误码，或 `err.range` 无有效可展示源码片段时，`Diagnostic.message`
+///   直接返回编译期静态字符串切片，不调用 `allocator`，调用者不可对其单独 `free`。
+/// - 对于需要拼入源码片段的错误，通过 `allocator` 分配 `Diagnostic.message`。
+/// - `Diagnostic.related` 始终为空静态切片，`source` 仅作只读借用。
+/// 推荐传入 `ArenaAllocator` 统一托管诊断消息的生命周期。
+pub fn parseErrorToDiagnostic(
+    allocator: std.mem.Allocator,
+    file: common.FileId,
+    source: []const u8,
+    err: ParseError,
+) std.mem.Allocator.Error!common.Diagnostic {
+    const message: []const u8 = switch (err.code) {
+        // 编译期完全确定的固定错误消息：零堆分配
+        .recursive_depth_limit => "syntax nesting exceeds maximum recursion depth",
+        .non_associative_comparison => "comparison operators are non-associative",
+        .non_associative_assignment => "assignment operators are non-associative",
+        .non_associative_operator => "operator is non-associative",
+        .invalid_assignment_target => "invalid assignment target",
+        .unclosed_delimiter => "unclosed delimiter",
+        .invalid_interpolation => "invalid string interpolation",
+
+        // 存在有效源码片段时动态格式化，否则直接返回编译期静态字符串（零分配）
+        .expected_expression => if (extractDiagnosticSnippet(source, err.range)) |s|
+            try std.fmt.allocPrint(allocator, "expected expression near `{s}`", .{s})
+        else
+            "expected expression",
+        .expected_token => if (extractDiagnosticSnippet(source, err.range)) |s|
+            try std.fmt.allocPrint(allocator, "expected token near `{s}`", .{s})
+        else
+            "expected token",
+        .expected_item => if (extractDiagnosticSnippet(source, err.range)) |s|
+            try std.fmt.allocPrint(allocator, "expected declaration or item near `{s}`", .{s})
+        else
+            "expected declaration or item",
+        .invalid_literal => if (extractDiagnosticSnippet(source, err.range)) |s|
+            try std.fmt.allocPrint(allocator, "invalid literal `{s}`", .{s})
+        else
+            "invalid literal",
+        .expected_type => if (extractDiagnosticSnippet(source, err.range)) |s|
+            try std.fmt.allocPrint(allocator, "expected type near `{s}`", .{s})
+        else
+            "expected type",
+        .expected_pattern => if (extractDiagnosticSnippet(source, err.range)) |s|
+            try std.fmt.allocPrint(allocator, "expected pattern near `{s}`", .{s})
+        else
+            "expected pattern",
+        .expected_identifier => if (extractDiagnosticSnippet(source, err.range)) |s|
+            try std.fmt.allocPrint(allocator, "expected identifier near `{s}`", .{s})
+        else
+            "expected identifier",
+        .expected_block => if (extractDiagnosticSnippet(source, err.range)) |s|
+            try std.fmt.allocPrint(allocator, "expected block near `{s}`", .{s})
+        else
+            "expected block",
+        .illegal_token => if (extractDiagnosticSnippet(source, err.range)) |s|
+            try std.fmt.allocPrint(allocator, "illegal token `{s}`", .{s})
+        else
+            "illegal token",
+        .unexpected_token => if (extractDiagnosticSnippet(source, err.range)) |s|
+            try std.fmt.allocPrint(allocator, "unexpected token `{s}`", .{s})
+        else
+            "unexpected token",
+    };
+
+    return .{
+        .file = file,
+        .range = err.range,
+        .severity = .err,
+        .source = .parser,
+        .message = message,
+        .related = &.{},
+    };
+}
 
 /// 词法叶子事件，携带经语法分析确定后的 CST 叶子标签与源码字节区间。
 pub const TokenEvent = struct {
@@ -87,13 +204,13 @@ pub const Restrictions = packed struct {
     allow_let_condition: bool = false,
 };
 
-/// 前瞻回溯检查点，完整保存游标、事件缓冲长度、已发射字节位置、递归深度、错误计数与上下文限制。
+/// 前瞻回溯检查点，完整保存游标、事件缓冲长度、已发射字节位置、递归深度、错误列表长度与上下文限制。
 pub const Checkpoint = struct {
     cursor: usize,
     event_len: usize,
     emitted_pos: u32,
     depth: u32,
-    error_count: usize,
+    error_len: usize,
     restrictions: Restrictions,
 };
 
@@ -166,21 +283,21 @@ pub const Parser = struct {
     emitted_pos: u32 = 0,
     /// 内部事件缓冲区，由 `allocator` 分配并在 `deinit` 时释放。
     events: std.ArrayList(Event) = .empty,
+    /// 解析过程中产生的全部 `ParseError`，由 `allocator` 分配并在 `deinit` 时释放。
+    errors: std.ArrayList(ParseError) = .empty,
     /// 下一次 `gen` 将要返回的事件下标。
     read_index: usize = 0,
     /// 是否已完成整份输入的解析。
     parsed: bool = false,
     /// 当前递归嵌套深度。
     depth: u32 = 0,
-    /// 已记录的解析错误数量，供回溯判定试探是否产生新错误。
-    error_count: usize = 0,
     /// 当前语法上下文限制标志。
     restrictions: Restrictions = .{},
 
     /// 创建语法解析器。
     ///
     /// `source` 与 `tokens` 均借用自调用者，本结构体不复制也不负责释放它们的内存；
-    /// 使用结束后调用者须调用 `deinit` 释放内部事件缓冲区。
+    /// 使用结束后调用者须调用 `deinit` 释放内部事件与错误缓冲区。
     pub fn new(
         allocator: std.mem.Allocator,
         source: []const u8,
@@ -195,27 +312,28 @@ pub const Parser = struct {
         };
     }
 
-    /// 释放解析器内部的事件缓冲区内存。
+    /// 释放解析器内部的事件缓冲区与 `errors` 错误列表内存。
     ///
     /// 不释放构造时借用的 `source` 与 `tokens`。
     pub fn deinit(self: *Parser) void {
         self.events.deinit(self.allocator);
+        self.errors.deinit(self.allocator);
         self.* = undefined;
     }
 
     /// 产出下一个解析事件；全部事件消费完毕后返回 `null`。
     ///
-    /// 首次调用时执行整份源文件的完整语法解析并将事件写入内部缓冲；若期间发生内存不足，
-    /// 会清空半成品事件并复位全部状态，避免后续读取到残缺事件流。
+    /// 首次调用时执行整份源文件的完整语法解析并将事件写入 `events`、错误写入 `errors`；
+    /// 若期间发生内存不足，会清空半成品数据并复位全部状态，避免后续读取到残缺状态。
     pub fn gen(self: *Parser) std.mem.Allocator.Error!?Event {
         if (!self.parsed) {
             errdefer {
                 self.events.clearRetainingCapacity();
+                self.errors.clearRetainingCapacity();
                 self.cursor = 0;
                 self.emitted_pos = 0;
                 self.read_index = 0;
                 self.depth = 0;
-                self.error_count = 0;
                 self.restrictions = .{};
                 self.parsed = false;
             }
@@ -490,7 +608,7 @@ pub const Parser = struct {
             .event_len = self.events.items.len,
             .emitted_pos = self.emitted_pos,
             .depth = self.depth,
-            .error_count = self.error_count,
+            .error_len = self.errors.items.len,
             .restrictions = self.restrictions,
         };
     }
@@ -501,7 +619,7 @@ pub const Parser = struct {
         self.events.shrinkRetainingCapacity(cp.event_len);
         self.emitted_pos = cp.emitted_pos;
         self.depth = cp.depth;
-        self.error_count = cp.error_count;
+        self.errors.shrinkRetainingCapacity(cp.error_len);
         self.restrictions = cp.restrictions;
     }
 
@@ -541,11 +659,13 @@ pub const Parser = struct {
         try self.emitErrorAt(code, self.currentErrorRange());
     }
 
-    /// 在指定全局字节区间记录一条语法错误诊断。
+    /// 在指定全局字节区间记录一条语法错误诊断，同时存入 `errors` 成员与事件流。
     pub fn emitErrorAt(self: *Parser, code: ParseErrorCode, range: common.TextRange) std.mem.Allocator.Error!void {
-        self.error_count += 1;
+        const err_item: ParseError = .{ .code = code, .range = range };
+        try self.errors.append(self.allocator, err_item);
+        errdefer _ = self.errors.pop();
         try self.events.append(self.allocator, .{
-            .parse_error = .{ .code = code, .range = range },
+            .parse_error = err_item,
         });
     }
 
@@ -1196,6 +1316,7 @@ fn parseTokensAndVerify(
 
     try std.testing.expectEqual(@as(usize, 0), frames.items.len);
     try std.testing.expect(root_opt != null);
+    try std.testing.expectEqualSlices(ParseError, parser.errors.items, errors.items);
     var root = root_opt.?;
 
     if (check_lossless) {
@@ -2191,5 +2312,102 @@ test "LSP 逐字符实时输入前缀测试：任意截断位置均无损且事�
         const prefix = sample[0..prefix_len];
         var res = try parseAndVerify(gpa, prefix);
         defer res.deinit(gpa);
+    }
+}
+
+test "Parser.errors 与 parseErrorToDiagnostic 零分配静态消息及动态片段格式化" {
+    const gpa = std.testing.allocator;
+    const file_id: common.FileId = .{ .index = 3, .generation = 1 };
+
+    // 1. 编译期确定消息的错误码使用 failing_allocator 验证严格零堆分配
+    const static_codes = [_]ParseErrorCode{
+        .recursive_depth_limit,
+        .non_associative_comparison,
+        .non_associative_assignment,
+        .non_associative_operator,
+        .invalid_assignment_target,
+        .unclosed_delimiter,
+        .invalid_interpolation,
+    };
+    for (static_codes) |code| {
+        const err_item: ParseError = .{ .code = code, .range = .{ .start = 0, .end = 3 } };
+        const diag = try err_item.toDiagnostic(std.testing.failing_allocator, file_id, "abc");
+        try std.testing.expectEqual(file_id, diag.file);
+        try std.testing.expectEqual(err_item.range, diag.range);
+        try std.testing.expectEqual(common.Severity.err, diag.severity);
+        try std.testing.expect(common.DiagnosticSource.eql(.parser, diag.source));
+        try std.testing.expect(diag.message.len > 0);
+        try std.testing.expectEqual(@as(usize, 0), diag.related.len);
+    }
+
+    // 2. 需源码片段的错误码在空区间、越界与倒置区间下同样零分配返回编译期静态消息
+    const snippet_codes = [_]ParseErrorCode{
+        .expected_expression,
+        .expected_token,
+        .expected_item,
+        .invalid_literal,
+        .expected_type,
+        .expected_pattern,
+        .expected_identifier,
+        .expected_block,
+        .illegal_token,
+        .unexpected_token,
+    };
+    const invalid_ranges = [_]common.TextRange{
+        .{ .start = 0, .end = 0 },
+        .{ .start = 5, .end = 2 },
+        .{ .start = 0, .end = 999 },
+    };
+    for (snippet_codes) |code| {
+        for (invalid_ranges) |r| {
+            const diag = try parseErrorToDiagnostic(std.testing.failing_allocator, file_id, "let x", .{
+                .code = code,
+                .range = r,
+            });
+            try std.testing.expect(diag.message.len > 0);
+        }
+    }
+
+    // 3. 有效源码片段动态格式化与多字节 UTF-8 截断安全校验
+    {
+        var arena = std.heap.ArenaAllocator.init(gpa);
+        defer arena.deinit();
+        const alloc = arena.allocator();
+
+        const long_utf8 = "这是一段非常非常长的中文标识符用于测试按码点截断边界不会破坏编码";
+        for (snippet_codes) |code| {
+            const diag = try parseErrorToDiagnostic(alloc, file_id, long_utf8, .{
+                .code = code,
+                .range = .{ .start = 0, .end = @intCast(long_utf8.len) },
+            });
+            try std.testing.expect(std.unicode.utf8ValidateSlice(diag.message));
+            try std.testing.expect(std.mem.indexOf(u8, diag.message, "这是一段") != null);
+        }
+    }
+
+    // 4. 完整解析流程：验证 Parser.errors 包含插值子解析错误、排除回溯临时错误并转换为 Diagnostic 数组
+    {
+        const src = "let ok = a < b && c > d\nlet bad = \"hi ${a < b < c}\"\n";
+        var tok_list: std.ArrayList(common.Token) = .empty;
+        defer tok_list.deinit(gpa);
+
+        var lex = try lexer.Lexer.new(src);
+        while (true) {
+            const tok = try lex.gen();
+            try tok_list.append(gpa, tok);
+            if (tok.tag == .end) break;
+        }
+
+        var parser = Parser.new(gpa, src, tok_list.items);
+        defer parser.deinit();
+        while (try parser.gen()) |_| {}
+
+        try std.testing.expectEqual(@as(usize, 1), parser.errors.items.len);
+        try std.testing.expectEqual(ParseErrorCode.non_associative_comparison, parser.errors.items[0].code);
+
+        const diag = try parser.errors.items[0].toDiagnostic(std.testing.failing_allocator, file_id, src);
+        try std.testing.expectEqual(file_id, diag.file);
+        try std.testing.expectEqual(common.Severity.err, diag.severity);
+        try std.testing.expectEqualStrings("comparison operators are non-associative", diag.message);
     }
 }
