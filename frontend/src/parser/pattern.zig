@@ -63,10 +63,11 @@ pub fn parsePattern(p: *Parser, allow_type_pattern: bool) std.mem.Allocator.Erro
         },
         else => {
             if (Parser.isIdentLike(tag)) {
-                if (allow_type_pattern and p.peekNth(1) == .colon) {
+                const next = p.peekNth(1);
+                if (allow_type_pattern and next == .colon) {
                     try parseTypePattern(p);
                 } else {
-                    try parseIdentOrEnumPattern(p, allow_type_pattern);
+                    try parseIdentOrEnumPattern(p, allow_type_pattern, next);
                 }
             } else {
                 try p.emitError(.expected_pattern);
@@ -128,8 +129,10 @@ fn parseTuplePattern(p: *Parser, allow_type_pattern: bool) std.mem.Allocator.Err
         const before = p.cursor;
         try parsePattern(p, allow_type_pattern);
         if (try p.eat(.comma)) {
-            if (p.shouldStopList(.pattern_list)) break;
-        } else if (p.canStartPattern() and !p.shouldStopList(.pattern_list)) {
+            continue;
+        } else if (p.shouldStopList(.pattern_list)) {
+            break;
+        } else if (p.canStartPattern()) {
             try p.emitError(.expected_token);
         } else {
             break;
@@ -143,8 +146,7 @@ fn parseTuplePattern(p: *Parser, allow_type_pattern: bool) std.mem.Allocator.Err
 }
 
 /// 区分单标识符变量绑定模式（`var_pattern`）与枚举构造器模式（`enum_pattern`，含点分路径或参数括号）。
-fn parseIdentOrEnumPattern(p: *Parser, allow_type_pattern: bool) std.mem.Allocator.Error!void {
-    const next = p.peekNth(1);
+fn parseIdentOrEnumPattern(p: *Parser, allow_type_pattern: bool, next: TokenTag) std.mem.Allocator.Error!void {
     const maybe_enum = next == .dot or next == .l_paren or next == .less;
     if (!maybe_enum) {
         try p.startNode(.var_pattern);
@@ -175,8 +177,10 @@ fn parseIdentOrEnumPattern(p: *Parser, allow_type_pattern: bool) std.mem.Allocat
             const before = p.cursor;
             try parsePattern(p, allow_type_pattern);
             if (try p.eat(.comma)) {
-                if (p.shouldStopList(.pattern_list)) break;
-            } else if (p.canStartPattern() and !p.shouldStopList(.pattern_list)) {
+                continue;
+            } else if (p.shouldStopList(.pattern_list)) {
+                break;
+            } else if (p.canStartPattern()) {
                 try p.emitError(.expected_token);
             } else {
                 break;

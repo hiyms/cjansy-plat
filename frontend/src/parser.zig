@@ -199,6 +199,74 @@ pub const Event = union(enum) {
     parse_error: ParseError,
 };
 
+/// 内部紧凑事件存储（12 字节），避免对外 `Event` 联合体的尾部填充开销。
+pub const CompactEvent = struct {
+    /// 紧凑事件类型标签。
+    pub const Tag = enum(u8) {
+        start_node,
+        wrap_node,
+        token,
+        finish_node,
+        parse_error,
+    };
+
+    range: common.TextRange = .{ .start = 0, .end = 0 },
+    payload: u16 = 0,
+    tag: Tag,
+
+    /// 构造 `start_node` 紧凑事件。
+    pub inline fn startNode(kind: SyntaxKind) CompactEvent {
+        return .{ .payload = @backingInt(kind), .tag = .start_node };
+    }
+
+    /// 构造 `wrap_node` 紧凑事件。
+    pub inline fn wrapNode(kind: SyntaxKind) CompactEvent {
+        return .{ .payload = @backingInt(kind), .tag = .wrap_node };
+    }
+
+    /// 构造 `token` 紧凑事件。
+    pub inline fn token(kind: SyntaxKind, range: common.TextRange) CompactEvent {
+        return .{ .range = range, .payload = @backingInt(kind), .tag = .token };
+    }
+
+    /// 构造 `finish_node` 紧凑事件。
+    pub inline fn finishNode() CompactEvent {
+        return .{ .tag = .finish_node };
+    }
+
+    /// 构造 `parse_error` 紧凑事件。
+    pub inline fn parseError(err: ParseError) CompactEvent {
+        return .{ .range = err.range, .payload = @backingInt(err.code), .tag = .parse_error };
+    }
+
+    /// 转换为对外导出的 `Event`。
+    pub inline fn toEvent(self: CompactEvent) Event {
+        return switch (self.tag) {
+            .start_node => .{ .start_node = @fromBackingInt(@intCast(self.payload)) },
+            .wrap_node => .{ .wrap_node = @fromBackingInt(@intCast(self.payload)) },
+            .token => .{ .token = .{ .kind = @fromBackingInt(@intCast(self.payload)), .range = self.range } },
+            .finish_node => .finish_node,
+            .parse_error => .{ .parse_error = .{
+                .code = @fromBackingInt(@intCast(self.payload)),
+                .range = self.range,
+            } },
+        };
+    }
+};
+
+comptime {
+    std.debug.assert(@sizeOf(CompactEvent) == 12);
+}
+
+/// 编译期构造的非注释词法标签到 CST 叶子标签的直接查找表（`.sentinel` 与 `.comment` 占位为 `.illegal`）。
+const non_comment_syntax_table: [@typeInfo(TokenTag).@"enum".field_names.len]SyntaxKind = blk: {
+    var table: [@typeInfo(TokenTag).@"enum".field_names.len]SyntaxKind = @splat(.illegal);
+    for (std.enums.values(TokenTag)) |tag| {
+        table[@backingInt(tag)] = common.toSyntaxKind(tag) orelse .illegal;
+    }
+    break :blk table;
+};
+
 /// 解析上下文限制标志，控制尾随闭包、区间步长、半开切片与 `if`/`while` 的 `let` 解构条件。
 pub const Restrictions = packed struct {
     /// 是否允许表达式后紧跟尾随 lambda（在 `if`、`while`、`match` 条件与 `for-in` 迭代源中关闭）。
@@ -211,9 +279,13 @@ pub const Restrictions = packed struct {
     allow_let_condition: bool = false,
 };
 
-/// 前瞻回溯检查点，完整保存游标、事件缓冲长度、已发射字节位置、递归深度、错误列表长度与上下文限制。
+/// 前瞻回溯检查点，完整保存游标、前瞻缓存、事件缓冲长度、已发射字节位置、递归深度、错误列表长度与上下文限制。
 pub const Checkpoint = struct {
     cursor: usize,
+    sig_no_nl_idx: usize,
+    sig_no_nl_tag: TokenTag,
+    sig_idx: usize,
+    sig_tag: TokenTag,
     event_len: usize,
     emitted_pos: u32,
     depth: u32,
@@ -287,10 +359,18 @@ pub const Parser = struct {
     base_offset: u32 = 0,
     /// 当前尚未处理的词法单元下标。
     cursor: usize = 0,
+    /// 自当前游标起跳过注释后的首个词法单元下标（越界时为 `tokens.len`）。
+    sig_no_nl_idx: usize = 0,
+    /// `sig_no_nl_idx` 对应的词法标签（越界时为 `.end`）。
+    sig_no_nl_tag: TokenTag = .end,
+    /// 自当前游标起跳过注释与换行后的首个词法单元下标（越界时为 `tokens.len`）。
+    sig_idx: usize = 0,
+    /// `sig_tag` 为 `sig_idx` 对应的词法标签（越界时为 `.end`）。
+    sig_tag: TokenTag = .end,
     /// 相对于 `source` 已发射到事件流的字节位置，用于合成 `SyntaxKind.whitespace`。
     emitted_pos: u32 = 0,
-    /// 内部事件缓冲区，由 `allocator` 分配并在 `deinit` 时释放。
-    events: std.ArrayList(Event) = .empty,
+    /// 内部紧凑事件缓冲区，由 `allocator` 分配并在 `deinit` 时释放。
+    events: std.ArrayList(CompactEvent) = .empty,
     /// 解析过程中产生的全部 `ParseError`，由 `allocator` 分配并在 `deinit` 时释放。
     errors: std.ArrayList(ParseError) = .empty,
     /// 下一次 `gen` 将要返回的事件下标。
@@ -312,12 +392,14 @@ pub const Parser = struct {
         tokens: []const common.Token,
     ) Parser {
         const clamped_len: u32 = @intCast(@min(source.len, std.math.maxInt(u32)));
-        return .{
+        var p: Parser = .{
             .allocator = allocator,
             .source = source,
             .tokens = tokens,
             .source_len = clamped_len,
         };
+        p.syncLookahead();
+        return p;
     }
 
     /// 释放解析器内部的事件缓冲区与 `errors` 错误列表内存。
@@ -329,27 +411,79 @@ pub const Parser = struct {
         self.* = undefined;
     }
 
+    /// 单趟从 `self.cursor` 同步更新跳过注释与换行的前瞻下标与标签缓存。
+    pub inline fn syncLookahead(self: *Parser) void {
+        const toks = self.tokens;
+        var idx = self.cursor;
+        while (idx < toks.len and toks[idx].tag == .comment) : (idx += 1) {}
+        self.sig_no_nl_idx = idx;
+        if (idx >= toks.len) {
+            self.sig_no_nl_tag = .end;
+            self.sig_idx = toks.len;
+            self.sig_tag = .end;
+            return;
+        }
+        const no_nl_tag = toks[idx].tag;
+        self.sig_no_nl_tag = no_nl_tag;
+        if (no_nl_tag != .nl) {
+            self.sig_idx = idx;
+            self.sig_tag = no_nl_tag;
+            return;
+        }
+        idx += 1;
+        while (idx < toks.len) : (idx += 1) {
+            const tag = toks[idx].tag;
+            if (tag != .comment and tag != .nl) {
+                self.sig_idx = idx;
+                self.sig_tag = tag;
+                return;
+            }
+        }
+        self.sig_idx = toks.len;
+        self.sig_tag = .end;
+    }
+
+    /// 更新当前游标并立即同步前瞻缓存。
+    pub inline fn setCursor(self: *Parser, new_cursor: usize) void {
+        self.cursor = new_cursor;
+        self.syncLookahead();
+    }
+
+    /// 首次调用 `gen` 时执行的整文件解析冷路径：按词法单元数量一次性预分配事件缓冲，
+    /// 若期间发生内存不足则清空半成品数据并复位全部状态。
+    fn parseOnce(self: *Parser) std.mem.Allocator.Error!void {
+        @branchHint(.cold);
+        errdefer {
+            self.events.clearRetainingCapacity();
+            self.errors.clearRetainingCapacity();
+            self.setCursor(0);
+            self.emitted_pos = 0;
+            self.read_index = 0;
+            self.depth = 0;
+            self.restrictions = .{};
+            self.parsed = false;
+        }
+        if (self.events.capacity == 0) {
+            const est_cap: usize = if (self.tokens.len == 0)
+                8
+            else
+                (self.tokens.len *| 3) +| (self.tokens.len >> 1) +| 32;
+            try self.events.ensureTotalCapacityPrecise(self.allocator, est_cap);
+        }
+        try decl.parseSourceFile(self);
+        self.parsed = true;
+    }
+
     /// 产出下一个解析事件；全部事件消费完毕后返回 `null`。
     ///
     /// 首次调用时执行整份源文件的完整语法解析并将事件写入 `events`、错误写入 `errors`；
     /// 若期间发生内存不足，会清空半成品数据并复位全部状态，避免后续读取到残缺状态。
-    pub fn gen(self: *Parser) std.mem.Allocator.Error!?Event {
+    pub inline fn gen(self: *Parser) std.mem.Allocator.Error!?Event {
         if (!self.parsed) {
-            errdefer {
-                self.events.clearRetainingCapacity();
-                self.errors.clearRetainingCapacity();
-                self.cursor = 0;
-                self.emitted_pos = 0;
-                self.read_index = 0;
-                self.depth = 0;
-                self.restrictions = .{};
-                self.parsed = false;
-            }
-            try decl.parseSourceFile(self);
-            self.parsed = true;
+            try self.parseOnce();
         }
         if (self.read_index >= self.events.items.len) return null;
-        const ev = self.events.items[self.read_index];
+        const ev = self.events.items[self.read_index].toEvent();
         self.read_index += 1;
         return ev;
     }
@@ -475,59 +609,56 @@ pub const Parser = struct {
 
     /// 将任意词法单元转换为对应的 CST 叶子标签。
     pub inline fn tokenToSyntaxKind(self: *const Parser, tok: common.Token) SyntaxKind {
-        return switch (tok.tag) {
-            .comment => self.classifyComment(tok),
-            .sentinel => .illegal,
-            else => common.toSyntaxKind(tok.tag) orelse .illegal,
-        };
+        if (tok.tag == .comment) return self.classifyComment(tok);
+        return non_comment_syntax_table[@backingInt(tok.tag)];
     }
 
     /// 返回自 `start_idx` 起跳过注释（以及可选跳过换行）后的首个词法单元下标；到达末尾返回 `tokens.len`。
-    pub fn nextSignificantIndex(self: *const Parser, start_idx: usize, skip_nl: bool) usize {
+    pub inline fn nextSignificantIndex(self: *const Parser, start_idx: usize, skip_nl: bool) usize {
         var idx = start_idx;
-        while (idx < self.tokens.len) : (idx += 1) {
-            const tag = self.tokens[idx].tag;
+        const toks = self.tokens;
+        while (idx < toks.len) : (idx += 1) {
+            const tag = toks[idx].tag;
             if (tag == .comment) continue;
             if (skip_nl and tag == .nl) continue;
             return idx;
         }
-        return self.tokens.len;
+        return toks.len;
     }
 
     /// 只读查询自当前游标起第 `nth`（从 0 起）个非 Trivia 词法单元下标；越界返回 `null`。
     pub fn peekIndexNth(self: *const Parser, nth: usize, skip_nl: bool) ?usize {
-        var idx = self.cursor;
-        var count: usize = 0;
-        while (idx < self.tokens.len) {
-            const tag = self.tokens[idx].tag;
-            if (tag == .comment or (skip_nl and tag == .nl)) {
-                idx += 1;
-                continue;
-            }
+        const first_idx = if (skip_nl) self.sig_idx else self.sig_no_nl_idx;
+        const first_tag = if (skip_nl) self.sig_tag else self.sig_no_nl_tag;
+        if (first_idx >= self.tokens.len or first_tag == .end) return null;
+        if (nth == 0) return first_idx;
+
+        var idx = first_idx + 1;
+        var count: usize = 1;
+        const toks = self.tokens;
+        while (idx < toks.len) : (idx += 1) {
+            const tag = toks[idx].tag;
+            if (tag == .comment or (skip_nl and tag == .nl)) continue;
             if (tag == .end) return null;
             if (count == nth) return idx;
             count += 1;
-            idx += 1;
         }
         return null;
     }
 
     /// 只读前瞻当前有效词法单元标签（跳过注释与换行）；到达文件尾返回 `.end`。
     pub inline fn peek(self: *const Parser) TokenTag {
-        const idx = self.nextSignificantIndex(self.cursor, true);
-        if (idx >= self.tokens.len) return .end;
-        return self.tokens[idx].tag;
+        return self.sig_tag;
     }
 
     /// 只读前瞻当前有效词法单元标签（仅跳过注释，保留换行 `.nl`）；到达文件尾返回 `.end`。
     pub inline fn peekNoNl(self: *const Parser) TokenTag {
-        const idx = self.nextSignificantIndex(self.cursor, false);
-        if (idx >= self.tokens.len) return .end;
-        return self.tokens[idx].tag;
+        return self.sig_no_nl_tag;
     }
 
     /// 只读前瞻第 `nth`（从 0 起）个跳过注释与换行后的词法单元标签；越界返回 `.end`。
     pub inline fn peekNth(self: *const Parser, nth: usize) TokenTag {
+        if (nth == 0) return self.sig_tag;
         const idx = self.peekIndexNth(nth, true) orelse return .end;
         return self.tokens[idx].tag;
     }
@@ -541,51 +672,42 @@ pub const Parser = struct {
     }
 
     /// 只读判断当前游标至下一个有效词法单元之间是否存在换行符。
-    pub fn hasNewlineBefore(self: *const Parser) bool {
-        var idx = self.cursor;
-        while (idx < self.tokens.len) : (idx += 1) {
-            const tag = self.tokens[idx].tag;
-            if (tag == .nl) return true;
-            if (tag == .comment) continue;
-            return false;
-        }
-        return false;
+    pub inline fn hasNewlineBefore(self: *const Parser) bool {
+        return self.sig_no_nl_tag == .nl;
     }
 
     /// 只读判断当前是否位于指定标签上（跳过注释与换行）。
     pub inline fn at(self: *const Parser, tag: TokenTag) bool {
-        return self.peek() == tag;
+        return self.sig_tag == tag;
     }
 
     /// 只读判断当前位置是否匹配指定标识符文本（跳过注释与换行，要求为普通 `.identifier`）。
     pub inline fn atIdentText(self: *const Parser, expected: []const u8) bool {
-        const idx = self.nextSignificantIndex(self.cursor, true);
-        if (idx >= self.tokens.len) return false;
-        const tok = self.tokens[idx];
-        if (tok.tag != .identifier) return false;
-        return std.mem.eql(u8, self.tokenText(tok), expected);
+        if (self.sig_tag != .identifier) return false;
+        return std.mem.eql(u8, self.tokenText(self.tokens[self.sig_idx]), expected);
     }
 
     /// 只读判断当前位置（跳过注释，可选跳过换行）是否构成相邻的组合运算符（`??`、`>>`、`>>=`、`>=`）。
-    pub fn peekCombinedOp(self: *const Parser, skip_nl: bool) ?CombinedOp {
-        const idx = self.nextSignificantIndex(self.cursor, skip_nl);
+    pub inline fn peekCombinedOp(self: *const Parser, skip_nl: bool) ?CombinedOp {
+        const idx = if (skip_nl) self.sig_idx else self.sig_no_nl_idx;
         return self.combinedOpAt(idx);
     }
 
     /// 只读判断给定下标处是否构成物理相邻的组合运算符（`??`、`>>`、`>>=`、`>=`）。
-    pub fn combinedOpAt(self: *const Parser, idx: usize) ?CombinedOp {
+    pub inline fn combinedOpAt(self: *const Parser, idx: usize) ?CombinedOp {
         if (idx >= self.tokens.len or self.tokens.len - idx < 2) return null;
         const t0 = self.tokens[idx];
+        if (t0.tag != .quest and t0.tag != .greater) return null;
         const t1 = self.tokens[idx + 1];
         if (t0.span.end != t1.span.start) return null;
 
-        if (t0.tag == .quest and t1.tag == .quest) {
-            return .{ .kind = .coalescing, .token_count = 2 };
+        if (t0.tag == .quest) {
+            return if (t1.tag == .quest) .{ .kind = .coalescing, .token_count = 2 } else null;
         }
-        if (t0.tag == .greater and t1.tag == .assign) {
+        if (t1.tag == .assign) {
             return .{ .kind = .greater_equal, .token_count = 2 };
         }
-        if (t0.tag == .greater and t1.tag == .greater) {
+        if (t1.tag == .greater) {
             if (self.tokens.len - idx >= 3) {
                 const t2 = self.tokens[idx + 2];
                 if (t1.span.end == t2.span.start and t2.tag == .assign) {
@@ -604,9 +726,8 @@ pub const Parser = struct {
 
     /// 只读返回当前有效词法单元对应的全局字节区间（用于错误定位）。
     pub fn currentErrorRange(self: *const Parser) common.TextRange {
-        const idx = self.nextSignificantIndex(self.cursor, true);
-        if (idx < self.tokens.len and self.tokens[idx].tag != .end) {
-            const r = self.safeRange(self.tokens[idx].span);
+        if (self.sig_idx < self.tokens.len and self.sig_tag != .end) {
+            const r = self.safeRange(self.tokens[self.sig_idx].span);
             return .{
                 .start = self.globalPos(r.start),
                 .end = self.globalPos(r.end),
@@ -620,6 +741,10 @@ pub const Parser = struct {
     pub inline fn checkpoint(self: *const Parser) Checkpoint {
         return .{
             .cursor = self.cursor,
+            .sig_no_nl_idx = self.sig_no_nl_idx,
+            .sig_no_nl_tag = self.sig_no_nl_tag,
+            .sig_idx = self.sig_idx,
+            .sig_tag = self.sig_tag,
             .event_len = self.events.items.len,
             .emitted_pos = self.emitted_pos,
             .depth = self.depth,
@@ -631,6 +756,10 @@ pub const Parser = struct {
     /// 回退解析器状态至指定检查点。
     pub inline fn rollback(self: *Parser, cp: Checkpoint) void {
         self.cursor = cp.cursor;
+        self.sig_no_nl_idx = cp.sig_no_nl_idx;
+        self.sig_no_nl_tag = cp.sig_no_nl_tag;
+        self.sig_idx = cp.sig_idx;
+        self.sig_tag = cp.sig_tag;
         self.events.shrinkRetainingCapacity(cp.event_len);
         self.emitted_pos = cp.emitted_pos;
         self.depth = cp.depth;
@@ -639,8 +768,9 @@ pub const Parser = struct {
     }
 
     /// 进入一层递归；超出 `max_recursion_depth` 时记录诊断并返回 `false`。
-    pub fn enterDepth(self: *Parser) std.mem.Allocator.Error!bool {
+    pub inline fn enterDepth(self: *Parser) std.mem.Allocator.Error!bool {
         if (self.depth >= max_recursion_depth) {
+            @branchHint(.cold);
             try self.emitError(.recursive_depth_limit);
             return false;
         }
@@ -654,109 +784,114 @@ pub const Parser = struct {
         self.depth -= 1;
     }
 
+    /// 冷路径扩容内部事件缓冲区，分离慢路径以减小热路径内联代码体积。
+    fn growEvents(self: *Parser, additional: usize) std.mem.Allocator.Error!void {
+        @branchHint(.cold);
+        try self.events.ensureUnusedCapacity(self.allocator, additional);
+    }
+
+    /// 向内部事件缓冲区追加单个紧凑事件。
+    inline fn appendEvent(self: *Parser, ev: CompactEvent) std.mem.Allocator.Error!void {
+        if (self.events.items.len == self.events.capacity) {
+            try self.growEvents(1);
+        }
+        self.events.appendAssumeCapacity(ev);
+    }
+
     /// 发射一个 `start_node` 事件。
     pub inline fn startNode(self: *Parser, kind: SyntaxKind) std.mem.Allocator.Error!void {
-        try self.events.append(self.allocator, .{ .start_node = kind });
+        try self.appendEvent(CompactEvent.startNode(kind));
+    }
+
+    /// 原地修改指定事件下标处的 `start_node` 节点标签（用于单趟消除括号表达式与元组的前瞻扫描）。
+    pub inline fn setNodeKindAt(self: *Parser, event_idx: usize, kind: SyntaxKind) void {
+        std.debug.assert(event_idx < self.events.items.len);
+        std.debug.assert(self.events.items[event_idx].tag == .start_node);
+        self.events.items[event_idx].payload = @backingInt(kind);
     }
 
     /// 发射一个 `wrap_node` 事件，包裹当前父节点最后一项已完成子节点。
     pub inline fn wrapNode(self: *Parser, kind: SyntaxKind) std.mem.Allocator.Error!void {
-        try self.events.append(self.allocator, .{ .wrap_node = kind });
+        try self.appendEvent(CompactEvent.wrapNode(kind));
     }
 
     /// 发射一个 `finish_node` 事件。
     pub inline fn finishNode(self: *Parser) std.mem.Allocator.Error!void {
-        try self.events.append(self.allocator, .finish_node);
+        try self.appendEvent(CompactEvent.finishNode());
     }
 
     /// 在当前有效词法单元位置记录一条语法错误诊断。
     pub fn emitError(self: *Parser, code: ParseErrorCode) std.mem.Allocator.Error!void {
+        @branchHint(.cold);
         try self.emitErrorAt(code, self.currentErrorRange());
     }
 
     /// 在指定全局字节区间记录一条语法错误诊断，同时存入 `errors` 成员与事件流。
     pub fn emitErrorAt(self: *Parser, code: ParseErrorCode, range: common.TextRange) std.mem.Allocator.Error!void {
+        @branchHint(.cold);
         const err_item: ParseError = .{ .code = code, .range = range };
         try self.errors.append(self.allocator, err_item);
         errdefer _ = self.errors.pop();
-        try self.events.append(self.allocator, .{
-            .parse_error = err_item,
-        });
+        try self.appendEvent(CompactEvent.parseError(err_item));
     }
 
     /// 发射单个 CST 叶子事件，自动补发前导水平空白并钳制区间维持单调不回退与无重复字节。
-    pub fn emitLeaf(self: *Parser, kind: SyntaxKind, local_range: common.TextRange) std.mem.Allocator.Error!void {
+    pub inline fn emitLeaf(self: *Parser, kind: SyntaxKind, local_range: common.TextRange) std.mem.Allocator.Error!void {
         const clamped_start = @max(self.emitted_pos, @min(local_range.start, self.source_len));
         const clamped_end = @max(clamped_start, @min(local_range.end, self.source_len));
 
         if (self.emitted_pos < clamped_start) {
-            try self.events.append(self.allocator, .{
-                .token = .{
-                    .kind = .whitespace,
-                    .range = .{
-                        .start = self.globalPos(self.emitted_pos),
-                        .end = self.globalPos(clamped_start),
-                    },
-                },
-            });
+            if (self.events.capacity - self.events.items.len < 2) {
+                try self.growEvents(2);
+            }
+            self.events.appendAssumeCapacity(CompactEvent.token(.whitespace, .{
+                .start = self.globalPos(self.emitted_pos),
+                .end = self.globalPos(clamped_start),
+            }));
+            self.events.appendAssumeCapacity(CompactEvent.token(kind, .{
+                .start = self.globalPos(clamped_start),
+                .end = self.globalPos(clamped_end),
+            }));
+        } else {
+            try self.appendEvent(CompactEvent.token(kind, .{
+                .start = self.globalPos(clamped_start),
+                .end = self.globalPos(clamped_end),
+            }));
         }
-        try self.events.append(self.allocator, .{
-            .token = .{
-                .kind = kind,
-                .range = .{
-                    .start = self.globalPos(clamped_start),
-                    .end = self.globalPos(clamped_end),
-                },
-            },
-        });
         self.emitted_pos = clamped_end;
     }
 
     /// 补发 `emitted_pos` 至 `source_len` 之间的尾部水平空白（用于文件末尾与插值片段末尾）。
     pub fn emitTrailingWhitespace(self: *Parser) std.mem.Allocator.Error!void {
         if (self.emitted_pos < self.source_len) {
-            try self.events.append(self.allocator, .{
-                .token = .{
-                    .kind = .whitespace,
-                    .range = .{
-                        .start = self.globalPos(self.emitted_pos),
-                        .end = self.globalPos(self.source_len),
-                    },
-                },
-            });
+            try self.appendEvent(CompactEvent.token(.whitespace, .{
+                .start = self.globalPos(self.emitted_pos),
+                .end = self.globalPos(self.source_len),
+            }));
             self.emitted_pos = self.source_len;
         }
     }
 
     /// 补发 `emitted_pos` 至当前游标词法单元起点之间的水平空白，使新开启子节点首字符精确对应首个非空白字符。
-    pub fn emitPendingWhitespace(self: *Parser) std.mem.Allocator.Error!void {
+    pub inline fn emitPendingWhitespace(self: *Parser) std.mem.Allocator.Error!void {
         if (self.cursor >= self.tokens.len) return;
         const tok = self.tokens[self.cursor];
         if (tok.tag == .end) return;
         const range = self.safeRange(tok.span);
         if (self.emitted_pos < range.start) {
-            try self.events.append(self.allocator, .{
-                .token = .{
-                    .kind = .whitespace,
-                    .range = .{
-                        .start = self.globalPos(self.emitted_pos),
-                        .end = self.globalPos(range.start),
-                    },
-                },
-            });
+            try self.appendEvent(CompactEvent.token(.whitespace, .{
+                .start = self.globalPos(self.emitted_pos),
+                .end = self.globalPos(range.start),
+            }));
             self.emitted_pos = range.start;
         }
     }
 
-    /// 内部公共前导 Trivia 发射：消费连续的注释（及可选换行），按需补发其后的水平空白。
-    ///
-    /// 当 `allow_doc_comment` 为 `false` 且存在 `doc_comment` 时，合并相邻悬空文档注释区间并记录
-    /// `ParseErrorCode.dangling_doc_comment`，同时无损发射 `.doc_comment` 叶子。
-    fn emitTriviaInternal(
+    /// 内部公共前导 Trivia 发射慢路径：实际存在待消费的注释或换行时执行。
+    fn emitTriviaLoop(
         self: *Parser,
         include_nl: bool,
         allow_doc_comment: bool,
-        emit_pending_ws: bool,
     ) std.mem.Allocator.Error!void {
         var dangling_doc_start: ?u32 = null;
         var dangling_doc_end: u32 = 0;
@@ -790,13 +925,27 @@ pub const Parser = struct {
             }
         }
 
+        self.syncLookahead();
+
         if (dangling_doc_start) |s| {
             try self.emitErrorAt(.dangling_doc_comment, .{
                 .start = self.globalPos(s),
                 .end = self.globalPos(dangling_doc_end),
             });
         }
+    }
 
+    /// 内部公共前导 Trivia 发射：无待消费注释或换行时零循环短路，按需补发其后的水平空白。
+    inline fn emitTriviaInternal(
+        self: *Parser,
+        include_nl: bool,
+        allow_doc_comment: bool,
+        emit_pending_ws: bool,
+    ) std.mem.Allocator.Error!void {
+        const target_idx = if (include_nl) self.sig_idx else self.sig_no_nl_idx;
+        if (self.cursor < target_idx) {
+            try self.emitTriviaLoop(include_nl, allow_doc_comment);
+        }
         if (emit_pending_ws) {
             try self.emitPendingWhitespace();
         }
@@ -815,18 +964,13 @@ pub const Parser = struct {
     /// 若当前前导 Trivia 序列中存在文档注释，则在当前声明节点层发射至最后一个文档注释为止，
     /// 使文档注释成为声明对象的直接成员且保留其后换行与空白作为下一子节点的 leading trivia。
     pub fn emitPendingDocComments(self: *Parser) std.mem.Allocator.Error!void {
+        if (self.cursor == self.sig_idx) return;
         var idx = self.cursor;
         var last_doc_idx: ?usize = null;
-        while (idx < self.tokens.len) : (idx += 1) {
+        while (idx < self.sig_idx) : (idx += 1) {
             const tok = self.tokens[idx];
-            if (tok.tag == .comment) {
-                if (self.classifyComment(tok) == .doc_comment) {
-                    last_doc_idx = idx;
-                }
-            } else if (tok.tag == .nl) {
-                continue;
-            } else {
-                break;
+            if (tok.tag == .comment and self.classifyComment(tok) == .doc_comment) {
+                last_doc_idx = idx;
             }
         }
         const stop_idx = last_doc_idx orelse return;
@@ -839,10 +983,11 @@ pub const Parser = struct {
             }
             self.cursor += 1;
         }
+        self.syncLookahead();
     }
 
     /// 内部公共词法消费：先发射前导 Trivia，再发射当前词法单元（可选覆盖标签）。
-    fn bumpInternal(
+    inline fn bumpInternal(
         self: *Parser,
         skip_nl: bool,
         allow_doc_comment: bool,
@@ -854,7 +999,7 @@ pub const Parser = struct {
         if (tok.tag == .end) return;
         const kind = kind_override orelse self.tokenToSyntaxKind(tok);
         try self.emitLeaf(kind, self.safeRange(tok.span));
-        self.cursor += 1;
+        self.setCursor(self.cursor + 1);
     }
 
     /// 消费下一个非 Trivia 词法单元，发射其前导 Trivia 并按默认映射为 `SyntaxKind` 发射叶子。
@@ -887,7 +1032,7 @@ pub const Parser = struct {
         try self.bumpCombinedInternal(op, skip_nl, true);
     }
 
-    /// 内部组合运算符消费实现。
+    /// 内部组合运算符消费逻辑。
     fn bumpCombinedInternal(
         self: *Parser,
         op: CombinedOp,
@@ -904,12 +1049,12 @@ pub const Parser = struct {
             .end = @max(first.start, last.end),
         };
         try self.emitLeaf(op.kind, merged);
-        self.cursor += count;
+        self.setCursor(self.cursor + count);
     }
 
     /// 若当前有效词法单元匹配 `tag` 则消费并返回 `true`，否则不消费并返回 `false`。
-    pub fn eat(self: *Parser, tag: TokenTag) std.mem.Allocator.Error!bool {
-        if (self.peek() == tag) {
+    pub inline fn eat(self: *Parser, tag: TokenTag) std.mem.Allocator.Error!bool {
+        if (self.sig_tag == tag) {
             try self.bump();
             return true;
         }
@@ -917,8 +1062,8 @@ pub const Parser = struct {
     }
 
     /// 期望当前有效词法单元为 `tag`；匹配则消费并返回 `true`，不匹配则记录 `expected_token` 错误并返回 `false`。
-    pub fn expect(self: *Parser, tag: TokenTag) std.mem.Allocator.Error!bool {
-        if (self.peek() == tag) {
+    pub inline fn expect(self: *Parser, tag: TokenTag) std.mem.Allocator.Error!bool {
+        if (self.sig_tag == tag) {
             try self.bump();
             return true;
         }
@@ -927,8 +1072,8 @@ pub const Parser = struct {
     }
 
     /// 期望当前有效词法单元为闭合定界符（`)`、`]`、`}`）；不匹配时记录 `unclosed_delimiter` 错误。
-    pub fn expectClosing(self: *Parser, tag: TokenTag) std.mem.Allocator.Error!bool {
-        if (self.peek() == tag) {
+    pub inline fn expectClosing(self: *Parser, tag: TokenTag) std.mem.Allocator.Error!bool {
+        if (self.sig_tag == tag) {
             try self.bump();
             return true;
         }
@@ -937,8 +1082,8 @@ pub const Parser = struct {
     }
 
     /// 消费一个标识符或上下文关键字并统一发射为 `SyntaxKind.identifier`；不匹配时记录 `expected_identifier`。
-    pub fn expectIdent(self: *Parser) std.mem.Allocator.Error!bool {
-        if (isIdentLike(self.peek())) {
+    pub inline fn expectIdent(self: *Parser) std.mem.Allocator.Error!bool {
+        if (isIdentLike(self.sig_tag)) {
             try self.bumpAs(.identifier);
             return true;
         }
@@ -948,7 +1093,7 @@ pub const Parser = struct {
 
     /// 消费一个包名段（标识符、上下文关键字或反引号包名）；不匹配时记录 `expected_identifier`。
     pub fn expectPackageIdent(self: *Parser) std.mem.Allocator.Error!bool {
-        const tag = self.peek();
+        const tag = self.sig_tag;
         if (tag == .package_identifier) {
             try self.bump();
             return true;
@@ -963,9 +1108,8 @@ pub const Parser = struct {
 
     /// 消费一个无法识别的词法单元并包裹在 `error_node` 内，记录对应错误码以维持无损与游标前进。
     pub fn bumpErrorToken(self: *Parser, code: ParseErrorCode) std.mem.Allocator.Error!void {
-        const sig_idx = self.nextSignificantIndex(self.cursor, true);
-        if (sig_idx >= self.tokens.len) return;
-        const tok = self.tokens[sig_idx];
+        if (self.sig_idx >= self.tokens.len) return;
+        const tok = self.tokens[self.sig_idx];
         if (tok.tag == .end) return;
 
         const actual_code: ParseErrorCode = if (tok.tag == .illegal) .illegal_token else code;
@@ -975,7 +1119,7 @@ pub const Parser = struct {
         if (self.cursor < self.tokens.len and self.tokens[self.cursor].tag != .end) {
             const cur = self.tokens[self.cursor];
             try self.emitLeaf(self.tokenToSyntaxKind(cur), self.safeRange(cur.span));
-            self.cursor += 1;
+            self.setCursor(self.cursor + 1);
         }
         try self.finishNode();
     }
@@ -984,9 +1128,8 @@ pub const Parser = struct {
     /// 遇换行、分号、花括号、声明起始或合法表达式起始立即停止，兼顾最少 Token 消耗与抑制错误风暴。
     /// 当 `code` 为 `null` 时表示错误已由前序解析步骤记录，不再重复发射诊断。
     pub fn bumpErrorRun(self: *Parser, code: ?ParseErrorCode, stop_at_r_curl: bool) std.mem.Allocator.Error!void {
-        const sig_idx = self.nextSignificantIndex(self.cursor, true);
-        if (sig_idx >= self.tokens.len) return;
-        const first = self.tokens[sig_idx];
+        if (self.sig_idx >= self.tokens.len) return;
+        const first = self.tokens[self.sig_idx];
         if (first.tag == .end) return;
 
         if (code) |err_code| {
@@ -998,12 +1141,12 @@ pub const Parser = struct {
         if (self.cursor < self.tokens.len and self.tokens[self.cursor].tag != .end) {
             const cur = self.tokens[self.cursor];
             try self.emitLeaf(self.tokenToSyntaxKind(cur), self.safeRange(cur.span));
-            self.cursor += 1;
+            self.setCursor(self.cursor + 1);
         }
 
         // 仅在同行内继续合并连续的 `.illegal` 或孤立冗余闭合符 `)` / `]`
         while (self.cursor < self.tokens.len) {
-            const next_no_nl = self.peekNoNl();
+            const next_no_nl = self.sig_no_nl_tag;
             if (next_no_nl == .end or next_no_nl == .nl or next_no_nl == .semi or next_no_nl == .l_curl) break;
             if (stop_at_r_curl and next_no_nl == .r_curl) break;
             if (next_no_nl != .illegal and next_no_nl != .r_paren and next_no_nl != .r_square) break;
@@ -1013,13 +1156,12 @@ pub const Parser = struct {
     }
 
     /// 仅消费显式分号分隔符 `;`（不提前消费换行与注释，将其保留为后续节点的 leading trivia）。
-    pub fn eatSemicolons(self: *Parser) std.mem.Allocator.Error!bool {
-        var consumed = false;
-        while (self.at(.semi)) {
+    pub inline fn eatSemicolons(self: *Parser) std.mem.Allocator.Error!bool {
+        if (self.sig_tag != .semi) return false;
+        while (self.sig_tag == .semi) {
             try self.bump();
-            consumed = true;
         }
-        return consumed;
+        return true;
     }
 
     /// 判定标签是否为明确不可作为列表元素的顶层或成员声明关键字。
@@ -1043,27 +1185,32 @@ pub const Parser = struct {
         };
     }
 
-    /// 只读判断当前位置是否跨行到达了一条新声明的明确起始边界（用于 LSP 编辑态防止前一行未写完的表达式/类型/点号吞并下一行声明）。
-    pub fn isNewlineDeclBoundary(self: *const Parser) bool {
-        if (!self.hasNewlineBefore()) return false;
-        const idx = self.nextSignificantIndex(self.cursor, true);
+    /// 跨行新声明边界判定的慢路径（仅在 `hasNewlineBefore()` 为真时进入）。
+    fn isNewlineDeclBoundarySlow(self: *const Parser) bool {
+        const idx = self.sig_idx;
         if (idx >= self.tokens.len) return false;
-        const tag = self.tokens[idx].tag;
+        const tag = self.sig_tag;
         if (isHardDeclKeyword(tag)) return true;
-        switch (tag) {
-            .kw_let, .kw_var, .kw_const, .kw_init => return true,
-            .bit_not => {
+        return switch (tag) {
+            .kw_let, .kw_var, .kw_const, .kw_init => true,
+            .bit_not => blk: {
                 const next = self.nextSignificantIndex(idx + 1, true);
-                return next < self.tokens.len and self.tokens[next].tag == .kw_init;
+                break :blk next < self.tokens.len and self.tokens[next].tag == .kw_init;
             },
-            .at, .at_excl => return decl.isAnnotationFollowedByDeclAt(self, idx),
-            else => return decl.isModifierFollowedByDeclAt(self, idx),
-        }
+            .at, .at_excl => decl.isAnnotationFollowedByDeclAt(self, idx),
+            else => decl.isModifierFollowedByDeclAt(self, idx),
+        };
+    }
+
+    /// 只读判断当前位置是否跨行到达了一条新声明的明确起始边界（用于 LSP 编辑态防止前一行未写完的表达式/类型/点号吞并下一行声明）。
+    pub inline fn isNewlineDeclBoundary(self: *const Parser) bool {
+        if (!self.hasNewlineBefore()) return false;
+        return self.isNewlineDeclBoundarySlow();
     }
 
     /// 只读判断当前位置是否为主构造器成员参数起始（`[public|private|protected|internal] (let | var)`）。
     pub fn isPrimaryCtorMemberParamStart(self: *const Parser) bool {
-        const t0 = self.peek();
+        const t0 = self.sig_tag;
         if (t0 == .kw_let or t0 == .kw_var) return true;
         if (t0 == .kw_public or t0 == .kw_private or t0 == .kw_protected or t0 == .kw_internal) {
             const t1 = self.peekNth(1);
@@ -1073,16 +1220,11 @@ pub const Parser = struct {
     }
 
     /// 判定当前词法位置是否命中指定列表上下文的外层同步恢复边界；命中时列表应立即停止而不吞并外层词法单元。
-    pub fn shouldStopList(self: *const Parser, ctx: ListContext) bool {
-        const tag = self.peek();
+    pub inline fn shouldStopList(self: *const Parser, ctx: ListContext) bool {
+        const tag = self.sig_tag;
         if (tag == .end or isHardDeclKeyword(tag)) return true;
-        if (ctx == .primary_ctor_param_list) {
-            if (self.isNewlineDeclBoundary() and !self.isPrimaryCtorMemberParamStart()) return true;
-        } else if (self.isNewlineDeclBoundary()) {
-            return true;
-        }
 
-        return switch (ctx) {
+        const stopped_by_tag = switch (ctx) {
             .paren_expr_list => switch (tag) {
                 .r_paren, .r_curl, .r_square, .semi, .kw_let, .kw_var, .kw_const => true,
                 else => false,
@@ -1116,12 +1258,18 @@ pub const Parser = struct {
                 else => false,
             },
         };
+        if (stopped_by_tag) return true;
+
+        if (ctx == .primary_ctor_param_list) {
+            return self.isNewlineDeclBoundary() and !self.isPrimaryCtorMemberParamStart();
+        }
+        return self.isNewlineDeclBoundary();
     }
 
     /// 只读判断当前词法单元是否可以合法起始一条常规表达式（用于逗号分隔列表的漏逗号恢复判定）。
     pub fn canStartExpr(self: *const Parser) bool {
         if (self.isNewlineDeclBoundary()) return false;
-        const tag = self.peek();
+        const tag = self.sig_tag;
         return switch (tag) {
             .integer_literal,
             .float_literal,
@@ -1167,7 +1315,7 @@ pub const Parser = struct {
     /// 只读判断当前词法单元是否可以合法起始一个模式（用于模式列表的漏逗号恢复判定）。
     pub fn canStartPattern(self: *const Parser) bool {
         if (self.isNewlineDeclBoundary()) return false;
-        const tag = self.peek();
+        const tag = self.sig_tag;
         return switch (tag) {
             .wildcard,
             .l_paren,
@@ -1190,12 +1338,12 @@ pub const Parser = struct {
 
     /// 判定当前是否位于文件尾（跳过注释与换行后为 `.end`）。
     pub inline fn isAtEof(self: *const Parser) bool {
-        return self.peek() == .end;
+        return self.sig_tag == .end;
     }
 
     /// 判定当前游标处（不跳过换行）是否位于语句终止位置（换行、`;`、`}`、`)`、`]`、`eof`）。
     pub inline fn atStmtTerminator(self: *const Parser) bool {
-        return switch (self.peekNoNl()) {
+        return switch (self.sig_no_nl_tag) {
             .nl, .semi, .r_curl, .r_paren, .r_square, .end => true,
             else => false,
         };
@@ -1204,26 +1352,20 @@ pub const Parser = struct {
     /// 在文件结束时发射所有残余词法单元、文件末尾 Trivia（归属 `source_file`）与 `SyntaxKind.eof`。
     pub fn finishFile(self: *Parser) std.mem.Allocator.Error!void {
         while (self.cursor < self.tokens.len) {
-            const sig_idx = self.nextSignificantIndex(self.cursor, true);
-            if (sig_idx >= self.tokens.len or self.tokens[sig_idx].tag == .end) {
+            if (self.sig_idx >= self.tokens.len or self.sig_tag == .end) {
                 try self.emitTrivia(true, false);
                 if (self.cursor < self.tokens.len and self.tokens[self.cursor].tag == .end) {
-                    self.cursor += 1;
+                    self.setCursor(self.cursor + 1);
                 }
                 break;
             }
             try self.bumpErrorToken(.unexpected_token);
         }
         try self.emitTrailingWhitespace();
-        try self.events.append(self.allocator, .{
-            .token = .{
-                .kind = .eof,
-                .range = .{
-                    .start = self.globalPos(self.emitted_pos),
-                    .end = self.globalPos(self.emitted_pos),
-                },
-            },
-        });
+        try self.appendEvent(CompactEvent.token(.eof, .{
+            .start = self.globalPos(self.emitted_pos),
+            .end = self.globalPos(self.emitted_pos),
+        }));
     }
 };
 
@@ -2728,5 +2870,36 @@ test "文档注释：支持 /// 与 /** */、归属注释对象成员，无注�
         try std.testing.expectEqual(@as(usize, 1), res.errors.items.len);
         try std.testing.expectEqual(ParseErrorCode.dangling_doc_comment, res.errors.items[0].code);
         try std.testing.expect(res.root.hasKind(.doc_comment));
+    }
+}
+
+test "括号与元组原地改写、漏逗号元组恢复与超长/嵌套字符串插值" {
+    const gpa = std.testing.allocator;
+
+    // 1. 漏逗号元组 `(a b, c)` 正确识别为 `tuple_lit` 且仅报 1 次缺少分隔符错误
+    {
+        var r = try parseAndVerify(gpa, "let t = (a b, c)");
+        defer r.deinit(gpa);
+        try std.testing.expectEqual(@as(usize, 1), r.errors.items.len);
+        try std.testing.expectEqual(ParseErrorCode.expected_token, r.errors.items[0].code);
+        try std.testing.expectEqual(@as(usize, 1), r.root.countKind(.tuple_lit));
+        try std.testing.expectEqual(@as(usize, 0), r.root.countKind(.paren_expr));
+    }
+
+    // 2. 超过 64 个词法单元的插值表达式溢出堆缓冲与多层嵌套插值均保持无损与零错误
+    {
+        var src_buf: std.ArrayList(u8) = .empty;
+        defer src_buf.deinit(gpa);
+        try src_buf.appendSlice(gpa, "let s = \"sum=${1");
+        for (0..40) |_| {
+            try src_buf.appendSlice(gpa, " + 1");
+        }
+        try src_buf.appendSlice(gpa, "}, nested=${\"a=${1 + 2}\"}\"");
+
+        var r = try parseAndVerify(gpa, src_buf.items);
+        defer r.deinit(gpa);
+        try std.testing.expectEqual(@as(usize, 0), r.errors.items.len);
+        try std.testing.expectEqual(@as(usize, 2), r.root.countKind(.str_interpolation_expr));
+        try std.testing.expectEqual(@as(usize, 3), r.root.countKind(.interpolation_expr));
     }
 }

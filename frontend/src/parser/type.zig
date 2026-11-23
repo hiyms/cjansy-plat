@@ -109,7 +109,13 @@ fn parseConstantType(p: *Parser) std.mem.Allocator.Error!void {
 pub fn parsePathType(p: *Parser) std.mem.Allocator.Error!void {
     try p.startNode(.path_type);
     try p.emitLeadingTrivia(false);
-    try parseTypePathSegment(p);
+    // 首段已由 `parseType` 校验非声明边界、已发射前导 Trivia 且满足 `isIdentLike`
+    try p.startNode(.path_segment);
+    try p.bumpAs(.identifier);
+    if (p.at(.less)) {
+        try parseTypeArgumentList(p);
+    }
+    try p.finishNode();
     while (p.at(.dot)) {
         try p.bump();
         try parseTypePathSegment(p);
@@ -181,8 +187,8 @@ const ParenTypeShape = struct {
 
 /// 只读扫描括号类型头部，一次确定外层应构造 `func_type`、`tuple_type` 还是 `paren_type`。
 fn classifyParenType(p: *const Parser) ParenTypeShape {
-    const start_idx = p.nextSignificantIndex(p.cursor, true);
-    if (start_idx >= p.tokens.len or p.tokens[start_idx].tag != .l_paren) {
+    const start_idx = p.sig_idx;
+    if (start_idx >= p.tokens.len or p.sig_tag != .l_paren) {
         return .{ .is_func = false, .has_comma = false, .has_label = false, .is_empty = true };
     }
 
@@ -257,8 +263,10 @@ fn parseParenTupleOrFuncType(p: *Parser) std.mem.Allocator.Error!void {
             const before = p.cursor;
             try parseOptionalLabeledType(p);
             if (try p.eat(.comma)) {
-                if (p.shouldStopList(.paren_type_list)) break;
-            } else if (canStartType(p) and !p.shouldStopList(.paren_type_list)) {
+                continue;
+            } else if (p.shouldStopList(.paren_type_list)) {
+                break;
+            } else if (canStartType(p)) {
                 try p.emitError(.expected_token);
             } else {
                 break;
@@ -289,11 +297,82 @@ fn parseOptionalLabeledType(p: *Parser) std.mem.Allocator.Error!void {
     try parseType(p);
 }
 
+/// 零分配只读快速预检：判断当前同行 `<` 起是否可能构成无错误的表达式泛型实参列表，
+/// 直接排除常规 `<` 比较表达式，避免无意义的事件写入、错误记录与回溯。
+fn looksLikeExprTypeArgs(p: *const Parser) bool {
+    const start_idx = p.sig_idx;
+    if (start_idx >= p.tokens.len or p.sig_tag != .less) return false;
+
+    var angle_depth: u32 = 1;
+    var paren_depth: u32 = 0;
+    var has_content = false;
+    var idx = start_idx + 1;
+    const toks = p.tokens;
+
+    while (idx < toks.len) : (idx += 1) {
+        const tag = toks[idx].tag;
+        switch (tag) {
+            .comment, .nl => continue,
+            .less => angle_depth += 1,
+            .greater => {
+                angle_depth -= 1;
+                if (angle_depth == 0) {
+                    if (paren_depth != 0 or !has_content) return false;
+                    // 闭合 `>` 与紧随词法单元构成 `>=` 或 `>>=` 时不得作为泛型闭合符
+                    const gt_tok = toks[idx];
+                    if (idx + 1 < toks.len) {
+                        const next = toks[idx + 1];
+                        if (Parser.isAdjacent(gt_tok, next)) {
+                            if (next.tag == .assign) return false;
+                            if (next.tag == .greater and idx + 2 < toks.len) {
+                                const after = toks[idx + 2];
+                                if (Parser.isAdjacent(next, after) and after.tag == .assign) return false;
+                            }
+                        }
+                    }
+                    const next_no_nl_idx = p.nextSignificantIndex(idx + 1, false);
+                    const next_no_nl: TokenTag = if (next_no_nl_idx < toks.len) toks[next_no_nl_idx].tag else .end;
+                    return isValidAfterExprTypeArgsTag(next_no_nl);
+                }
+            },
+            .l_paren => {
+                paren_depth += 1;
+                has_content = true;
+            },
+            .r_paren => {
+                if (paren_depth == 0) return false;
+                paren_depth -= 1;
+            },
+            .comma,
+            .dot,
+            .quest,
+            .arrow,
+            .colon,
+            .dollar,
+            .integer_literal,
+            .kw_this_type,
+            .kw_varray,
+            => {
+                has_content = true;
+            },
+            else => {
+                if (Parser.isPrimitiveTypeTag(tag) or Parser.isIdentLike(tag)) {
+                    has_content = true;
+                } else {
+                    return false;
+                }
+            },
+        }
+    }
+    return false;
+}
+
 /// 在表达式路径段之后试探解析 `<Type, ...>` 泛型实参列表；
 /// 依据 `cangjie_spec` 泛型消歧规则，解析成功、闭合 `>` 未与后继构成 `>=`/`>>=` 且后继合法时提交，否则回溯。
 pub fn tryParseExprTypeArguments(p: *Parser) std.mem.Allocator.Error!bool {
     if (!p.at(.less)) return false;
     if (p.hasNewlineBefore()) return false;
+    if (!looksLikeExprTypeArgs(p)) return false;
 
     const cp = p.checkpoint();
     try parseTypeArgumentList(p);
@@ -327,7 +406,7 @@ pub fn tryParsePatternTypeArguments(p: *Parser) std.mem.Allocator.Error!bool {
     return false;
 }
 
-/// 检查刚刚消费的闭合 `>` 是否与紧随其后的词法单元物理紧邻构成 `>=` 或 `>>=`（防止误拆 `c >= 0`）。
+/// 检查刚刚消费的闭合 `>` 是否与紧随其后的词法单元物理紧邻构成 `>=` 或 `>>=`（防止误切 `c >= 0`）。
 fn closingGreaterFormsCombinedAssign(p: *const Parser) bool {
     if (p.cursor == 0 or p.cursor >= p.tokens.len) return false;
     const prev_gt = p.tokens[p.cursor - 1];
@@ -342,9 +421,8 @@ fn closingGreaterFormsCombinedAssign(p: *const Parser) bool {
     return false;
 }
 
-/// 判定闭合泛型实参列表 `>` 之后的词法单元是否符合表达式位置泛型引用的合法后继集合。
-fn isValidAfterExprTypeArgs(p: *const Parser) bool {
-    const next_no_nl = p.peekNoNl();
+/// 判定闭合泛型实参列表 `>` 之后的词法标签是否属于表达式位置泛型引用的合法后继集合。
+inline fn isValidAfterExprTypeArgsTag(next_no_nl: TokenTag) bool {
     return switch (next_no_nl) {
         .l_paren,
         .l_square,
@@ -384,4 +462,9 @@ fn isValidAfterExprTypeArgs(p: *const Parser) bool {
         => true,
         else => false,
     };
+}
+
+/// 判定闭合泛型实参列表 `>` 之后的词法单元是否符合表达式位置泛型引用的合法后继集合。
+inline fn isValidAfterExprTypeArgs(p: *const Parser) bool {
+    return isValidAfterExprTypeArgsTag(p.peekNoNl());
 }

@@ -647,18 +647,27 @@ pub const SyntaxKind = enum {
     error_node,
 };
 
+/// 编译期构造的词法标签到 CST 标签查找表，`.comment` 与 `.sentinel` 映射为 `null`。
+const token_to_syntax_table: [@typeInfo(TokenTag).@"enum".field_names.len]?SyntaxKind = blk: {
+    var table: [@typeInfo(TokenTag).@"enum".field_names.len]?SyntaxKind = @splat(null);
+    for (std.enums.values(TokenTag)) |tag| {
+        table[@backingInt(tag)] = switch (tag) {
+            .nl => .newline,
+            .end => .eof,
+            .comment, .sentinel => null,
+            inline else => |t| @field(SyntaxKind, @tagName(t)),
+        };
+    }
+    break :blk table;
+};
+
 /// 把词法单元标签转换为 CST 节点标签。
 ///
 /// `comment` 需按注释文本区分单行、块注释与文档注释，`sentinel` 是解析器内部占位，两者返回 null。
 /// `??`、`>>`、`>>=`、`>=`、`unit_literal`、`annotation` 及带插值的 `str_interpolation_expr`
 /// 由语法分析阶段按上下文组合或展开。
-pub fn toSyntaxKind(token_tag: TokenTag) ?SyntaxKind {
-    return switch (token_tag) {
-        .nl => .newline,
-        .end => .eof,
-        .comment, .sentinel => null,
-        inline else => |tag| @field(SyntaxKind, @tagName(tag)),
-    };
+pub inline fn toSyntaxKind(token_tag: TokenTag) ?SyntaxKind {
+    return token_to_syntax_table[@backingInt(token_tag)];
 }
 
 test "SyntaxKind 为空白、换行与三类注释提供独立标签" {

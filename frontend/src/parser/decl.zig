@@ -57,17 +57,39 @@ pub fn parseSourceFile(p: *Parser) std.mem.Allocator.Error!void {
     }
 
     // 零或多个顶层声明与 `main`
-    while (!p.isAtEof()) {
+    while (true) {
         _ = try p.eatSemicolons();
-        if (p.isAtEof()) break;
+        const cur = p.peek();
+        if (cur == .end) break;
 
         const before = p.cursor;
-        if (isImportSpecStart(p)) {
-            try parseImportSpec(p);
-        } else if (isPackageHeaderStart(p)) {
-            try parsePackageHeader(p);
-        } else {
-            try parseDecl(p, .top_level);
+        switch (cur) {
+            .kw_import => try parseImportSpec(p),
+            .kw_package => try parsePackageHeader(p),
+            .kw_public, .kw_protected, .kw_internal => {
+                if (isImportSpecStart(p)) {
+                    try parseImportSpec(p);
+                } else if (isPackageHeaderStart(p)) {
+                    try parsePackageHeader(p);
+                } else {
+                    try parseDecl(p, .top_level);
+                }
+            },
+            .kw_private, .at => {
+                if (isImportSpecStart(p)) {
+                    try parseImportSpec(p);
+                } else {
+                    try parseDecl(p, .top_level);
+                }
+            },
+            .kw_macro => {
+                if (isPackageHeaderStart(p)) {
+                    try parsePackageHeader(p);
+                } else {
+                    try parseDecl(p, .top_level);
+                }
+            },
+            else => try parseDecl(p, .top_level),
         }
         _ = try p.eatSemicolons();
 
@@ -165,7 +187,7 @@ fn parseFeaturesDirective(p: *Parser) std.mem.Allocator.Error!void {
 
 /// 只读判断当前是否位于 `package` 包声明头部。
 fn isPackageHeaderStart(p: *const Parser) bool {
-    var idx = p.nextSignificantIndex(p.cursor, true);
+    var idx = p.sig_idx;
     if (idx < p.tokens.len) {
         const t0 = p.tokens[idx].tag;
         if (t0 == .kw_public or t0 == .kw_protected or t0 == .kw_internal) {
@@ -282,7 +304,7 @@ pub fn isBuiltinAnnotationAtIndex(p: *const Parser, at_idx: usize) bool {
 
 /// 只读判断当前位置是否位于内置注解起始处。
 pub inline fn isBuiltinAnnotation(p: *const Parser) bool {
-    return isBuiltinAnnotationAtIndex(p, p.nextSignificantIndex(p.cursor, true));
+    return p.sig_tag == .at and isBuiltinAnnotationAtIndex(p, p.sig_idx);
 }
 
 /// 只读线性跳过自物理下标 `start_idx` 起连续的内置注解，返回其后首个有效词法单元下标。
@@ -555,6 +577,24 @@ fn isConstModifierAtIndex(p: *const Parser, const_idx: usize, scope: DeclScope) 
     return false;
 }
 
+/// 按长度快速筛选标识符修饰符类别，避免对常规标识符执行多次字符串比较。
+const IdentModifierKind = enum {
+    none,
+    common,
+    specific,
+    late,
+};
+
+/// 分类标识符文本是否为 `common`、`specific` 或 `late`。
+inline fn classifyIdentModifier(text: []const u8) IdentModifierKind {
+    return switch (text.len) {
+        4 => if (std.mem.eql(u8, text, "late")) .late else .none,
+        6 => if (std.mem.eql(u8, text, "common")) .common else .none,
+        8 => if (std.mem.eql(u8, text, "specific")) .specific else .none,
+        else => .none,
+    };
+}
+
 /// 统一只读判定物理下标 `idx` 处的词法单元在 `scope` 下是否属于声明修饰符。
 fn isModifierAtIndex(p: *const Parser, idx: usize, scope: DeclScope) bool {
     if (idx >= p.tokens.len) return false;
@@ -573,45 +613,45 @@ fn isModifierAtIndex(p: *const Parser, idx: usize, scope: DeclScope) bool {
         };
     }
 
-    // 在类/结构体中若上下文关键字或 `common`/`specific` 后紧跟 `(`，将其留作主构造器名称
-    if (scope == .class_body or scope == .struct_body) {
-        const is_ctx_or_cs = Parser.isContextKeywordTag(tok.tag) or
-            (tok.tag == .identifier and
-                (std.mem.eql(u8, p.tokenText(tok), "common") or std.mem.eql(u8, p.tokenText(tok), "specific")));
-        if (is_ctx_or_cs) {
-            const next = p.nextSignificantIndex(idx + 1, true);
-            if (next < p.tokens.len and p.tokens[next].tag == .l_paren) {
-                return false;
-            }
-        }
-    }
-
+    const in_type_body = scope == .class_body or scope == .struct_body;
     return switch (tok.tag) {
         .kw_public,
         .kw_private,
         .kw_protected,
         .kw_internal,
-        .kw_static,
         .kw_override,
         .kw_redef,
         .kw_abstract,
         .kw_sealed,
         .kw_open,
+        => blk: {
+            if (in_type_body) {
+                const next = p.nextSignificantIndex(idx + 1, true);
+                if (next < p.tokens.len and p.tokens[next].tag == .l_paren) break :blk false;
+            }
+            break :blk true;
+        },
+        .kw_static,
         .kw_mut,
         .kw_unsafe,
         .kw_operator,
         => true,
         .kw_const => isConstModifierAtIndex(p, idx, scope),
         .identifier => blk: {
-            const text = p.tokenText(tok);
-            if (std.mem.eql(u8, text, "common") or std.mem.eql(u8, text, "specific")) {
-                break :blk true;
+            switch (classifyIdentModifier(p.tokenText(tok))) {
+                .common, .specific => {
+                    if (in_type_body) {
+                        const next = p.nextSignificantIndex(idx + 1, true);
+                        if (next < p.tokens.len and p.tokens[next].tag == .l_paren) break :blk false;
+                    }
+                    break :blk true;
+                },
+                .late => {
+                    const next = p.nextSignificantIndex(idx + 1, true);
+                    break :blk next < p.tokens.len and p.tokens[next].tag == .kw_macro;
+                },
+                .none => break :blk false,
             }
-            if (std.mem.eql(u8, text, "late")) {
-                const next = p.nextSignificantIndex(idx + 1, true);
-                break :blk next < p.tokens.len and p.tokens[next].tag == .kw_macro;
-            }
-            break :blk false;
         },
         else => false,
     };
@@ -620,18 +660,20 @@ fn isModifierAtIndex(p: *const Parser, idx: usize, scope: DeclScope) bool {
 /// 消费声明修饰符序列，其中 `common` / `specific` 按上下文关键字发射为对应 `SyntaxKind`。
 fn parseDeclModifiers(p: *Parser, scope: DeclScope) std.mem.Allocator.Error!void {
     while (true) {
-        const idx = p.nextSignificantIndex(p.cursor, true);
+        const idx = p.sig_idx;
         if (!isModifierAtIndex(p, idx, scope)) break;
         const tok = p.tokens[idx];
         if (tok.tag == .identifier) {
-            const text = p.tokenText(tok);
-            if (std.mem.eql(u8, text, "common")) {
-                try p.bumpAs(.kw_common);
-                continue;
-            }
-            if (std.mem.eql(u8, text, "specific")) {
-                try p.bumpAs(.kw_specific);
-                continue;
+            switch (classifyIdentModifier(p.tokenText(tok))) {
+                .common => {
+                    try p.bumpAs(.kw_common);
+                    continue;
+                },
+                .specific => {
+                    try p.bumpAs(.kw_specific);
+                    continue;
+                },
+                else => {},
             }
         }
         try p.bump();
@@ -640,7 +682,10 @@ fn parseDeclModifiers(p: *Parser, scope: DeclScope) std.mem.Allocator.Error!void
 
 /// 只读前瞻自 `start_idx` 跳过前置内置注解与修饰符后，判定声明体应构造的 `SyntaxKind`。
 fn peekDeclKindAt(p: *const Parser, start_idx: usize, scope: DeclScope) ?SyntaxKind {
-    var idx = skipLeadingBuiltinAnnotationsIndex(p, start_idx);
+    var idx = if (start_idx < p.tokens.len and p.tokens[start_idx].tag == .at)
+        skipLeadingBuiltinAnnotationsIndex(p, start_idx)
+    else
+        p.nextSignificantIndex(start_idx, true);
     if (idx >= p.tokens.len) return null;
 
     // 遇到非内置注解的 `@` 或 `@!` 直接归为声明位置宏调用
@@ -685,58 +730,60 @@ fn peekDeclKindAt(p: *const Parser, start_idx: usize, scope: DeclScope) ?SyntaxK
 }
 
 /// 只读判断当前游标处的声明类型。
-fn peekDeclKind(p: *const Parser, scope: DeclScope) ?SyntaxKind {
-    return peekDeclKindAt(p, p.cursor, scope);
+inline fn peekDeclKind(p: *const Parser, scope: DeclScope) ?SyntaxKind {
+    return peekDeclKindAt(p, p.sig_idx, scope);
+}
+
+/// 只读判断局部语句块中当前词法位置对应的声明类型；若非局部声明返回 `null`。
+pub fn peekLocalDeclKind(p: *const Parser) ?SyntaxKind {
+    const first = p.sig_tag;
+    return switch (first) {
+        .kw_let, .kw_var => .var_decl,
+        .kw_func => .func_decl,
+        .kw_class => .class_decl,
+        .kw_struct => .struct_decl,
+        .kw_interface => .interface_decl,
+        .kw_enum => .enum_decl,
+        .kw_type => .type_alias_decl,
+        .kw_extend => .extend_decl,
+        .at_excl => .macro_expand_decl,
+        .kw_const => peekDeclKindAt(p, p.sig_idx, .local_block),
+        .kw_unsafe => blk: {
+            // 排除 `unsafe { ... }`（属于 `unsafe_expr`）
+            const next = p.nextSignificantIndex(p.sig_idx + 1, true);
+            if (next < p.tokens.len and p.tokens[next].tag == .l_curl) break :blk null;
+            const k = peekDeclKindAt(p, p.sig_idx, .local_block) orelse break :blk null;
+            break :blk switch (k) {
+                .var_decl, .func_decl, .class_decl, .struct_decl, .interface_decl, .enum_decl, .type_alias_decl, .extend_decl, .macro_expand_decl => k,
+                else => null,
+            };
+        },
+        .at => blk: {
+            if (expr.isIfAvailableStart(p)) break :blk null;
+            if (isBuiltinAnnotationAtIndex(p, p.sig_idx)) {
+                const after_anno = skipLeadingBuiltinAnnotationsIndex(p, p.sig_idx);
+                if (after_anno < p.tokens.len and p.tokens[after_anno].tag == .l_curl) break :blk null;
+                const k = peekDeclKindAt(p, p.sig_idx, .local_block) orelse break :blk null;
+                break :blk switch (k) {
+                    .var_decl, .func_decl, .class_decl, .struct_decl, .interface_decl, .enum_decl, .type_alias_decl, .extend_decl, .macro_expand_decl => k,
+                    else => null,
+                };
+            }
+            break :blk if (isMacroWithoutParensAtIndex(p, p.sig_idx)) .macro_expand_decl else null;
+        },
+        else => null,
+    };
 }
 
 /// 只读判断局部语句块中当前词法位置是否为局部声明（宽松允许块内声明，同时保留独立上下文关键字表达式）。
-pub fn isLocalDeclStart(p: *const Parser) bool {
-    const first_idx = p.nextSignificantIndex(p.cursor, true);
-    if (first_idx >= p.tokens.len) return false;
-    const first = p.tokens[first_idx].tag;
-
-    // 排除 `unsafe { ... }`（属于 `unsafe_expr`）
-    if (first == .kw_unsafe) {
-        const next = p.nextSignificantIndex(first_idx + 1, true);
-        if (next < p.tokens.len and p.tokens[next].tag == .l_curl) return false;
-    }
-
-    if (first == .at) {
-        if (expr.isIfAvailableStart(p)) return false;
-        if (isBuiltinAnnotationAtIndex(p, first_idx)) {
-            const after_anno = skipLeadingBuiltinAnnotationsIndex(p, first_idx);
-            if (after_anno < p.tokens.len and p.tokens[after_anno].tag == .l_curl) return false;
-        } else {
-            return isMacroWithoutParensAtIndex(p, first_idx);
-        }
-    }
-    if (first == .at_excl) return true;
-
-    const k = peekDeclKindAt(p, first_idx, .local_block) orelse return false;
-    return switch (k) {
-        .var_decl,
-        .func_decl,
-        .class_decl,
-        .struct_decl,
-        .interface_decl,
-        .enum_decl,
-        .type_alias_decl,
-        .extend_decl,
-        .macro_expand_decl,
-        => true,
-        else => false,
-    };
+pub inline fn isLocalDeclStart(p: *const Parser) bool {
+    return peekLocalDeclKind(p) != null;
 }
 
-/// 根据作用域解析单条声明（或声明位置宏调用）。
-pub fn parseDecl(p: *Parser, scope: DeclScope) std.mem.Allocator.Error!void {
+/// 根据已前瞻确定的声明类型 `kind` 直接分发解析单条声明，避免重复前瞻。
+pub fn parseDeclWithKind(p: *Parser, scope: DeclScope, kind: SyntaxKind) std.mem.Allocator.Error!void {
     if (!try p.enterDepth()) return;
     defer p.leaveDepth();
-
-    const kind = peekDeclKind(p, scope) orelse {
-        try p.bumpErrorToken(.expected_item);
-        return;
-    };
 
     switch (kind) {
         .macro_expand_decl => try parseMacroExpandDecl(p, scope),
@@ -757,6 +804,17 @@ pub fn parseDecl(p: *Parser, scope: DeclScope) std.mem.Allocator.Error!void {
         .foreign_decl => try parseForeignDecl(p),
         else => try p.bumpErrorToken(.expected_item),
     }
+}
+
+/// 根据作用域解析单条声明（或声明位置宏调用）。
+pub fn parseDecl(p: *Parser, scope: DeclScope) std.mem.Allocator.Error!void {
+    const kind = peekDeclKind(p, scope) orelse {
+        if (!try p.enterDepth()) return;
+        defer p.leaveDepth();
+        try p.bumpErrorToken(.expected_item);
+        return;
+    };
+    try parseDeclWithKind(p, scope, kind);
 }
 
 /// 解析 `class` 声明。
@@ -1007,9 +1065,10 @@ fn parseMemberBody(p: *Parser, node_kind: SyntaxKind, scope: DeclScope) std.mem.
     try p.startNode(node_kind);
     try p.emitLeadingTrivia(false);
     try p.bump(); // {
-    while (!p.isAtEof() and !p.at(.r_curl)) {
+    while (true) {
         _ = try p.eatSemicolons();
-        if (p.at(.r_curl) or p.isAtEof()) break;
+        const cur = p.peek();
+        if (cur == .r_curl or cur == .end) break;
         const before = p.cursor;
         try parseDecl(p, scope);
         _ = try p.eatSemicolons();
@@ -1027,8 +1086,10 @@ fn parseFuncDecl(p: *Parser, scope: DeclScope) std.mem.Allocator.Error!void {
     try parseDeclModifiers(p, scope);
     _ = try p.expect(.kw_func);
 
-    if (!try eatOverloadableOperator(p)) {
-        _ = try p.expectIdent();
+    if (Parser.isIdentLike(p.peek())) {
+        try p.bumpAs(.identifier);
+    } else if (!try eatOverloadableOperator(p)) {
+        try p.emitError(.expected_identifier);
     }
 
     if (p.at(.less)) try parseTypeParameterList(p);
@@ -1140,10 +1201,9 @@ fn parseVarDecl(p: *Parser, scope: DeclScope) std.mem.Allocator.Error!void {
     try parseLeadingBuiltinAnnotations(p, true);
     try parseDeclModifiers(p, scope);
 
-    if (p.at(.kw_let) or p.at(.kw_var) or p.at(.kw_const)) {
-        try p.bump();
-    } else {
-        try p.emitError(.expected_token);
+    switch (p.peek()) {
+        .kw_let, .kw_var, .kw_const => try p.bump(),
+        else => try p.emitError(.expected_token),
     }
 
     try pattern.parsePattern(p, false);
@@ -1315,8 +1375,10 @@ fn parseTypeParameterList(p: *Parser) std.mem.Allocator.Error!void {
         try p.finishNode();
         count += 1;
         if (try p.eat(.comma)) {
-            if (p.shouldStopList(.type_param_list)) break;
-        } else if (Parser.isIdentLike(p.peek()) and !p.shouldStopList(.type_param_list)) {
+            continue;
+        } else if (p.shouldStopList(.type_param_list)) {
+            break;
+        } else if (Parser.isIdentLike(p.peek())) {
             try p.emitError(.expected_token);
         } else {
             break;
@@ -1398,17 +1460,24 @@ fn parseFuncParamList(p: *Parser, is_primary_ctor: bool) std.mem.Allocator.Error
             _ = try p.eat(.comma);
             break;
         }
-        const after_builtin = skipLeadingBuiltinAnnotationsIndex(p, p.cursor);
-        if (after_builtin < p.tokens.len and
-            (p.tokens[after_builtin].tag == .at or p.tokens[after_builtin].tag == .at_excl))
-        {
-            try parseMacroExpandParam(p, is_primary_ctor);
+        const cur_tag = p.peek();
+        if (cur_tag == .at or cur_tag == .at_excl) {
+            const after_builtin = skipLeadingBuiltinAnnotationsIndex(p, p.sig_idx);
+            if (after_builtin < p.tokens.len and
+                (p.tokens[after_builtin].tag == .at or p.tokens[after_builtin].tag == .at_excl))
+            {
+                try parseMacroExpandParam(p, is_primary_ctor);
+            } else {
+                try parseFuncParam(p, is_primary_ctor);
+            }
         } else {
             try parseFuncParam(p, is_primary_ctor);
         }
         if (try p.eat(.comma)) {
-            if (p.shouldStopList(list_ctx)) break;
-        } else if (canStartFuncParam(p, is_primary_ctor) and !p.shouldStopList(list_ctx)) {
+            continue;
+        } else if (p.shouldStopList(list_ctx)) {
+            break;
+        } else if (canStartFuncParam(p, is_primary_ctor)) {
             try p.emitError(.expected_token);
         } else {
             break;

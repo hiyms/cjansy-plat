@@ -86,15 +86,15 @@ pub fn parseStmtList(p: *Parser, stop_tag: TokenTag, stop_at_case: bool) std.mem
     try p.startNode(.stmt_list);
 
     var count: usize = 0;
-    while (!p.isAtEof()) {
+    while (true) {
         _ = try p.eatSemicolons();
         const cur = p.peek();
         if (cur == .end or cur == stop_tag) break;
         if (stop_at_case and cur == .kw_case) break;
 
         const before = p.cursor;
-        if (decl.isLocalDeclStart(p)) {
-            try decl.parseDecl(p, .local_block);
+        if (decl.peekLocalDeclKind(p)) |decl_kind| {
+            try decl.parseDeclWithKind(p, .local_block, decl_kind);
         } else {
             try parseExprStmt(p);
         }
@@ -229,40 +229,54 @@ fn parseExprBp(p: *Parser, min_prec: u8) std.mem.Allocator.Error!LhsKind {
 }
 
 /// 只读识别当前位置的中缀运算符及其优先级、结合性与组合形态。
-fn peekInfixOp(p: *const Parser) ?InfixInfo {
-    if (p.peekCombinedOp(true)) |comb| {
-        return switch (comb.kind) {
-            .rshift_assign => .{
-                .prec = Prec.assign,
-                .right_prec = Prec.flow,
-                .kind = .assign,
-                .non_assoc = true,
-                .combined = comb,
-            },
-            .coalescing => .{
-                .prec = Prec.coalescing,
-                .right_prec = Prec.coalescing,
-                .kind = .binary,
-                .combined = comb,
-            },
-            .greater_equal => .{
+inline fn peekInfixOp(p: *const Parser) ?InfixInfo {
+    return switch (p.sig_tag) {
+        .quest => blk: {
+            if (p.combinedOpAt(p.sig_idx)) |comb| {
+                if (comb.kind == .coalescing) {
+                    break :blk .{
+                        .prec = Prec.coalescing,
+                        .right_prec = Prec.coalescing,
+                        .kind = .binary,
+                        .combined = comb,
+                    };
+                }
+            }
+            break :blk null;
+        },
+        .greater => blk: {
+            if (p.combinedOpAt(p.sig_idx)) |comb| {
+                break :blk switch (comb.kind) {
+                    .rshift_assign => .{
+                        .prec = Prec.assign,
+                        .right_prec = Prec.flow,
+                        .kind = .assign,
+                        .non_assoc = true,
+                        .combined = comb,
+                    },
+                    .greater_equal => .{
+                        .prec = Prec.comparison,
+                        .right_prec = Prec.range,
+                        .kind = .binary,
+                        .non_assoc = true,
+                        .combined = comb,
+                    },
+                    .rshift => .{
+                        .prec = Prec.shift,
+                        .right_prec = Prec.shift + 1,
+                        .kind = .binary,
+                        .combined = comb,
+                    },
+                    else => null,
+                };
+            }
+            break :blk .{
                 .prec = Prec.comparison,
                 .right_prec = Prec.range,
                 .kind = .binary,
                 .non_assoc = true,
-                .combined = comb,
-            },
-            .rshift => .{
-                .prec = Prec.shift,
-                .right_prec = Prec.shift + 1,
-                .kind = .binary,
-                .combined = comb,
-            },
-            else => null,
-        };
-    }
-
-    return switch (p.peek()) {
+            };
+        },
         .assign,
         .add_assign,
         .sub_assign,
@@ -318,7 +332,7 @@ fn peekInfixOp(p: *const Parser) ?InfixInfo {
             .kind = .binary,
             .non_assoc = true,
         },
-        .less, .less_equal, .greater => .{
+        .less, .less_equal => .{
             .prec = Prec.comparison,
             .right_prec = Prec.range,
             .kind = .binary,
@@ -377,7 +391,8 @@ fn peekInfixOp(p: *const Parser) ?InfixInfo {
 
 /// 解析前缀一元表达式（`-`、`!`），带递归深度上限保护；否则进入后缀与自增自减层。
 fn parsePrefixExpr(p: *Parser) std.mem.Allocator.Error!LhsKind {
-    if (p.at(.sub) or p.at(.not)) {
+    const tag = p.sig_tag;
+    if (tag == .sub or tag == .not) {
         if (!try p.enterDepth()) return .missing;
         defer p.leaveDepth();
 
@@ -577,8 +592,8 @@ fn isAnnotatedTrailingLambdaSameLine(p: *const Parser) bool {
 
 /// 只读前瞻同行 `?` 之后的下一个非注释词法单元（用于判定 `?.`、`?(`、`?[`、`?{`）。
 fn peekAfterQuest(p: *const Parser) TokenTag {
-    const q_idx = p.nextSignificantIndex(p.cursor, false);
-    if (q_idx >= p.tokens.len or p.tokens[q_idx].tag != .quest) return .end;
+    const q_idx = p.sig_no_nl_idx;
+    if (q_idx >= p.tokens.len or p.sig_no_nl_tag != .quest) return .end;
     const next_idx = p.nextSignificantIndex(q_idx + 1, true);
     if (next_idx >= p.tokens.len) return .end;
     if (p.tokens[next_idx].tag == .dot) return .dot;
@@ -802,7 +817,7 @@ fn parseLetConditionDestructor(p: *Parser) std.mem.Allocator.Error!void {
 
 /// 只读判断当前有效词法单元之后是否在同一行紧接 `(`（避免跨行误判类型转换表达式）。
 fn isSameLineLParenAfterCurrent(p: *const Parser) bool {
-    const cur_idx = p.nextSignificantIndex(p.cursor, true);
+    const cur_idx = p.sig_idx;
     if (cur_idx >= p.tokens.len) return false;
     const next_idx = p.nextSignificantIndex(cur_idx + 1, false);
     if (next_idx >= p.tokens.len) return false;
@@ -813,7 +828,18 @@ fn isSameLineLParenAfterCurrent(p: *const Parser) bool {
 fn parsePathExpr(p: *Parser) std.mem.Allocator.Error!void {
     try p.startNode(.path_expr);
     try p.emitLeadingTrivia(false);
-    try parseExprPathSegment(p);
+    // 首段已由 `parseAtomExpr` 确认非声明边界、已发射前导 Trivia 且标签合法
+    try p.startNode(.path_segment);
+    const tag = p.sig_tag;
+    if (tag == .kw_this or tag == .kw_super or tag == .kw_this_type or Parser.isPrimitiveTypeTag(tag)) {
+        try p.bump();
+    } else {
+        try p.bumpAs(.identifier);
+    }
+    if (p.sig_tag == .less) {
+        _ = try type_parser.tryParseExprTypeArguments(p);
+    }
+    try p.finishNode();
     try parseFlatPathTail(p);
     try p.finishNode();
 }
@@ -828,7 +854,7 @@ fn parseExprPathSegment(p: *Parser) std.mem.Allocator.Error!void {
         return;
     }
     try p.emitLeadingTrivia(false);
-    const tag = p.peek();
+    const tag = p.sig_tag;
     if (tag == .kw_this or tag == .kw_super or tag == .kw_this_type or Parser.isPrimitiveTypeTag(tag)) {
         try p.bump();
     } else if (Parser.isIdentLike(tag)) {
@@ -836,7 +862,7 @@ fn parseExprPathSegment(p: *Parser) std.mem.Allocator.Error!void {
     } else {
         try p.emitError(.expected_identifier);
     }
-    if (p.at(.less)) {
+    if (p.sig_tag == .less) {
         _ = try type_parser.tryParseExprTypeArguments(p);
     }
     try p.finishNode();
@@ -867,15 +893,12 @@ fn parseVArrayExpr(p: *Parser) std.mem.Allocator.Error!void {
     try p.finishNode();
 }
 
-/// 只读探测当前 `(` 括号表达式内是否存在顶层逗号，以一次区分 `unit_literal`、`paren_expr` 与 `tuple_lit`。
-fn parenExprHasTopComma(p: *const Parser) bool {
-    const start_idx = p.nextSignificantIndex(p.cursor, true);
-    if (start_idx >= p.tokens.len or p.tokens[start_idx].tag != .l_paren) return false;
-
+/// 只读探测自 `start_idx` 起当前未闭合圆括号内剩余部分是否存在顶层逗号。
+fn scanTopCommaInParenFrom(p: *const Parser, start_idx: usize) bool {
     var paren_depth: u32 = 0;
     var square_depth: u32 = 0;
     var curl_depth: u32 = 0;
-    var idx = start_idx + 1;
+    var idx = start_idx;
 
     while (idx < p.tokens.len) : (idx += 1) {
         const tag = p.tokens[idx].tag;
@@ -905,6 +928,31 @@ fn parenExprHasTopComma(p: *const Parser) bool {
     return false;
 }
 
+/// 只读探测当前 `(` 括号表达式内是否存在顶层逗号，用于 `allow_let_condition` 场景下区分 `paren_expr` 与 `tuple_lit`。
+fn parenExprHasTopComma(p: *const Parser) bool {
+    const start_idx = p.sig_idx;
+    if (start_idx >= p.tokens.len or p.sig_tag != .l_paren) return false;
+    return scanTopCommaInParenFrom(p, start_idx + 1);
+}
+
+/// 解析 `tuple_lit` 中剩余的逗号分隔元素直到闭合 `)` 或外层同步边界。
+fn parseTupleTailElements(p: *Parser) std.mem.Allocator.Error!void {
+    while (!p.shouldStopList(.paren_expr_list)) {
+        const before = p.cursor;
+        _ = try parseExprWithRestrictions(p, .{});
+        if (try p.eat(.comma)) {
+            continue;
+        } else if (p.shouldStopList(.paren_expr_list)) {
+            break;
+        } else if (p.canStartExpr()) {
+            try p.emitError(.expected_token);
+        } else {
+            break;
+        }
+        if (p.cursor == before) try p.bumpErrorToken(.expected_expression);
+    }
+}
+
 /// 解析 `()`（`unit_literal`）、`(expr)`（`paren_expr`）或 `(e1, e2, ...)`（`tuple_lit`）。
 fn parseParenUnitOrTupleExpr(p: *Parser) std.mem.Allocator.Error!LhsKind {
     if (p.peekNth(1) == .r_paren) {
@@ -916,37 +964,51 @@ fn parseParenUnitOrTupleExpr(p: *Parser) std.mem.Allocator.Error!LhsKind {
         return .general;
     }
 
-    if (parenExprHasTopComma(p)) {
-        try p.startNode(.tuple_lit);
+    // `if` / `while` 条件内需根据是否含逗号决定首元素是否继承 `allow_let_condition`
+    if (p.restrictions.allow_let_condition) {
+        if (parenExprHasTopComma(p)) {
+            try p.startNode(.tuple_lit);
+            try p.emitLeadingTrivia(false);
+            try p.bump(); // (
+            try parseTupleTailElements(p);
+            _ = try p.expectClosing(.r_paren);
+            try p.finishNode();
+            return .general;
+        }
+
+        const inner_r: parser_mod.Restrictions = .{
+            .allow_trailing_closure = true,
+            .allow_range_colon = true,
+            .allow_let_condition = true,
+        };
+        try p.startNode(.paren_expr);
         try p.emitLeadingTrivia(false);
         try p.bump(); // (
-        while (!p.shouldStopList(.paren_expr_list)) {
-            const before = p.cursor;
-            _ = try parseExprWithRestrictions(p, .{});
-            if (try p.eat(.comma)) {
-                if (p.shouldStopList(.paren_expr_list)) break;
-            } else if (p.canStartExpr() and !p.shouldStopList(.paren_expr_list)) {
-                try p.emitError(.expected_token);
-            } else {
-                break;
-            }
-            if (p.cursor == before) try p.bumpErrorToken(.expected_expression);
-        }
+        _ = try parseExprWithRestrictions(p, inner_r);
         _ = try p.expectClosing(.r_paren);
         try p.finishNode();
         return .general;
     }
 
-    // 单元素括号继承 `allow_let_condition`，使 `if ((let Some(v) <- opt) && v > 0)` 正常解析
-    const inner_r: parser_mod.Restrictions = .{
-        .allow_trailing_closure = true,
-        .allow_range_colon = true,
-        .allow_let_condition = p.restrictions.allow_let_condition,
-    };
+    // 常规括号表达式与元组统一单趟解析：先按 `paren_expr` 开启，遇 `,` 时原地改写为 `tuple_lit`
+    const start_ev_idx = p.events.items.len;
     try p.startNode(.paren_expr);
     try p.emitLeadingTrivia(false);
     try p.bump(); // (
-    _ = try parseExprWithRestrictions(p, inner_r);
+    _ = try parseExprWithRestrictions(p, .{});
+    if (try p.eat(.comma)) {
+        p.setNodeKindAt(start_ev_idx, .tuple_lit);
+        try parseTupleTailElements(p);
+    } else if (p.sig_tag != .r_paren and
+        !p.shouldStopList(.paren_expr_list) and
+        p.canStartExpr() and
+        scanTopCommaInParenFrom(p, p.sig_idx))
+    {
+        // 错误恢复冷路径：首元素后漏逗号但括号内后续仍存在顶层逗号（如 `(a b, c)`）
+        p.setNodeKindAt(start_ev_idx, .tuple_lit);
+        try p.emitError(.expected_token);
+        try parseTupleTailElements(p);
+    }
     _ = try p.expectClosing(.r_paren);
     try p.finishNode();
     return .general;
@@ -962,8 +1024,10 @@ fn parseArrayLit(p: *Parser) std.mem.Allocator.Error!void {
         _ = try p.eat(.mul);
         _ = try parseExprWithRestrictions(p, .{});
         if (try p.eat(.comma)) {
-            if (p.shouldStopList(.square_expr_list)) break;
-        } else if ((p.canStartExpr() or p.at(.mul)) and !p.shouldStopList(.square_expr_list)) {
+            continue;
+        } else if (p.shouldStopList(.square_expr_list)) {
+            break;
+        } else if (p.canStartExpr() or p.at(.mul)) {
             try p.emitError(.expected_token);
         } else {
             break;
@@ -981,8 +1045,10 @@ fn parseCallArgs(p: *Parser) std.mem.Allocator.Error!void {
         const before = p.cursor;
         try parseFuncArg(p);
         if (try p.eat(.comma)) {
-            if (p.shouldStopList(.paren_expr_list)) break;
-        } else if (p.canStartExpr() and !p.shouldStopList(.paren_expr_list)) {
+            continue;
+        } else if (p.shouldStopList(.paren_expr_list)) {
+            break;
+        } else if (p.canStartExpr()) {
             try p.emitError(.expected_token);
         } else {
             break;
@@ -1033,10 +1099,10 @@ fn parseSubscriptArgs(p: *Parser) std.mem.Allocator.Error!void {
         }
 
         if (try p.eat(.comma)) {
-            if (p.shouldStopList(.square_expr_list)) break;
-        } else if ((p.canStartExpr() or p.at(.range_op) or p.at(.closed_range_op)) and
-            !p.shouldStopList(.square_expr_list))
-        {
+            continue;
+        } else if (p.shouldStopList(.square_expr_list)) {
+            break;
+        } else if (p.canStartExpr() or p.at(.range_op) or p.at(.closed_range_op)) {
             try p.emitError(.expected_token);
         } else {
             break;
@@ -1418,10 +1484,10 @@ fn parseUnsafeExpr(p: *Parser) std.mem.Allocator.Error!void {
     try p.finishNode();
 }
 
-/// 只读前瞻 `{` 之后是否存在顶层 `=>`（遇任意 `{` / `}` 立即终止，避免 `<` 与嵌套 `match` 误判）。
+/// 只读前瞻 `{` 之后是否存在顶层 `=>`（遇任意 `{` / `}` 或非参数关键字立即终止，避免 `<` 与嵌套 `match` 误判）。
 fn lambdaHasArrow(p: *const Parser) bool {
-    const start_idx = p.nextSignificantIndex(p.cursor, true);
-    if (start_idx >= p.tokens.len or p.tokens[start_idx].tag != .l_curl) return false;
+    const start_idx = p.sig_idx;
+    if (start_idx >= p.tokens.len or p.sig_tag != .l_curl) return false;
 
     var paren_depth: u32 = 0;
     var angle_depth: u32 = 0;
@@ -1432,8 +1498,23 @@ fn lambdaHasArrow(p: *const Parser) bool {
         if (tag == .comment or tag == .nl) continue;
         if (tag == .end or tag == .semi or tag == .l_curl or tag == .r_curl) return false;
 
-        if (paren_depth == 0 and angle_depth == 0 and tag == .double_arrow) {
-            return true;
+        if (paren_depth == 0 and angle_depth == 0) {
+            if (tag == .double_arrow) return true;
+            switch (tag) {
+                .kw_let,
+                .kw_var,
+                .kw_return,
+                .kw_if,
+                .kw_while,
+                .kw_for,
+                .kw_match,
+                .kw_try,
+                .kw_break,
+                .kw_continue,
+                .kw_throw,
+                => return false,
+                else => {},
+            }
         }
         switch (tag) {
             .l_paren => paren_depth += 1,
@@ -1704,17 +1785,16 @@ inline fn isValidQuoteEscapeTarget(tag: TokenTag) bool {
 
 /// 解析单行或多行字符串字面量；若内部包含未转义的 `${...}` 插值则展开为 `str_interpolation_expr`。
 fn parseStringOrInterpolation(p: *Parser) std.mem.Allocator.Error!void {
-    const idx = p.nextSignificantIndex(p.cursor, true);
+    const idx = p.sig_idx;
     if (idx >= p.tokens.len) return;
     const tok = p.tokens[idx];
     const text = p.tokenText(tok);
     const is_multiline = tok.tag == .multiline_string;
 
-    const first_interp = findNextInterpolation(text, 0, is_multiline);
-    if (first_interp == null) {
+    const first_interp = findNextInterpolation(text, 0, is_multiline) orelse {
         try p.bump();
         return;
-    }
+    };
 
     if (!try p.enterDepth()) {
         try p.bump();
@@ -1725,13 +1805,13 @@ fn parseStringOrInterpolation(p: *Parser) std.mem.Allocator.Error!void {
     try p.startNode(.str_interpolation_expr);
     try p.emitLeadingTrivia(false);
     const range = p.safeRange(tok.span);
-    p.cursor += 1;
+    p.setCursor(p.cursor + 1);
 
     var seg_start: u32 = 0;
-    var scan_pos: u32 = 0;
     const text_len: u32 = @intCast(text.len);
+    var next_interp: ?u32 = first_interp;
 
-    while (findNextInterpolation(text, scan_pos, is_multiline)) |dollar_rel| {
+    while (next_interp) |dollar_rel| {
         if (dollar_rel > seg_start) {
             try p.emitLeaf(.string_content, .{
                 .start = range.start + seg_start,
@@ -1741,8 +1821,12 @@ fn parseStringOrInterpolation(p: *Parser) std.mem.Allocator.Error!void {
         }
 
         const expr_rel_start = dollar_rel + 2;
-        const close_rel = findMatchingInterpClose(text, expr_rel_start);
-        if (close_rel) |r_curl_rel| {
+        var inline_tokens: [64]common.Token = undefined;
+        var heap_tokens: std.ArrayList(common.Token) = .empty;
+        defer heap_tokens.deinit(p.allocator);
+
+        if (try lexInterpolationUntilClose(p.allocator, text, expr_rel_start, &inline_tokens, &heap_tokens)) |interp_res| {
+            const r_curl_rel = interp_res.close_rel;
             try p.startNode(.interpolation_expr);
             try p.emitLeaf(.dollar, .{
                 .start = range.start + dollar_rel,
@@ -1753,7 +1837,7 @@ fn parseStringOrInterpolation(p: *Parser) std.mem.Allocator.Error!void {
                 .end = range.start + expr_rel_start,
             });
 
-            try parseInterpolationBlock(p, range.start + expr_rel_start, range.start + r_curl_rel);
+            try parseInterpolationTokens(p, range.start + expr_rel_start, range.start + r_curl_rel, interp_res.tokens);
 
             try p.emitLeaf(.r_curl, .{
                 .start = range.start + r_curl_rel,
@@ -1762,7 +1846,7 @@ fn parseStringOrInterpolation(p: *Parser) std.mem.Allocator.Error!void {
             try p.finishNode();
 
             seg_start = r_curl_rel + 1;
-            scan_pos = seg_start;
+            next_interp = findNextInterpolation(text, seg_start, is_multiline);
         } else {
             try p.emitErrorAt(.invalid_interpolation, .{
                 .start = p.globalPos(range.start + dollar_rel),
@@ -1782,7 +1866,7 @@ fn parseStringOrInterpolation(p: *Parser) std.mem.Allocator.Error!void {
     try p.finishNode();
 }
 
-/// 在字符串字面量文本中自 `start` 起查找下一个未转义的 `${` 相对位置；跳过转义序列。
+/// 在字符串字面量文本中自 `start` 起查找下一个未转义的 `${` 相对位置；优先使用向量化查找跳过不含 `$` 的文本。
 fn findNextInterpolation(text: []const u8, start: u32, is_multiline: bool) ?u32 {
     var pos: usize = start;
     if (start == 0) {
@@ -1802,25 +1886,46 @@ fn findNextInterpolation(text: []const u8, start: u32, is_multiline: bool) ?u32 
     else
         (if (text.len >= 1) text.len - 1 else 0);
 
+    if (pos >= end_limit) return null;
+    const body = text[0..end_limit];
+    if (std.mem.indexOfScalarPos(u8, body, pos, '$') == null) return null;
+
     while (pos < end_limit) {
-        const c = text[pos];
-        if (c == '\\') {
-            pos += 2;
+        const hit = std.mem.indexOfAnyPos(u8, body, pos, "\\$") orelse return null;
+        if (body[hit] == '\\') {
+            pos = hit + 2;
             continue;
         }
-        if (c == '$' and pos + 1 < end_limit and text[pos + 1] == '{') {
-            return @intCast(pos);
+        if (hit + 1 < end_limit and body[hit + 1] == '{') {
+            return @intCast(hit);
         }
-        pos += 1;
+        pos = hit + 1;
     }
     return null;
 }
 
-/// 从 `${` 之后第一字节起扫描，定位与该 `${` 配对的 `}` 相对位置，完整跳过内层大括号、注释与嵌套字符串。
-fn findMatchingInterpClose(text: []const u8, start: u32) ?u32 {
+/// 单遍词法扫描插值体的结果：`close_rel` 为配对 `}` 在字符串文本中的相对位置，`tokens` 借用自调用方传入缓冲。
+const InterpLexResult = struct {
+    close_rel: u32,
+    tokens: []const common.Token,
+};
+
+/// 单遍扫描自 `${` 之后第一字节至配对 `}` 的全部词法单元，同时定位闭合 `}` 相对位置。
+///
+/// 短插值直接写入调用方提供的 `inline_buf`（零堆分配），超长插值溢出到 `heap_buf`（由调用方释放）；
+/// 返回结果中的 `tokens` 切片借用自 `inline_buf` 或 `heap_buf`，调用方不得单独释放。
+fn lexInterpolationUntilClose(
+    allocator: std.mem.Allocator,
+    text: []const u8,
+    start: u32,
+    inline_buf: []common.Token,
+    heap_buf: *std.ArrayList(common.Token),
+) std.mem.Allocator.Error!?InterpLexResult {
     const sub = text[start..];
     var lex = parser_mod.lexer.Lexer.new(sub) catch return null;
     var brace_depth: u32 = 1;
+    var inline_len: usize = 0;
+    var using_heap = false;
 
     while (true) {
         const tok = lex.gen() catch return null;
@@ -1830,63 +1935,96 @@ fn findMatchingInterpClose(text: []const u8, start: u32) ?u32 {
         } else if (tok.tag == .r_curl) {
             brace_depth -= 1;
             if (brace_depth == 0) {
-                return start + tok.span.start;
+                const end_tok: common.Token = .{
+                    .tag = .end,
+                    .span = .{ .start = tok.span.start, .end = tok.span.start },
+                };
+                const tokens_slice: []const common.Token = if (!using_heap and inline_len < inline_buf.len) blk: {
+                    inline_buf[inline_len] = end_tok;
+                    inline_len += 1;
+                    break :blk inline_buf[0..inline_len];
+                } else blk: {
+                    if (!using_heap) {
+                        try heap_buf.ensureTotalCapacity(allocator, inline_len + 1);
+                        heap_buf.appendSliceAssumeCapacity(inline_buf[0..inline_len]);
+                        using_heap = true;
+                    }
+                    try heap_buf.append(allocator, end_tok);
+                    break :blk heap_buf.items;
+                };
+                return .{
+                    .close_rel = start + tok.span.start,
+                    .tokens = tokens_slice,
+                };
             }
+        }
+
+        if (!using_heap) {
+            if (inline_len < inline_buf.len) {
+                inline_buf[inline_len] = tok;
+                inline_len += 1;
+            } else {
+                try heap_buf.ensureTotalCapacity(allocator, @max(inline_len * 2, 16));
+                heap_buf.appendSliceAssumeCapacity(inline_buf[0..inline_len]);
+                heap_buf.appendAssumeCapacity(tok);
+                using_heap = true;
+            }
+        } else {
+            try heap_buf.append(allocator, tok);
         }
     }
 }
 
-/// 对 `${...}` 内部源码切片执行子词法与子语法解析，将生成的 `block` 节点事件直接合入父解析器。
-fn parseInterpolationBlock(p: *Parser, local_start: u32, local_end: u32) std.mem.Allocator.Error!void {
+/// 复用父 `Parser` 的事件与错误缓冲直接解析 `${...}` 内部词法单元切片，消除子缓冲分配与事件拷贝。
+fn parseInterpolationTokens(
+    p: *Parser,
+    local_start: u32,
+    local_end: u32,
+    sub_tokens: []const common.Token,
+) std.mem.Allocator.Error!void {
     const slice = p.source[local_start..local_end];
-    var sub_tokens: std.ArrayList(common.Token) = .empty;
-    defer sub_tokens.deinit(p.allocator);
 
-    var lex = parser_mod.lexer.Lexer.new(slice) catch {
-        try emitFallbackInterpolationBlock(p, local_start, local_end);
-        return;
-    };
+    const saved_source = p.source;
+    const saved_tokens = p.tokens;
+    const saved_source_len = p.source_len;
+    const saved_base_offset = p.base_offset;
+    const saved_cursor = p.cursor;
+    const saved_sig_no_nl_idx = p.sig_no_nl_idx;
+    const saved_sig_no_nl_tag = p.sig_no_nl_tag;
+    const saved_sig_idx = p.sig_idx;
+    const saved_sig_tag = p.sig_tag;
+    var restored_emitted_pos = p.emitted_pos;
+    const saved_restrictions = p.restrictions;
 
-    while (true) {
-        const tok = lex.gen() catch {
-            try emitFallbackInterpolationBlock(p, local_start, local_end);
-            return;
-        };
-        try sub_tokens.append(p.allocator, tok);
-        if (tok.tag == .end) break;
+    defer {
+        p.source = saved_source;
+        p.tokens = saved_tokens;
+        p.source_len = saved_source_len;
+        p.base_offset = saved_base_offset;
+        p.cursor = saved_cursor;
+        p.sig_no_nl_idx = saved_sig_no_nl_idx;
+        p.sig_no_nl_tag = saved_sig_no_nl_tag;
+        p.sig_idx = saved_sig_idx;
+        p.sig_tag = saved_sig_tag;
+        p.emitted_pos = restored_emitted_pos;
+        p.restrictions = saved_restrictions;
     }
 
-    var child = Parser.new(p.allocator, slice, sub_tokens.items);
-    defer child.deinit();
-    child.base_offset = p.globalPos(local_start);
-    child.depth = p.depth;
+    p.source = slice;
+    p.tokens = sub_tokens;
+    p.source_len = @intCast(slice.len);
+    p.base_offset = p.globalPos(local_start);
+    p.emitted_pos = 0;
+    p.restrictions = .{};
+    p.setCursor(0);
 
-    try child.startNode(.block);
-    _ = try parseStmtList(&child, .end, false);
-    try child.finishNode();
-    try child.emitTrivia(true, false);
-    try child.emitTrailingWhitespace();
-
-    try p.events.appendSlice(p.allocator, child.events.items);
-    try p.errors.appendSlice(p.allocator, child.errors.items);
-    if (local_end > p.emitted_pos) {
-        p.emitted_pos = local_end;
-    }
-}
-
-/// 子词法分析触发结构性错误时的降级无损恢复：保持字节覆盖与节点平衡。
-fn emitFallbackInterpolationBlock(p: *Parser, local_start: u32, local_end: u32) std.mem.Allocator.Error!void {
-    try p.emitErrorAt(.invalid_interpolation, .{
-        .start = p.globalPos(local_start),
-        .end = p.globalPos(local_end),
-    });
     try p.startNode(.block);
-    try p.startNode(.stmt_list);
-    if (local_start < local_end) {
-        try p.startNode(.error_node);
-        try p.emitLeaf(.illegal, .{ .start = local_start, .end = local_end });
-        try p.finishNode();
+    _ = try parseStmtList(p, .end, false);
+    try p.finishNode();
+    try p.emitTrivia(true, false);
+    try p.emitTrailingWhitespace();
+
+    if (local_end > restored_emitted_pos) {
+        restored_emitted_pos = local_end;
     }
-    try p.finishNode();
-    try p.finishNode();
 }
