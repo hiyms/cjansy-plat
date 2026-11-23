@@ -7,10 +7,11 @@
 //! 以事件流（`Event`）形式产出 Lossless CST 构建指令，交由下游 `GreenBuilder` 构造只读绿树。
 //! 表达式部分使用 Pratt 解析，其余部分使用递归下降，并严格遵循三项核心不变式：
 //! 1. 只读前瞻：所有 `peek*` 方法只读取游标，不向事件流发射任何词法单元。
-//! 2. 惰性前导 Trivia 发射：仅在当前已开启的节点内准备发射非 Trivia 词法单元时，才先补发
-//!    前导空白（`whitespace`）、换行（`newline`）与注释，确保 `wrap_node` 精准包裹前一个
-//!    已完成子节点，绝不误抓尾随 Trivia。
-//! 3. 点分路径平铺：同链的 `a.b.c`、`a?.b.c` 始终平铺在单个 `path_expr` 或 `path_type` 内。
+//! 2. 完全的前导 Trivia 发射：所有空白（`whitespace`）、换行（`newline`）与注释均作为后续语法节点或
+//!    词法单元的前导 Trivia 发射在其内部开头，文件末尾残余 Trivia 归属 `source_file`；`///` 与 `/**...*/`
+//!    文档注释归属其修饰的声明对象，无注释对象时记录 `dangling_doc_comment` 错误。
+//! 3. 点分路径平铺：同链的 `a.b.c`、`a?.b.c`、`g().b.c` 始终平铺在单个 `path_expr` 或 `path_type` 内，
+//!    每段均由 `path_segment` 表示。
 
 const std = @import("std");
 const common = @import("common");
@@ -45,6 +46,7 @@ pub const ParseErrorCode = enum(u8) {
     illegal_token,
     unexpected_token,
     invalid_interpolation,
+    dangling_doc_comment,
 };
 
 /// 解析错误，携带错误码与源码字节区间。
@@ -116,6 +118,7 @@ pub fn parseErrorToDiagnostic(
         .invalid_assignment_target => "invalid assignment target",
         .unclosed_delimiter => "unclosed delimiter",
         .invalid_interpolation => "invalid string interpolation",
+        .dangling_doc_comment => "dangling doc comment has no target declaration",
 
         // 存在有效源码片段时动态格式化，否则直接返回编译期静态字符串（零分配）
         .expected_expression => if (extractDiagnosticSnippet(source, err.range)) |s|
@@ -230,6 +233,7 @@ pub const ListContext = enum {
     paren_expr_list,
     square_expr_list,
     func_param_list,
+    primary_ctor_param_list,
     type_param_list,
     type_arg_list,
     paren_type_list,
@@ -452,10 +456,17 @@ pub const Parser = struct {
         };
     }
 
-    /// 根据注释源码文本将其细分为单行注释、文档注释或块注释标签。
+    /// 根据注释源码文本将其划分为单行注释、文档注释或块注释标签。
+    ///
+    /// 文档注释覆盖 `///...`（不含 `////...`）与 `/**...*/`（不含 `/**/` 与 `/***...`）。
     pub inline fn classifyComment(self: *const Parser, tok: common.Token) SyntaxKind {
         const text = self.tokenText(tok);
-        if (std.mem.startsWith(u8, text, "//")) return .line_comment;
+        if (std.mem.startsWith(u8, text, "//")) {
+            if (text.len >= 3 and text[2] == '/' and (text.len == 3 or text[3] != '/')) {
+                return .doc_comment;
+            }
+            return .line_comment;
+        }
         if (std.mem.startsWith(u8, text, "/**") and text.len >= 5 and text[3] != '*') {
             return .doc_comment;
         }
@@ -737,12 +748,39 @@ pub const Parser = struct {
         }
     }
 
-    /// 消费并向事件流发射当前游标处连续的 Trivia（注释；当 `include_nl` 为真时含换行）。
-    pub fn emitTrivia(self: *Parser, include_nl: bool) std.mem.Allocator.Error!void {
+    /// 内部公共前导 Trivia 发射：消费连续的注释（及可选换行），按需补发其后的水平空白。
+    ///
+    /// 当 `allow_doc_comment` 为 `false` 且存在 `doc_comment` 时，合并相邻悬空文档注释区间并记录
+    /// `ParseErrorCode.dangling_doc_comment`，同时无损发射 `.doc_comment` 叶子。
+    fn emitTriviaInternal(
+        self: *Parser,
+        include_nl: bool,
+        allow_doc_comment: bool,
+        emit_pending_ws: bool,
+    ) std.mem.Allocator.Error!void {
+        var dangling_doc_start: ?u32 = null;
+        var dangling_doc_end: u32 = 0;
+
         while (self.cursor < self.tokens.len) {
             const tok = self.tokens[self.cursor];
             if (tok.tag == .comment) {
-                try self.emitLeaf(self.classifyComment(tok), self.safeRange(tok.span));
+                const kind = self.classifyComment(tok);
+                const range = self.safeRange(tok.span);
+                try self.emitLeaf(kind, range);
+                if (!allow_doc_comment) {
+                    if (kind == .doc_comment) {
+                        if (dangling_doc_start == null) {
+                            dangling_doc_start = range.start;
+                        }
+                        dangling_doc_end = range.end;
+                    } else if (dangling_doc_start) |s| {
+                        try self.emitErrorAt(.dangling_doc_comment, .{
+                            .start = self.globalPos(s),
+                            .end = self.globalPos(dangling_doc_end),
+                        });
+                        dangling_doc_start = null;
+                    }
+                }
                 self.cursor += 1;
             } else if (include_nl and tok.tag == .nl) {
                 try self.emitLeaf(.newline, self.safeRange(tok.span));
@@ -751,11 +789,66 @@ pub const Parser = struct {
                 break;
             }
         }
+
+        if (dangling_doc_start) |s| {
+            try self.emitErrorAt(.dangling_doc_comment, .{
+                .start = self.globalPos(s),
+                .end = self.globalPos(dangling_doc_end),
+            });
+        }
+
+        if (emit_pending_ws) {
+            try self.emitPendingWhitespace();
+        }
+    }
+
+    /// 消费并向事件流发射当前游标处连续的 Trivia（注释；当 `include_nl` 为真时含换行）。
+    pub inline fn emitTrivia(self: *Parser, include_nl: bool, allow_doc_comment: bool) std.mem.Allocator.Error!void {
+        try self.emitTriviaInternal(include_nl, allow_doc_comment, false);
+    }
+
+    /// 在已开启的语法节点开头发射全部前导 Trivia（注释、换行与紧接其后的水平空白）。
+    pub inline fn emitLeadingTrivia(self: *Parser, allow_doc_comment: bool) std.mem.Allocator.Error!void {
+        try self.emitTriviaInternal(true, allow_doc_comment, true);
+    }
+
+    /// 若当前前导 Trivia 序列中存在文档注释，则在当前声明节点层发射至最后一个文档注释为止，
+    /// 使文档注释成为声明对象的直接成员且保留其后换行与空白作为下一子节点的 leading trivia。
+    pub fn emitPendingDocComments(self: *Parser) std.mem.Allocator.Error!void {
+        var idx = self.cursor;
+        var last_doc_idx: ?usize = null;
+        while (idx < self.tokens.len) : (idx += 1) {
+            const tok = self.tokens[idx];
+            if (tok.tag == .comment) {
+                if (self.classifyComment(tok) == .doc_comment) {
+                    last_doc_idx = idx;
+                }
+            } else if (tok.tag == .nl) {
+                continue;
+            } else {
+                break;
+            }
+        }
+        const stop_idx = last_doc_idx orelse return;
+        while (self.cursor <= stop_idx) {
+            const tok = self.tokens[self.cursor];
+            if (tok.tag == .comment) {
+                try self.emitLeaf(self.classifyComment(tok), self.safeRange(tok.span));
+            } else if (tok.tag == .nl) {
+                try self.emitLeaf(.newline, self.safeRange(tok.span));
+            }
+            self.cursor += 1;
+        }
     }
 
     /// 内部公共词法消费：先发射前导 Trivia，再发射当前词法单元（可选覆盖标签）。
-    fn bumpInternal(self: *Parser, skip_nl: bool, kind_override: ?SyntaxKind) std.mem.Allocator.Error!void {
-        try self.emitTrivia(skip_nl);
+    fn bumpInternal(
+        self: *Parser,
+        skip_nl: bool,
+        allow_doc_comment: bool,
+        kind_override: ?SyntaxKind,
+    ) std.mem.Allocator.Error!void {
+        try self.emitTrivia(skip_nl, allow_doc_comment);
         if (self.cursor >= self.tokens.len) return;
         const tok = self.tokens[self.cursor];
         if (tok.tag == .end) return;
@@ -766,22 +859,42 @@ pub const Parser = struct {
 
     /// 消费下一个非 Trivia 词法单元，发射其前导 Trivia 并按默认映射为 `SyntaxKind` 发射叶子。
     pub inline fn bump(self: *Parser) std.mem.Allocator.Error!void {
-        try self.bumpInternal(true, null);
+        try self.bumpInternal(true, false, null);
+    }
+
+    /// 消费下一个非 Trivia 词法单元且允许前导存在文档注释（用于 `quote` 与宏原始词法片段）。
+    pub inline fn bumpAllowDoc(self: *Parser) std.mem.Allocator.Error!void {
+        try self.bumpInternal(true, true, null);
     }
 
     /// 消费下一个非 Trivia 词法单元并覆盖发射的 `SyntaxKind`（如将上下文关键字发射为 `.identifier`）。
     pub inline fn bumpAs(self: *Parser, kind: SyntaxKind) std.mem.Allocator.Error!void {
-        try self.bumpInternal(true, kind);
+        try self.bumpInternal(true, false, kind);
     }
 
     /// 消费同行下一个非注释词法单元（不跳过换行），按默认映射发射。
     pub inline fn bumpNoNl(self: *Parser) std.mem.Allocator.Error!void {
-        try self.bumpInternal(false, null);
+        try self.bumpInternal(false, false, null);
     }
 
     /// 消费当前位置处的组合运算符（如 `??`、`>>`、`>>=`、`>=`），合并为单个 `TokenEvent` 发射。
-    pub fn bumpCombined(self: *Parser, op: CombinedOp, skip_nl: bool) std.mem.Allocator.Error!void {
-        try self.emitTrivia(skip_nl);
+    pub inline fn bumpCombined(self: *Parser, op: CombinedOp, skip_nl: bool) std.mem.Allocator.Error!void {
+        try self.bumpCombinedInternal(op, skip_nl, false);
+    }
+
+    /// 消费组合运算符且允许前导存在文档注释（用于 `quote` 与宏原始词法片段）。
+    pub inline fn bumpCombinedAllowDoc(self: *Parser, op: CombinedOp, skip_nl: bool) std.mem.Allocator.Error!void {
+        try self.bumpCombinedInternal(op, skip_nl, true);
+    }
+
+    /// 内部组合运算符消费实现。
+    fn bumpCombinedInternal(
+        self: *Parser,
+        op: CombinedOp,
+        skip_nl: bool,
+        allow_doc_comment: bool,
+    ) std.mem.Allocator.Error!void {
+        try self.emitTrivia(skip_nl, allow_doc_comment);
         const count: usize = op.token_count;
         if (count == 0 or self.cursor >= self.tokens.len or self.tokens.len - self.cursor < count) return;
         const first = self.safeRange(self.tokens[self.cursor].span);
@@ -850,16 +963,20 @@ pub const Parser = struct {
 
     /// 消费一个无法识别的词法单元并包裹在 `error_node` 内，记录对应错误码以维持无损与游标前进。
     pub fn bumpErrorToken(self: *Parser, code: ParseErrorCode) std.mem.Allocator.Error!void {
-        try self.emitTrivia(true);
-        if (self.cursor >= self.tokens.len) return;
-        const tok = self.tokens[self.cursor];
+        const sig_idx = self.nextSignificantIndex(self.cursor, true);
+        if (sig_idx >= self.tokens.len) return;
+        const tok = self.tokens[sig_idx];
         if (tok.tag == .end) return;
 
         const actual_code: ParseErrorCode = if (tok.tag == .illegal) .illegal_token else code;
         try self.emitError(actual_code);
         try self.startNode(.error_node);
-        try self.emitLeaf(self.tokenToSyntaxKind(tok), self.safeRange(tok.span));
-        self.cursor += 1;
+        try self.emitLeadingTrivia(false);
+        if (self.cursor < self.tokens.len and self.tokens[self.cursor].tag != .end) {
+            const cur = self.tokens[self.cursor];
+            try self.emitLeaf(self.tokenToSyntaxKind(cur), self.safeRange(cur.span));
+            self.cursor += 1;
+        }
         try self.finishNode();
     }
 
@@ -867,9 +984,9 @@ pub const Parser = struct {
     /// 遇换行、分号、花括号、声明起始或合法表达式起始立即停止，兼顾最少 Token 消耗与抑制错误风暴。
     /// 当 `code` 为 `null` 时表示错误已由前序解析步骤记录，不再重复发射诊断。
     pub fn bumpErrorRun(self: *Parser, code: ?ParseErrorCode, stop_at_r_curl: bool) std.mem.Allocator.Error!void {
-        try self.emitTrivia(true);
-        if (self.cursor >= self.tokens.len) return;
-        const first = self.tokens[self.cursor];
+        const sig_idx = self.nextSignificantIndex(self.cursor, true);
+        if (sig_idx >= self.tokens.len) return;
+        const first = self.tokens[sig_idx];
         if (first.tag == .end) return;
 
         if (code) |err_code| {
@@ -877,8 +994,12 @@ pub const Parser = struct {
             try self.emitError(actual_code);
         }
         try self.startNode(.error_node);
-        try self.emitLeaf(self.tokenToSyntaxKind(first), self.safeRange(first.span));
-        self.cursor += 1;
+        try self.emitLeadingTrivia(false);
+        if (self.cursor < self.tokens.len and self.tokens[self.cursor].tag != .end) {
+            const cur = self.tokens[self.cursor];
+            try self.emitLeaf(self.tokenToSyntaxKind(cur), self.safeRange(cur.span));
+            self.cursor += 1;
+        }
 
         // 仅在同行内继续合并连续的 `.illegal` 或孤立冗余闭合符 `)` / `]`
         while (self.cursor < self.tokens.len) {
@@ -891,25 +1012,12 @@ pub const Parser = struct {
         try self.finishNode();
     }
 
-    /// 消费连续语句分隔符（`;` 与换行），返回是否消费了至少一个 `;` 或换行。
-    pub fn eatSeparators(self: *Parser) std.mem.Allocator.Error!bool {
+    /// 仅消费显式分号分隔符 `;`（不提前消费换行与注释，将其保留为后续节点的 leading trivia）。
+    pub fn eatSemicolons(self: *Parser) std.mem.Allocator.Error!bool {
         var consumed = false;
-        while (self.cursor < self.tokens.len) {
-            const tok = self.tokens[self.cursor];
-            if (tok.tag == .comment) {
-                try self.emitLeaf(self.classifyComment(tok), self.safeRange(tok.span));
-                self.cursor += 1;
-            } else if (tok.tag == .nl) {
-                try self.emitLeaf(.newline, self.safeRange(tok.span));
-                self.cursor += 1;
-                consumed = true;
-            } else if (tok.tag == .semi) {
-                try self.emitLeaf(.semi, self.safeRange(tok.span));
-                self.cursor += 1;
-                consumed = true;
-            } else {
-                break;
-            }
+        while (self.at(.semi)) {
+            try self.bump();
+            consumed = true;
         }
         return consumed;
     }
@@ -953,11 +1061,26 @@ pub const Parser = struct {
         }
     }
 
+    /// 只读判断当前位置是否为主构造器成员参数起始（`[public|private|protected|internal] (let | var)`）。
+    pub fn isPrimaryCtorMemberParamStart(self: *const Parser) bool {
+        const t0 = self.peek();
+        if (t0 == .kw_let or t0 == .kw_var) return true;
+        if (t0 == .kw_public or t0 == .kw_private or t0 == .kw_protected or t0 == .kw_internal) {
+            const t1 = self.peekNth(1);
+            return t1 == .kw_let or t1 == .kw_var;
+        }
+        return false;
+    }
+
     /// 判定当前词法位置是否命中指定列表上下文的外层同步恢复边界；命中时列表应立即停止而不吞并外层词法单元。
     pub fn shouldStopList(self: *const Parser, ctx: ListContext) bool {
         const tag = self.peek();
         if (tag == .end or isHardDeclKeyword(tag)) return true;
-        if (self.isNewlineDeclBoundary()) return true;
+        if (ctx == .primary_ctor_param_list) {
+            if (self.isNewlineDeclBoundary() and !self.isPrimaryCtorMemberParamStart()) return true;
+        } else if (self.isNewlineDeclBoundary()) {
+            return true;
+        }
 
         return switch (ctx) {
             .paren_expr_list => switch (tag) {
@@ -968,7 +1091,7 @@ pub const Parser = struct {
                 .r_square, .r_curl, .r_paren, .semi, .kw_let, .kw_var, .kw_const => true,
                 else => false,
             },
-            .func_param_list => switch (tag) {
+            .func_param_list, .primary_ctor_param_list => switch (tag) {
                 .r_paren, .l_curl, .r_curl, .r_square, .semi, .kw_where => true,
                 else => false,
             },
@@ -1078,13 +1201,15 @@ pub const Parser = struct {
         };
     }
 
-    /// 在文件结束时发射所有残余词法单元、尾部空白与 `SyntaxKind.eof`。
+    /// 在文件结束时发射所有残余词法单元、文件末尾 Trivia（归属 `source_file`）与 `SyntaxKind.eof`。
     pub fn finishFile(self: *Parser) std.mem.Allocator.Error!void {
         while (self.cursor < self.tokens.len) {
-            try self.emitTrivia(true);
-            if (self.cursor >= self.tokens.len) break;
-            if (self.tokens[self.cursor].tag == .end) {
-                self.cursor += 1;
+            const sig_idx = self.nextSignificantIndex(self.cursor, true);
+            if (sig_idx >= self.tokens.len or self.tokens[sig_idx].tag == .end) {
+                try self.emitTrivia(true, false);
+                if (self.cursor < self.tokens.len and self.tokens[self.cursor].tag == .end) {
+                    self.cursor += 1;
+                }
                 break;
             }
             try self.bumpErrorToken(.unexpected_token);
@@ -1656,7 +1781,7 @@ test "quote 表达式：转义、插值边界、token_part 干净切分与错误
         const qi = r.root.findFirst(.quote_interpolation).?;
         const qi_txt = try qi.reconstruct(gpa, s);
         defer gpa.free(qi_txt);
-        try std.testing.expectEqualStrings("$x", qi_txt);
+        try std.testing.expectEqualStrings(" /* c */\n$x", qi_txt);
     }
 
     // quote 语法错误边界（未转义孤立 $、不匹配括号、quote 后换行、非紧邻反斜杠）
@@ -2024,7 +2149,9 @@ test "精确树形校验：wrap_node 不误抓 Trivia、优先级与结合性、
         defer res.deinit(gpa);
         try std.testing.expectEqual(@as(usize, 0), res.errors.items.len);
         const outer_path = res.root.findFirst(.path_expr).?;
-        try std.testing.expectEqual(SyntaxKind.call_expr, outer_path.nthChildNode(0).?.kind);
+        const seg0 = outer_path.nthChildNode(0).?;
+        try std.testing.expectEqual(SyntaxKind.path_segment, seg0.kind);
+        try std.testing.expectEqual(SyntaxKind.call_expr, seg0.nthChildNode(0).?.kind);
         try std.testing.expectEqual(SyntaxKind.path_segment, outer_path.nthChildNode(1).?.kind);
         try std.testing.expectEqual(SyntaxKind.path_segment, outer_path.nthChildNode(2).?.kind);
     }
@@ -2332,6 +2459,7 @@ test "Parser.errors 与 parseErrorToDiagnostic 零分配静态消息及动态片
         .invalid_assignment_target,
         .unclosed_delimiter,
         .invalid_interpolation,
+        .dangling_doc_comment,
     };
     for (static_codes) |code| {
         const err_item: ParseError = .{ .code = code, .range = .{ .start = 0, .end = 3 } };
@@ -2413,5 +2541,192 @@ test "Parser.errors 与 parseErrorToDiagnostic 零分配静态消息及动态片
         try std.testing.expectEqual(file_id, diag.file);
         try std.testing.expectEqual(common.Severity.err, diag.severity);
         try std.testing.expectEqualStrings("comparison operators are non-associative", diag.message);
+    }
+}
+
+test "完全 leading trivia、文件末尾 trivia 归属 source_file 与链式成员 path_segment 包装" {
+    const gpa = std.testing.allocator;
+
+    // 1. 文件头部注释归属首个顶层项，项间空行与注释归属后续项，文件末尾注释与空行归属 source_file
+    {
+        const src =
+            \\// file header
+            \\package demo
+            \\
+            \\// import note
+            \\import std.core.*
+            \\
+            \\func f() {
+            \\    // stmt note
+            \\    let x = g().a.b
+            \\    x[0]?.c.d
+            \\    // before r_curl
+            \\}
+            \\// trailing file comment
+            \\
+        ;
+        var res = try parseAndVerify(gpa, src);
+        defer res.deinit(gpa);
+        try std.testing.expectEqual(@as(usize, 0), res.errors.items.len);
+
+        // source_file 仅在末尾保留文件尾 trivia 与 eof，开头注释归 package_header
+        try std.testing.expect(res.root.children.items[0] == .node);
+        try std.testing.expectEqual(SyntaxKind.package_header, res.root.children.items[0].node.kind);
+        const pkg_txt = try res.root.children.items[0].node.reconstruct(gpa, src);
+        defer gpa.free(pkg_txt);
+        try std.testing.expectEqualStrings("// file header\npackage demo", pkg_txt);
+
+        // import_spec 承接前导空行与注释
+        try std.testing.expect(res.root.children.items[1] == .node);
+        try std.testing.expectEqual(SyntaxKind.import_spec, res.root.children.items[1].node.kind);
+        const imp_txt = try res.root.children.items[1].node.reconstruct(gpa, src);
+        defer gpa.free(imp_txt);
+        try std.testing.expectEqualStrings("\n\n// import note\nimport std.core.*", imp_txt);
+
+        // func_decl 承接前导空行，其后文件尾 trivia 归属 source_file
+        try std.testing.expect(res.root.children.items[2] == .node);
+        try std.testing.expectEqual(SyntaxKind.func_decl, res.root.children.items[2].node.kind);
+        var has_trailing_comment_in_root = false;
+        for (res.root.children.items[3..]) |child| {
+            if (child == .token and child.token.kind == .line_comment) {
+                has_trailing_comment_in_root = true;
+            }
+        }
+        try std.testing.expect(has_trailing_comment_in_root);
+
+        // g().a.b 与 x[0]?.c.d 的外层 path_expr 首子节点均为 path_segment
+        const vdecl = res.root.findFirst(.var_decl).?;
+        const call_chain = vdecl.findFirst(.path_expr).?;
+        try std.testing.expectEqual(SyntaxKind.path_segment, call_chain.nthChildNode(0).?.kind);
+        try std.testing.expectEqual(SyntaxKind.call_expr, call_chain.nthChildNode(0).?.nthChildNode(0).?.kind);
+
+        const expr_stmt = res.root.findFirst(.expression_statement).?;
+        const sub_chain = expr_stmt.findFirst(.path_expr).?;
+        try std.testing.expectEqual(SyntaxKind.path_segment, sub_chain.nthChildNode(0).?.kind);
+        try std.testing.expectEqual(SyntaxKind.subscript_expr, sub_chain.nthChildNode(0).?.nthChildNode(0).?.kind);
+    }
+
+    // 2. 纯注释与空白文件：全部 trivia 归属 source_file
+    {
+        const src = "// only comment\n   \n";
+        var res = try parseAndVerify(gpa, src);
+        defer res.deinit(gpa);
+        try std.testing.expectEqual(@as(usize, 0), res.errors.items.len);
+        try std.testing.expect(res.root.hasKind(.line_comment));
+    }
+}
+
+test "文档注释：支持 /// 与 /** */、归属注释对象成员，无注释对象报 dangling_doc_comment" {
+    const gpa = std.testing.allocator;
+
+    // 1. 合法文档注释（/// 与 /** */）归属对应声明对象成员；////、/**/、/*** */ 为普通注释
+    {
+        const src =
+            \\/// 包级文档
+            \\package docdemo
+            \\
+            \\/// 重导出说明
+            \\public import std.core.*
+            \\
+            \\//// 普通四斜杠分割线
+            \\/**/
+            \\/*** 普通块注释 ***/
+            \\/**
+            \\ * 函数文档
+            \\ */
+            \\@Frozen
+            \\/// 注解与修饰符之间的文档
+            \\@When[os == "Linux"]
+            \\/// 末尾注解之后的文档
+            \\public func f(
+            \\    /// 参数文档
+            \\    x: Int64,
+            \\): Int64 {
+            \\    /// 局部变量文档
+            \\    let y = x
+            \\    let q = quote(/// quote 内文档注释不误报
+            \\        func g() {}
+            \\    )
+            \\    y
+            \\}
+            \\
+            \\/// 枚举文档
+            \\enum Color {
+            \\    /// 红色
+            \\    | Red
+            \\    | /// 绿色
+            \\    Green(Int64)
+            \\    ///
+            \\    | @MyAnno Blue
+            \\}
+            \\
+            \\/// 类文档
+            \\class Box {
+            \\    /// 主构造器文档
+            \\    Box(
+            \\        /// 成员参数文档
+            \\        public let v: Int64,
+            \\    ) {}
+            \\    /// 属性文档
+            \\    prop p: Int64 {
+            \\        /// getter 文档
+            \\        get() { v }
+            \\    }
+            \\}
+            \\//// 文件尾普通注释不报错
+            \\
+        ;
+        var res = try parseAndVerify(gpa, src);
+        defer res.deinit(gpa);
+        try std.testing.expectEqual(@as(usize, 0), res.errors.items.len);
+
+        // 验证文档注释直接属于目标节点成员，未游离在 source_file 且未进入 annotation 内部
+        for (res.root.children.items) |child| {
+            if (child == .token) {
+                try std.testing.expect(child.token.kind != .doc_comment);
+            }
+        }
+        const pkg = res.root.findFirst(.package_header).?;
+        try std.testing.expect(pkg.hasKind(.doc_comment));
+
+        const func_node = res.root.findFirst(.func_decl).?;
+        var direct_func_docs: usize = 0;
+        for (func_node.children.items) |child| {
+            if (child == .token and child.token.kind == .doc_comment) direct_func_docs += 1;
+            if (child == .node and child.node.kind == .annotation) {
+                try std.testing.expect(!child.node.hasKind(.doc_comment));
+            }
+        }
+        try std.testing.expectEqual(@as(usize, 3), direct_func_docs);
+
+        const param_node = func_node.findFirst(.func_param).?;
+        try std.testing.expect(param_node.hasKind(.doc_comment));
+
+        const enum_node = res.root.findFirst(.enum_decl).?;
+        try std.testing.expect(enum_node.hasKind(.doc_comment));
+        try std.testing.expectEqual(@as(usize, 3), enum_node.countKind(.enum_constructor));
+        const ctor0 = enum_node.findFirst(.enum_constructor).?;
+        try std.testing.expect(ctor0.hasKind(.doc_comment));
+    }
+
+    // 2. 无注释对象的悬空文档注释一律报告 dangling_doc_comment 且保持无损
+    const dangling_cases = [_][]const u8{
+        "/// 文件尾孤立文档注释",
+        "/** 文件尾块文档注释 */",
+        "func f() {}\n/// 末尾悬空\n/// 第二行悬空\n",
+        "class C {\n    func m() {}\n    /// 类体末尾悬空\n}",
+        "func f() {\n    let x = 1\n    /** 块尾悬空 */\n}",
+        "func f() {\n    /// 表达式语句前非法\n    1 + 2\n}",
+        "func f() {\n    let x = 1 + /** 运算符后非法 */ 2\n}",
+        "func f(x: /** 类型前非法 */ Int64) {}",
+        "/// 分号前悬空\n; func f() {}",
+        "let s = \"${1 /** 插值尾悬空 */}\"",
+    };
+    for (dangling_cases) |bad_src| {
+        var res = try parseAndVerify(gpa, bad_src);
+        defer res.deinit(gpa);
+        try std.testing.expectEqual(@as(usize, 1), res.errors.items.len);
+        try std.testing.expectEqual(ParseErrorCode.dangling_doc_comment, res.errors.items[0].code);
+        try std.testing.expect(res.root.hasKind(.doc_comment));
     }
 }

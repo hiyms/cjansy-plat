@@ -34,31 +34,31 @@ pub const DeclScope = enum {
 pub fn parseSourceFile(p: *Parser) std.mem.Allocator.Error!void {
     try p.startNode(.source_file);
 
-    _ = try p.eatSeparators();
+    _ = try p.eatSemicolons();
 
     // 可选：`features { a.b, c.d }`
     if (isFeaturesDirectiveStart(p)) {
         try parseFeaturesDirective(p);
-        _ = try p.eatSeparators();
+        _ = try p.eatSemicolons();
     }
 
     // 可选：`[public|protected|internal] [macro] package ...`
     if (isPackageHeaderStart(p)) {
         try parsePackageHeader(p);
-        _ = try p.eatSeparators();
+        _ = try p.eatSemicolons();
     }
 
     // 零或多个 `import`（支持前置 `@When[...]` 注解与访问修饰符）
     while (!p.isAtEof() and isImportSpecStart(p)) {
         const before = p.cursor;
         try parseImportSpec(p);
-        _ = try p.eatSeparators();
+        _ = try p.eatSemicolons();
         if (p.cursor == before) try p.bumpErrorToken(.expected_item);
     }
 
     // 零或多个顶层声明与 `main`
     while (!p.isAtEof()) {
-        _ = try p.eatSeparators();
+        _ = try p.eatSemicolons();
         if (p.isAtEof()) break;
 
         const before = p.cursor;
@@ -69,7 +69,7 @@ pub fn parseSourceFile(p: *Parser) std.mem.Allocator.Error!void {
         } else {
             try parseDecl(p, .top_level);
         }
-        _ = try p.eatSeparators();
+        _ = try p.eatSemicolons();
 
         if (p.cursor == before) {
             try p.bumpErrorRun(.expected_item, false);
@@ -125,18 +125,18 @@ fn isFeaturesDirectiveStart(p: *const Parser) bool {
 
 /// 解析 `features { a.b, c.d }` 特性声明。
 fn parseFeaturesDirective(p: *Parser) std.mem.Allocator.Error!void {
-    try p.emitTrivia(true);
     try p.startNode(.features_directive);
+    try p.emitLeadingTrivia(false);
     try p.bumpAs(.kw_features);
 
-    try p.emitTrivia(true);
     try p.startNode(.features_set);
+    try p.emitLeadingTrivia(false);
     _ = try p.expect(.l_curl);
 
     while (!p.shouldStopList(.brace_list)) {
         const before = p.cursor;
-        try p.emitTrivia(true);
         try p.startNode(.feature_id);
+        try p.emitLeadingTrivia(false);
         _ = try p.expectIdent();
         while (p.at(.dot)) {
             try p.bump();
@@ -180,8 +180,8 @@ fn isPackageHeaderStart(p: *const Parser) bool {
 
 /// 解析 `[modifier] [macro] package [org::]a.b.c` 包声明。
 fn parsePackageHeader(p: *Parser) std.mem.Allocator.Error!void {
-    try p.emitTrivia(true);
     try p.startNode(.package_header);
+    try p.emitLeadingTrivia(true);
 
     const t0 = p.peek();
     if (t0 == .kw_public or t0 == .kw_protected or t0 == .kw_internal) {
@@ -190,23 +190,27 @@ fn parsePackageHeader(p: *Parser) std.mem.Allocator.Error!void {
     _ = try p.eat(.kw_macro);
     _ = try p.expect(.kw_package);
 
-    try p.emitTrivia(true);
     try p.startNode(.package_name);
-    if (Parser.isPackageIdentLike(p.peek()) and p.peekNth(1) == .double_colon) {
-        _ = try p.expectPackageIdent();
-        try p.bump(); // ::
-    }
     if (p.isNewlineDeclBoundary()) {
         try p.emitError(.expected_identifier);
     } else {
-        _ = try p.expectPackageIdent();
-        while (p.at(.dot)) {
-            try p.bump();
-            if (p.isNewlineDeclBoundary()) {
-                try p.emitError(.expected_identifier);
-                break;
-            }
+        try p.emitLeadingTrivia(false);
+        if (Parser.isPackageIdentLike(p.peek()) and p.peekNth(1) == .double_colon) {
             _ = try p.expectPackageIdent();
+            try p.bump(); // ::
+        }
+        if (p.isNewlineDeclBoundary()) {
+            try p.emitError(.expected_identifier);
+        } else {
+            _ = try p.expectPackageIdent();
+            while (p.at(.dot)) {
+                try p.bump();
+                if (p.isNewlineDeclBoundary()) {
+                    try p.emitError(.expected_identifier);
+                    break;
+                }
+                _ = try p.expectPackageIdent();
+            }
         }
     }
     try p.finishNode(); // package_name
@@ -338,10 +342,10 @@ fn isImportSpecStart(p: *const Parser) bool {
 
 /// 解析单条 `import` 声明。
 fn parseImportSpec(p: *Parser) std.mem.Allocator.Error!void {
-    try p.emitTrivia(true);
     try p.startNode(.import_spec);
+    try p.emitLeadingTrivia(true);
 
-    try parseLeadingBuiltinAnnotations(p);
+    try parseLeadingBuiltinAnnotations(p, true);
     const mod = p.peek();
     if (mod == .kw_public or mod == .kw_private or mod == .kw_protected or mod == .kw_internal) {
         try p.bump();
@@ -357,8 +361,13 @@ fn parseImportContent(p: *Parser, allow_org_and_group: bool) std.mem.Allocator.E
     if (!try p.enterDepth()) return;
     defer p.leaveDepth();
 
-    try p.emitTrivia(true);
     try p.startNode(.import_content);
+    if (p.isNewlineDeclBoundary()) {
+        try p.emitError(.expected_identifier);
+        try p.finishNode();
+        return;
+    }
+    try p.emitLeadingTrivia(false);
 
     if (allow_org_and_group and Parser.isPackageIdentLike(p.peek()) and p.peekNth(1) == .double_colon) {
         _ = try p.expectPackageIdent();
@@ -430,12 +439,17 @@ fn parseImportMultiGroup(p: *Parser) std.mem.Allocator.Error!void {
 }
 
 /// 连续解析零或多个前置内置注解节点（`SyntaxKind.annotation`）。
-pub fn parseLeadingBuiltinAnnotations(p: *Parser) std.mem.Allocator.Error!void {
+///
+/// 当 `allow_doc_comment` 为真时，若注解之间或注解之后存在文档注释，在当前声明节点层发射，
+/// 使文档注释归属声明对象，避免被 `annotation` 吞入或误判为悬空文档注释。
+pub fn parseLeadingBuiltinAnnotations(p: *Parser, allow_doc_comment: bool) std.mem.Allocator.Error!void {
     while (isBuiltinAnnotation(p)) {
+        if (allow_doc_comment) try p.emitPendingDocComments();
         const before = p.cursor;
         try parseAnnotation(p);
         if (p.cursor == before) break;
     }
+    if (allow_doc_comment) try p.emitPendingDocComments();
 }
 
 /// 解析单个内置注解 `@Name` 或 `@a.b.Name[args]`。
@@ -443,8 +457,8 @@ pub fn parseAnnotation(p: *Parser) std.mem.Allocator.Error!void {
     if (!try p.enterDepth()) return;
     defer p.leaveDepth();
 
-    try p.emitTrivia(true);
     try p.startNode(.annotation);
+    try p.emitLeadingTrivia(false);
     _ = try p.expect(.at);
     _ = try p.expectIdent();
     while (p.at(.dot)) {
@@ -747,9 +761,9 @@ pub fn parseDecl(p: *Parser, scope: DeclScope) std.mem.Allocator.Error!void {
 
 /// 解析 `class` 声明。
 fn parseClassDecl(p: *Parser) std.mem.Allocator.Error!void {
-    try p.emitTrivia(true);
     try p.startNode(.class_decl);
-    try parseLeadingBuiltinAnnotations(p);
+    try p.emitLeadingTrivia(true);
+    try parseLeadingBuiltinAnnotations(p, true);
     try parseDeclModifiers(p, .top_level);
     _ = try p.expect(.kw_class);
     _ = try p.expectIdent();
@@ -766,9 +780,9 @@ fn parseClassDecl(p: *Parser) std.mem.Allocator.Error!void {
 
 /// 解析 `interface` 声明。
 fn parseInterfaceDecl(p: *Parser) std.mem.Allocator.Error!void {
-    try p.emitTrivia(true);
     try p.startNode(.interface_decl);
-    try parseLeadingBuiltinAnnotations(p);
+    try p.emitLeadingTrivia(true);
+    try parseLeadingBuiltinAnnotations(p, true);
     try parseDeclModifiers(p, .top_level);
     _ = try p.expect(.kw_interface);
     _ = try p.expectIdent();
@@ -785,9 +799,9 @@ fn parseInterfaceDecl(p: *Parser) std.mem.Allocator.Error!void {
 
 /// 解析 `struct` 声明。
 fn parseStructDecl(p: *Parser) std.mem.Allocator.Error!void {
-    try p.emitTrivia(true);
     try p.startNode(.struct_decl);
-    try parseLeadingBuiltinAnnotations(p);
+    try p.emitLeadingTrivia(true);
+    try parseLeadingBuiltinAnnotations(p, true);
     try parseDeclModifiers(p, .top_level);
     _ = try p.expect(.kw_struct);
     _ = try p.expectIdent();
@@ -804,9 +818,9 @@ fn parseStructDecl(p: *Parser) std.mem.Allocator.Error!void {
 
 /// 解析 `enum` 声明及其包含构造器、可选非详尽 `...` 与成员声明的 `enum_body`。
 fn parseEnumDecl(p: *Parser) std.mem.Allocator.Error!void {
-    try p.emitTrivia(true);
     try p.startNode(.enum_decl);
-    try parseLeadingBuiltinAnnotations(p);
+    try p.emitLeadingTrivia(true);
+    try parseLeadingBuiltinAnnotations(p, true);
     try parseDeclModifiers(p, .top_level);
     _ = try p.expect(.kw_enum);
     _ = try p.expectIdent();
@@ -815,44 +829,62 @@ fn parseEnumDecl(p: *Parser) std.mem.Allocator.Error!void {
     if (p.at(.kw_where)) try parseWhereClause(p);
 
     if (p.at(.l_curl)) {
-        try p.emitTrivia(true);
         try p.startNode(.enum_body);
+        try p.emitLeadingTrivia(false);
         try p.bump(); // {
-        _ = try p.eatSeparators();
+        _ = try p.eatSemicolons();
 
         // 枚举构造器部分：`[|] Ctor1 | @Anno Ctor2(T) [| ...]`
-        var expect_ctor_after_bar = try p.eat(.bit_or);
+        var first_ctor = true;
         while (!p.isAtEof() and !p.at(.r_curl)) {
-            if (p.at(.ellipsis)) {
-                expect_ctor_after_bar = false;
-                try p.bump();
-                _ = try p.eatSeparators();
+            const sig_idx = p.nextSignificantIndex(p.cursor, true);
+            if (sig_idx >= p.tokens.len) break;
+
+            if (p.tokens[sig_idx].tag == .bit_or) {
+                const after_bar = p.nextSignificantIndex(sig_idx + 1, true);
+                if (after_bar < p.tokens.len and p.tokens[after_bar].tag == .ellipsis) {
+                    try p.bump(); // |
+                    try p.bump(); // ...
+                    _ = try p.eatSemicolons();
+                    break;
+                }
+                if (isEnumConstructorStartAt(p, after_bar)) {
+                    try parseEnumConstructorOrMacro(p, true);
+                    first_ctor = false;
+                    _ = try p.eatSemicolons();
+                    if (p.at(.bit_or)) continue;
+                    break;
+                }
+                try p.bump(); // |
+                try p.emitError(.expected_identifier);
+                _ = try p.eatSemicolons();
                 break;
             }
-            if (isEnumConstructorStart(p)) {
-                expect_ctor_after_bar = false;
-                try parseEnumConstructorOrMacro(p);
-                _ = try p.eatSeparators();
-                if (try p.eat(.bit_or)) {
-                    expect_ctor_after_bar = true;
-                    _ = try p.eatSeparators();
-                    continue;
+
+            if (first_ctor) {
+                if (p.tokens[sig_idx].tag == .ellipsis) {
+                    try p.bump(); // ...
+                    _ = try p.eatSemicolons();
+                    break;
                 }
-                break;
+                if (isEnumConstructorStartAt(p, sig_idx)) {
+                    try parseEnumConstructorOrMacro(p, false);
+                    first_ctor = false;
+                    _ = try p.eatSemicolons();
+                    if (p.at(.bit_or)) continue;
+                    break;
+                }
             }
             break;
-        }
-        if (expect_ctor_after_bar) {
-            try p.emitError(.expected_identifier);
         }
 
         // 枚举成员函数、属性与宏调用
         while (!p.isAtEof() and !p.at(.r_curl)) {
-            _ = try p.eatSeparators();
+            _ = try p.eatSemicolons();
             if (p.at(.r_curl) or p.isAtEof()) break;
             const before = p.cursor;
             try parseDecl(p, .enum_body);
-            _ = try p.eatSeparators();
+            _ = try p.eatSemicolons();
             if (p.cursor == before) try p.bumpErrorRun(.expected_item, true);
         }
 
@@ -864,9 +896,9 @@ fn parseEnumDecl(p: *Parser) std.mem.Allocator.Error!void {
     try p.finishNode();
 }
 
-/// 只读判断枚举体内当前位置是否为枚举构造器（含前置内置注解、自定义注解或无括号宏修饰的构造器）。
-fn isEnumConstructorStart(p: *const Parser) bool {
-    var idx = p.nextSignificantIndex(p.cursor, true);
+/// 只读判断从物理下标 `start_idx` 起是否为枚举构造器（含前置内置注解、自定义注解或无括号宏修饰的构造器）。
+fn isEnumConstructorStartAt(p: *const Parser, start_idx: usize) bool {
+    var idx = p.nextSignificantIndex(start_idx, true);
     while (idx < p.tokens.len) {
         if (isBuiltinAnnotationAtIndex(p, idx)) {
             idx = skipLeadingBuiltinAnnotationsIndex(p, idx);
@@ -887,34 +919,42 @@ fn isEnumConstructorStart(p: *const Parser) bool {
     return true;
 }
 
-/// 解析枚举构造器或带前置自定义注解/宏修饰的枚举构造器。
-fn parseEnumConstructorOrMacro(p: *Parser) std.mem.Allocator.Error!void {
+/// 解析枚举构造器或带前置自定义注解/宏修饰的枚举构造器（`has_leading_bar` 为真时先消费前置 `|`）。
+fn parseEnumConstructorOrMacro(p: *Parser, has_leading_bar: bool) std.mem.Allocator.Error!void {
     if (!try p.enterDepth()) return;
     defer p.leaveDepth();
 
-    const after_builtin = skipLeadingBuiltinAnnotationsIndex(p, p.cursor);
+    var idx = p.nextSignificantIndex(p.cursor, true);
+    if (has_leading_bar and idx < p.tokens.len and p.tokens[idx].tag == .bit_or) {
+        idx = p.nextSignificantIndex(idx + 1, true);
+    }
+    const after_builtin = skipLeadingBuiltinAnnotationsIndex(p, idx);
     if (after_builtin < p.tokens.len and
         (p.tokens[after_builtin].tag == .at or p.tokens[after_builtin].tag == .at_excl))
     {
-        try p.emitTrivia(true);
         try p.startNode(.macro_expand_decl);
-        try parseLeadingBuiltinAnnotations(p);
+        try p.emitLeadingTrivia(true);
+        if (has_leading_bar) _ = try p.eat(.bit_or);
+        try p.emitPendingDocComments();
+        try parseLeadingBuiltinAnnotations(p, true);
         try parseMacroHeader(p, true);
         if (!p.isAtEof() and !p.at(.r_curl) and !p.at(.bit_or)) {
-            try parseEnumConstructorOrMacro(p);
+            try parseEnumConstructorOrMacro(p, false);
         }
         try p.finishNode();
         return;
     }
 
-    try parseEnumConstructor(p);
+    try parseEnumConstructor(p, has_leading_bar);
 }
 
-/// 解析单个枚举构造器 `Ident [( Type, ... )]`。
-fn parseEnumConstructor(p: *Parser) std.mem.Allocator.Error!void {
-    try p.emitTrivia(true);
+/// 解析单个枚举构造器 `[|] Ident [( Type, ... )]`。
+fn parseEnumConstructor(p: *Parser, has_leading_bar: bool) std.mem.Allocator.Error!void {
     try p.startNode(.enum_constructor);
-    try parseLeadingBuiltinAnnotations(p);
+    try p.emitLeadingTrivia(true);
+    if (has_leading_bar) _ = try p.eat(.bit_or);
+    try p.emitPendingDocComments();
+    try parseLeadingBuiltinAnnotations(p, true);
     _ = try p.expectIdent();
     if (p.at(.l_paren)) {
         try p.bump(); // (
@@ -926,7 +966,7 @@ fn parseEnumConstructor(p: *Parser) std.mem.Allocator.Error!void {
             {
                 try parseMacroExpandParam(p, false);
             } else {
-                try parseLeadingBuiltinAnnotations(p);
+                try parseLeadingBuiltinAnnotations(p, false);
                 try type_parser.parseType(p);
             }
             if (try p.eat(.comma)) {
@@ -945,9 +985,9 @@ fn parseEnumConstructor(p: *Parser) std.mem.Allocator.Error!void {
 
 /// 解析 `extend` 扩展声明（支持前置泛型参数表、基础类型或复合类型及接口实现列表）。
 fn parseExtendDecl(p: *Parser) std.mem.Allocator.Error!void {
-    try p.emitTrivia(true);
     try p.startNode(.extend_decl);
-    try parseLeadingBuiltinAnnotations(p);
+    try p.emitLeadingTrivia(true);
+    try parseLeadingBuiltinAnnotations(p, true);
     try parseDeclModifiers(p, .top_level);
     _ = try p.expect(.kw_extend);
     if (p.at(.less)) try parseTypeParameterList(p);
@@ -964,15 +1004,15 @@ fn parseExtendDecl(p: *Parser) std.mem.Allocator.Error!void {
 
 /// 解析 `class_body`、`interface_body`、`struct_body`、`extend_body` 或 `foreign_block`。
 fn parseMemberBody(p: *Parser, node_kind: SyntaxKind, scope: DeclScope) std.mem.Allocator.Error!void {
-    try p.emitTrivia(true);
     try p.startNode(node_kind);
+    try p.emitLeadingTrivia(false);
     try p.bump(); // {
     while (!p.isAtEof() and !p.at(.r_curl)) {
-        _ = try p.eatSeparators();
+        _ = try p.eatSemicolons();
         if (p.at(.r_curl) or p.isAtEof()) break;
         const before = p.cursor;
         try parseDecl(p, scope);
-        _ = try p.eatSeparators();
+        _ = try p.eatSemicolons();
         if (p.cursor == before) try p.bumpErrorRun(.expected_item, true);
     }
     _ = try p.expectClosing(.r_curl);
@@ -981,9 +1021,9 @@ fn parseMemberBody(p: *Parser, node_kind: SyntaxKind, scope: DeclScope) std.mem.
 
 /// 解析 `func` 与 `operator func` 声明（含可选泛型参数表、返回类型、`where` 约束与函数体）。
 fn parseFuncDecl(p: *Parser, scope: DeclScope) std.mem.Allocator.Error!void {
-    try p.emitTrivia(true);
     try p.startNode(.func_decl);
-    try parseLeadingBuiltinAnnotations(p);
+    try p.emitLeadingTrivia(true);
+    try parseLeadingBuiltinAnnotations(p, true);
     try parseDeclModifiers(p, scope);
     _ = try p.expect(.kw_func);
 
@@ -1054,9 +1094,9 @@ fn eatOverloadableOperator(p: *Parser) std.mem.Allocator.Error!bool {
 
 /// 解析程序入口 `[modifiers] main(...) [: Type] { ... }`（修饰符合法性交由语义阶段检查）。
 fn parseMainDecl(p: *Parser) std.mem.Allocator.Error!void {
-    try p.emitTrivia(true);
     try p.startNode(.main_decl);
-    try parseLeadingBuiltinAnnotations(p);
+    try p.emitLeadingTrivia(true);
+    try parseLeadingBuiltinAnnotations(p, true);
     try parseDeclModifiers(p, .top_level);
     _ = try p.expect(.kw_main);
     try parseFuncParamList(p, false);
@@ -1073,9 +1113,9 @@ fn parseMainDecl(p: *Parser) std.mem.Allocator.Error!void {
 
 /// 解析宏定义 `public [late] macro Name(params) [: RetType] (= expr | { ... })`。
 fn parseMacroDecl(p: *Parser) std.mem.Allocator.Error!void {
-    try p.emitTrivia(true);
     try p.startNode(.macro_decl);
-    try parseLeadingBuiltinAnnotations(p);
+    try p.emitLeadingTrivia(true);
+    try parseLeadingBuiltinAnnotations(p, true);
     try parseDeclModifiers(p, .top_level);
     _ = try p.expect(.kw_macro);
     _ = try p.expectIdent();
@@ -1095,9 +1135,9 @@ fn parseMacroDecl(p: *Parser) std.mem.Allocator.Error!void {
 
 /// 解析变量与常量声明 `[modifiers] (let | var | const) Pattern [: Type] [= Expr]`。
 fn parseVarDecl(p: *Parser, scope: DeclScope) std.mem.Allocator.Error!void {
-    try p.emitTrivia(true);
     try p.startNode(.var_decl);
-    try parseLeadingBuiltinAnnotations(p);
+    try p.emitLeadingTrivia(true);
+    try parseLeadingBuiltinAnnotations(p, true);
     try parseDeclModifiers(p, scope);
 
     if (p.at(.kw_let) or p.at(.kw_var) or p.at(.kw_const)) {
@@ -1118,9 +1158,9 @@ fn parseVarDecl(p: *Parser, scope: DeclScope) std.mem.Allocator.Error!void {
 
 /// 解析属性声明 `[modifiers] prop Ident : Type [{ get() {...} set(v) {...} }]`。
 fn parsePropDecl(p: *Parser) std.mem.Allocator.Error!void {
-    try p.emitTrivia(true);
     try p.startNode(.prop_decl);
-    try parseLeadingBuiltinAnnotations(p);
+    try p.emitLeadingTrivia(true);
+    try parseLeadingBuiltinAnnotations(p, true);
     try parseDeclModifiers(p, .class_body);
     _ = try p.expect(.kw_prop);
     _ = try p.expectIdent();
@@ -1130,7 +1170,7 @@ fn parsePropDecl(p: *Parser) std.mem.Allocator.Error!void {
     if (p.at(.l_curl)) {
         try p.bump(); // {
         while (!p.isAtEof() and !p.at(.r_curl)) {
-            _ = try p.eatSeparators();
+            _ = try p.eatSemicolons();
             if (p.at(.r_curl) or p.isAtEof()) break;
             const before = p.cursor;
             if (p.atIdentText("get")) {
@@ -1140,7 +1180,7 @@ fn parsePropDecl(p: *Parser) std.mem.Allocator.Error!void {
             } else {
                 try p.bumpErrorToken(.expected_item);
             }
-            _ = try p.eatSeparators();
+            _ = try p.eatSemicolons();
             if (p.cursor == before) try p.bumpErrorToken(.expected_item);
         }
         _ = try p.expectClosing(.r_curl);
@@ -1150,8 +1190,8 @@ fn parsePropDecl(p: *Parser) std.mem.Allocator.Error!void {
 
 /// 解析属性访问器 `get() { ... }`。
 fn parsePropGetter(p: *Parser) std.mem.Allocator.Error!void {
-    try p.emitTrivia(true);
     try p.startNode(.prop_getter);
+    try p.emitLeadingTrivia(true);
     try p.bumpAs(.identifier); // get
     if (try p.expect(.l_paren)) {
         _ = try p.expectClosing(.r_paren);
@@ -1166,8 +1206,8 @@ fn parsePropGetter(p: *Parser) std.mem.Allocator.Error!void {
 
 /// 解析属性修改器 `set(value) { ... }`。
 fn parsePropSetter(p: *Parser) std.mem.Allocator.Error!void {
-    try p.emitTrivia(true);
     try p.startNode(.prop_setter);
+    try p.emitLeadingTrivia(true);
     try p.bumpAs(.identifier); // set
     if (try p.expect(.l_paren)) {
         _ = try p.expectIdent();
@@ -1183,9 +1223,9 @@ fn parsePropSetter(p: *Parser) std.mem.Allocator.Error!void {
 
 /// 解析类型别名 `type Alias[<T>] = Type`。
 fn parseTypeAliasDecl(p: *Parser) std.mem.Allocator.Error!void {
-    try p.emitTrivia(true);
     try p.startNode(.type_alias_decl);
-    try parseLeadingBuiltinAnnotations(p);
+    try p.emitLeadingTrivia(true);
+    try parseLeadingBuiltinAnnotations(p, true);
     try parseDeclModifiers(p, .top_level);
     _ = try p.expect(.kw_type);
     _ = try p.expectIdent();
@@ -1198,9 +1238,9 @@ fn parseTypeAliasDecl(p: *Parser) std.mem.Allocator.Error!void {
 
 /// 解析构造函数与静态初始化器 `[modifiers] init(...) { ... }`。
 fn parseInitDecl(p: *Parser) std.mem.Allocator.Error!void {
-    try p.emitTrivia(true);
     try p.startNode(.init_decl);
-    try parseLeadingBuiltinAnnotations(p);
+    try p.emitLeadingTrivia(true);
+    try parseLeadingBuiltinAnnotations(p, true);
     try parseDeclModifiers(p, .class_body);
     _ = try p.expect(.kw_init);
     try parseFuncParamList(p, false);
@@ -1214,9 +1254,9 @@ fn parseInitDecl(p: *Parser) std.mem.Allocator.Error!void {
 
 /// 解析类终结器 `[modifiers] ~init() { ... }`（修饰符合法性交由语义阶段检查）。
 fn parseFinalizerDecl(p: *Parser) std.mem.Allocator.Error!void {
-    try p.emitTrivia(true);
     try p.startNode(.finalizer_decl);
-    try parseLeadingBuiltinAnnotations(p);
+    try p.emitLeadingTrivia(true);
+    try parseLeadingBuiltinAnnotations(p, true);
     try parseDeclModifiers(p, .class_body);
     _ = try p.expect(.bit_not);
     _ = try p.expect(.kw_init);
@@ -1231,9 +1271,9 @@ fn parseFinalizerDecl(p: *Parser) std.mem.Allocator.Error!void {
 
 /// 解析类或结构体的主构造器 `[modifiers] TypeName(...) { ... }`。
 fn parsePrimaryCtorDecl(p: *Parser) std.mem.Allocator.Error!void {
-    try p.emitTrivia(true);
     try p.startNode(.primary_ctor_decl);
-    try parseLeadingBuiltinAnnotations(p);
+    try p.emitLeadingTrivia(true);
+    try parseLeadingBuiltinAnnotations(p, true);
     try parseDeclModifiers(p, .class_body);
     _ = try p.expectIdent();
     try parseFuncParamList(p, true);
@@ -1247,9 +1287,9 @@ fn parsePrimaryCtorDecl(p: *Parser) std.mem.Allocator.Error!void {
 
 /// 解析 `foreign` 外部声明（允许前置修饰符与任意内层声明，语义合法性交由后续阶段检查）。
 fn parseForeignDecl(p: *Parser) std.mem.Allocator.Error!void {
-    try p.emitTrivia(true);
     try p.startNode(.foreign_decl);
-    try parseLeadingBuiltinAnnotations(p);
+    try p.emitLeadingTrivia(true);
+    try parseLeadingBuiltinAnnotations(p, true);
     try parseDeclModifiers(p, .top_level);
     if (try p.expect(.kw_foreign)) {
         if (p.at(.l_curl)) {
@@ -1263,14 +1303,14 @@ fn parseForeignDecl(p: *Parser) std.mem.Allocator.Error!void {
 
 /// 解析声明侧类型参数表 `<T, U>`（支持缺失逗号恢复与外层边界保护，空 `<>` 报 `.expected_identifier`）。
 fn parseTypeParameterList(p: *Parser) std.mem.Allocator.Error!void {
-    try p.emitTrivia(true);
     try p.startNode(.type_parameter_list);
+    try p.emitLeadingTrivia(false);
     _ = try p.expect(.less);
     var count: usize = 0;
     while (!p.shouldStopList(.type_param_list)) {
         const before = p.cursor;
-        try p.emitTrivia(true);
         try p.startNode(.type_parameter);
+        try p.emitLeadingTrivia(false);
         _ = try p.expectIdent();
         try p.finishNode();
         count += 1;
@@ -1301,14 +1341,14 @@ fn parseOptionalSuperTypes(p: *Parser) std.mem.Allocator.Error!void {
 
 /// 解析泛型约束子句 `where T <: A & B, This <: C`。
 fn parseWhereClause(p: *Parser) std.mem.Allocator.Error!void {
-    try p.emitTrivia(true);
     try p.startNode(.where_clause);
+    try p.emitLeadingTrivia(false);
     _ = try p.expect(.kw_where);
 
     while (!p.isAtEof() and !p.at(.l_curl) and !p.at(.r_curl) and !p.isNewlineDeclBoundary()) {
         const before = p.cursor;
-        try p.emitTrivia(true);
         try p.startNode(.generic_constraint);
+        try p.emitLeadingTrivia(false);
         try type_parser.parseType(p);
         if (try p.expect(.upperbound)) {
             try type_parser.parseType(p);
@@ -1333,22 +1373,25 @@ fn parseWhereClause(p: *Parser) std.mem.Allocator.Error!void {
 
 /// 解析返回类型包装节点 `ret_type`。
 fn parseRetType(p: *Parser) std.mem.Allocator.Error!void {
-    try p.emitTrivia(true);
     try p.startNode(.ret_type);
+    if (!p.isNewlineDeclBoundary()) {
+        try p.emitLeadingTrivia(false);
+    }
     try type_parser.parseType(p);
     try p.finishNode();
 }
 
 /// 解析函数、构造器或宏参数表 `(...)`，支持缺失逗号恢复、外层边界保护、主构造器成员参数、参数宏与 `...`。
 fn parseFuncParamList(p: *Parser, is_primary_ctor: bool) std.mem.Allocator.Error!void {
-    try p.emitTrivia(true);
     try p.startNode(.func_param_list);
+    try p.emitLeadingTrivia(false);
     if (!try p.expect(.l_paren)) {
         try p.finishNode();
         return;
     }
 
-    while (!p.shouldStopList(.func_param_list)) {
+    const list_ctx: parser_mod.ListContext = if (is_primary_ctor) .primary_ctor_param_list else .func_param_list;
+    while (!p.shouldStopList(list_ctx)) {
         const before = p.cursor;
         if (p.at(.ellipsis)) {
             try p.bump();
@@ -1364,8 +1407,8 @@ fn parseFuncParamList(p: *Parser, is_primary_ctor: bool) std.mem.Allocator.Error
             try parseFuncParam(p, is_primary_ctor);
         }
         if (try p.eat(.comma)) {
-            if (p.shouldStopList(.func_param_list)) break;
-        } else if (canStartFuncParam(p, is_primary_ctor) and !p.shouldStopList(.func_param_list)) {
+            if (p.shouldStopList(list_ctx)) break;
+        } else if (canStartFuncParam(p, is_primary_ctor) and !p.shouldStopList(list_ctx)) {
             try p.emitError(.expected_token);
         } else {
             break;
@@ -1379,18 +1422,18 @@ fn parseFuncParamList(p: *Parser, is_primary_ctor: bool) std.mem.Allocator.Error
 
 /// 只读判断当前词法单元是否可以作为函数或主构造器参数的起始符（用于漏逗号恢复判定）。
 fn canStartFuncParam(p: *const Parser, is_primary_ctor: bool) bool {
+    if (is_primary_ctor and p.isPrimaryCtorMemberParamStart()) return true;
     if (p.isNewlineDeclBoundary()) return false;
     const tag = p.peek();
     if (tag == .wildcard or tag == .ellipsis or tag == .at or tag == .at_excl) return true;
-    if (is_primary_ctor and (tag == .kw_let or tag == .kw_var)) return true;
     return Parser.isIdentLike(tag);
 }
 
 /// 解析单个函数或主构造器参数（含注解、访问修饰符、`let`/`var`、参数名或 `_`、`!`、类型与默认值）。
 pub fn parseFuncParam(p: *Parser, is_primary_ctor: bool) std.mem.Allocator.Error!void {
-    try p.emitTrivia(true);
     try p.startNode(.func_param);
-    try parseLeadingBuiltinAnnotations(p);
+    try p.emitLeadingTrivia(true);
+    try parseLeadingBuiltinAnnotations(p, true);
 
     if (is_primary_ctor) {
         const mod = p.peek();
@@ -1437,9 +1480,9 @@ fn parseMacroExpandDecl(p: *Parser, scope: DeclScope) std.mem.Allocator.Error!vo
     if (!try p.enterDepth()) return;
     defer p.leaveDepth();
 
-    try p.emitTrivia(true);
     try p.startNode(.macro_expand_decl);
-    try parseLeadingBuiltinAnnotations(p);
+    try p.emitLeadingTrivia(true);
+    try parseLeadingBuiltinAnnotations(p, true);
     try parseMacroHeader(p, true);
 
     if (p.at(.l_paren)) {
@@ -1456,9 +1499,9 @@ fn parseMacroExpandParam(p: *Parser, is_primary_ctor: bool) std.mem.Allocator.Er
     if (!try p.enterDepth()) return;
     defer p.leaveDepth();
 
-    try p.emitTrivia(true);
     try p.startNode(.macro_expand_param);
-    try parseLeadingBuiltinAnnotations(p);
+    try p.emitLeadingTrivia(true);
+    try parseLeadingBuiltinAnnotations(p, true);
     try parseMacroHeader(p, true);
 
     if (p.at(.l_paren)) {
@@ -1504,26 +1547,26 @@ pub fn parseMacroHeader(p: *Parser, allow_at_excl: bool) std.mem.Allocator.Error
 
 /// 解析宏属性 `[...]`（`macro_attributes`），追踪中括号配对并支持 `\[`、`\]`、`\@` 转义。
 fn parseMacroAttributes(p: *Parser) std.mem.Allocator.Error!void {
-    try p.emitTrivia(true);
     try p.startNode(.macro_attributes);
+    try p.emitLeadingTrivia(false);
     try p.bump(); // [
 
     var depth: u32 = 1;
     var token_count: usize = 0;
 
     while (p.cursor < p.tokens.len) {
-        try p.emitTrivia(true);
-        if (p.cursor >= p.tokens.len) break;
-        const tok = p.tokens[p.cursor];
+        const sig_idx = p.nextSignificantIndex(p.cursor, true);
+        if (sig_idx >= p.tokens.len) break;
+        const tok = p.tokens[sig_idx];
         if (tok.tag == .end) break;
 
-        if (tok.tag == .illegal and std.mem.eql(u8, p.tokenText(tok), "\\") and p.cursor + 1 < p.tokens.len) {
-            const next = p.tokens[p.cursor + 1];
+        if (tok.tag == .illegal and std.mem.eql(u8, p.tokenText(tok), "\\") and sig_idx + 1 < p.tokens.len) {
+            const next = p.tokens[sig_idx + 1];
             if (Parser.isAdjacent(tok, next) and
                 (next.tag == .l_square or next.tag == .r_square or next.tag == .at or next.tag == .at_excl))
             {
-                try p.bump();
-                try p.bump();
+                try p.bumpAllowDoc();
+                try p.bumpAllowDoc();
                 token_count += 1;
                 continue;
             }
@@ -1531,18 +1574,18 @@ fn parseMacroAttributes(p: *Parser) std.mem.Allocator.Error!void {
 
         if (tok.tag == .l_square) {
             depth += 1;
-            try p.bump();
+            try p.bumpAllowDoc();
             token_count += 1;
         } else if (tok.tag == .r_square) {
             depth -= 1;
-            try p.bump();
+            try p.bumpAllowDoc();
             if (depth == 0) break;
             token_count += 1;
         } else {
-            if (p.combinedOpAt(p.cursor)) |comb| {
-                try p.bumpCombined(comb, true);
+            if (p.combinedOpAt(sig_idx)) |comb| {
+                try p.bumpCombinedAllowDoc(comb, true);
             } else {
-                try p.bump();
+                try p.bumpAllowDoc();
             }
             token_count += 1;
         }
@@ -1558,40 +1601,40 @@ fn parseMacroAttributes(p: *Parser) std.mem.Allocator.Error!void {
 
 /// 解析宏调用括号输入 `(...)`（`macro_input`），追踪小括号配对并支持 `\(`、`\)`、`\@` 转义。
 pub fn parseMacroInputParens(p: *Parser) std.mem.Allocator.Error!void {
-    try p.emitTrivia(true);
     try p.startNode(.macro_input);
+    try p.emitLeadingTrivia(false);
     _ = try p.expect(.l_paren);
 
     var depth: u32 = 1;
     while (p.cursor < p.tokens.len) {
-        try p.emitTrivia(true);
-        if (p.cursor >= p.tokens.len) break;
-        const tok = p.tokens[p.cursor];
+        const sig_idx = p.nextSignificantIndex(p.cursor, true);
+        if (sig_idx >= p.tokens.len) break;
+        const tok = p.tokens[sig_idx];
         if (tok.tag == .end) break;
 
-        if (tok.tag == .illegal and std.mem.eql(u8, p.tokenText(tok), "\\") and p.cursor + 1 < p.tokens.len) {
-            const next = p.tokens[p.cursor + 1];
+        if (tok.tag == .illegal and std.mem.eql(u8, p.tokenText(tok), "\\") and sig_idx + 1 < p.tokens.len) {
+            const next = p.tokens[sig_idx + 1];
             if (Parser.isAdjacent(tok, next) and
                 (next.tag == .l_paren or next.tag == .r_paren or next.tag == .at or next.tag == .at_excl))
             {
-                try p.bump();
-                try p.bump();
+                try p.bumpAllowDoc();
+                try p.bumpAllowDoc();
                 continue;
             }
         }
 
         if (tok.tag == .l_paren) {
             depth += 1;
-            try p.bump();
+            try p.bumpAllowDoc();
         } else if (tok.tag == .r_paren) {
             depth -= 1;
-            try p.bump();
+            try p.bumpAllowDoc();
             if (depth == 0) break;
         } else {
-            if (p.combinedOpAt(p.cursor)) |comb| {
-                try p.bumpCombined(comb, true);
+            if (p.combinedOpAt(sig_idx)) |comb| {
+                try p.bumpCombinedAllowDoc(comb, true);
             } else {
-                try p.bump();
+                try p.bumpAllowDoc();
             }
         }
     }

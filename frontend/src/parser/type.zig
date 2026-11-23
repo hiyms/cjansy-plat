@@ -54,24 +54,24 @@ pub fn canStartType(p: *const Parser) bool {
 
 /// 解析基础内置类型节点（如 `Int64`、`Bool`、`Unit`）。
 pub fn parsePrimitiveType(p: *Parser) std.mem.Allocator.Error!void {
-    try p.emitTrivia(true);
     try p.startNode(.primitive_type);
+    try p.emitLeadingTrivia(false);
     try p.bump();
     try p.finishNode();
 }
 
 /// 解析 `This` 类型节点。
 fn parseThisType(p: *Parser) std.mem.Allocator.Error!void {
-    try p.emitTrivia(true);
     try p.startNode(.this_type);
+    try p.emitLeadingTrivia(false);
     try p.bump();
     try p.finishNode();
 }
 
 /// 解析前缀可空类型 `?Type`；连续的 `??T` 每次仅消费单个 `?`，形成嵌套 `option_type`。
 fn parseOptionType(p: *Parser) std.mem.Allocator.Error!void {
-    try p.emitTrivia(true);
     try p.startNode(.option_type);
+    try p.emitLeadingTrivia(false);
     try p.bump();
     try parseType(p);
     try p.finishNode();
@@ -79,8 +79,8 @@ fn parseOptionType(p: *Parser) std.mem.Allocator.Error!void {
 
 /// 解析 `VArray<Type, $N>` 值数组类型。
 pub fn parseVArrayType(p: *Parser) std.mem.Allocator.Error!void {
-    try p.emitTrivia(true);
     try p.startNode(.varray_type);
+    try p.emitLeadingTrivia(false);
     try p.bump(); // VArray
     if (try p.expect(.less)) {
         try parseType(p);
@@ -93,8 +93,8 @@ pub fn parseVArrayType(p: *Parser) std.mem.Allocator.Error!void {
 
 /// 解析 `VArray` 中的常量类型实参 `$N`。
 fn parseConstantType(p: *Parser) std.mem.Allocator.Error!void {
-    try p.emitTrivia(true);
     try p.startNode(.constant_type);
+    try p.emitLeadingTrivia(false);
     if (try p.expect(.dollar)) {
         if (p.peek() == .integer_literal) {
             try p.bump();
@@ -107,8 +107,8 @@ fn parseConstantType(p: *Parser) std.mem.Allocator.Error!void {
 
 /// 解析用户定义类型的点分路径（`a.b.C<T>`），各段平铺为兄弟 `path_segment`。
 pub fn parsePathType(p: *Parser) std.mem.Allocator.Error!void {
-    try p.emitTrivia(true);
     try p.startNode(.path_type);
+    try p.emitLeadingTrivia(false);
     try parseTypePathSegment(p);
     while (p.at(.dot)) {
         try p.bump();
@@ -119,11 +119,11 @@ pub fn parsePathType(p: *Parser) std.mem.Allocator.Error!void {
 
 /// 解析类型路径中的单个段：标识符与可选的 `<Type, ...>` 类型实参表。
 fn parseTypePathSegment(p: *Parser) std.mem.Allocator.Error!void {
-    try p.emitTrivia(true);
     try p.startNode(.path_segment);
     if (p.isNewlineDeclBoundary()) {
         try p.emitError(.expected_identifier);
     } else {
+        try p.emitLeadingTrivia(false);
         _ = try p.expectIdent();
         if (p.at(.less)) {
             try parseTypeArgumentList(p);
@@ -137,8 +137,8 @@ pub fn parseTypeArgumentList(p: *Parser) std.mem.Allocator.Error!void {
     if (!try p.enterDepth()) return;
     defer p.leaveDepth();
 
-    try p.emitTrivia(true);
     try p.startNode(.type_argument_list);
+    try p.emitLeadingTrivia(false);
     _ = try p.expect(.less);
 
     var count: usize = 0;
@@ -248,8 +248,8 @@ fn parseParenTupleOrFuncType(p: *Parser) std.mem.Allocator.Error!void {
     else
         .paren_type;
 
-    try p.emitTrivia(true);
     try p.startNode(node_kind);
+    try p.emitLeadingTrivia(false);
     try p.bump(); // (
 
     if (!p.at(.r_paren)) {

@@ -77,16 +77,16 @@ pub fn parsePattern(p: *Parser, allow_type_pattern: bool) std.mem.Allocator.Erro
 
 /// 解析通配符模式 `_`。
 pub fn parseWildcardPattern(p: *Parser) std.mem.Allocator.Error!void {
-    try p.emitTrivia(true);
     try p.startNode(.wildcard_pattern);
+    try p.emitLeadingTrivia(false);
     try p.bump();
     try p.finishNode();
 }
 
 /// 解析 `()` Unit 字面量常量模式。
 fn parseUnitConstPattern(p: *Parser) std.mem.Allocator.Error!void {
-    try p.emitTrivia(true);
     try p.startNode(.const_pattern);
+    try p.emitLeadingTrivia(false);
     try p.startNode(.unit_literal);
     try p.bump(); // (
     try p.bump(); // )
@@ -96,8 +96,8 @@ fn parseUnitConstPattern(p: *Parser) std.mem.Allocator.Error!void {
 
 /// 解析字面量常量模式（含带前缀负号的数值字面量，如 `-1`、`-1.5`）。
 fn parseConstPattern(p: *Parser) std.mem.Allocator.Error!void {
-    try p.emitTrivia(true);
     try p.startNode(.const_pattern);
+    try p.emitLeadingTrivia(false);
     if (p.at(.sub)) {
         try p.bump();
     }
@@ -107,8 +107,8 @@ fn parseConstPattern(p: *Parser) std.mem.Allocator.Error!void {
 
 /// 解析类型模式 `(ident | _) : Type`。
 fn parseTypePattern(p: *Parser) std.mem.Allocator.Error!void {
-    try p.emitTrivia(true);
     try p.startNode(.type_pattern);
+    try p.emitLeadingTrivia(false);
     if (p.at(.wildcard)) {
         try p.bump();
     } else {
@@ -121,8 +121,8 @@ fn parseTypePattern(p: *Parser) std.mem.Allocator.Error!void {
 
 /// 解析元组模式 `(pat1, pat2, ...)`，支持缺失逗号恢复与外层边界保护。
 fn parseTuplePattern(p: *Parser, allow_type_pattern: bool) std.mem.Allocator.Error!void {
-    try p.emitTrivia(true);
     try p.startNode(.tuple_pattern);
+    try p.emitLeadingTrivia(false);
     try p.bump(); // (
     while (!p.shouldStopList(.pattern_list)) {
         const before = p.cursor;
@@ -147,16 +147,16 @@ fn parseIdentOrEnumPattern(p: *Parser, allow_type_pattern: bool) std.mem.Allocat
     const next = p.peekNth(1);
     const maybe_enum = next == .dot or next == .l_paren or next == .less;
     if (!maybe_enum) {
-        try p.emitTrivia(true);
         try p.startNode(.var_pattern);
+        try p.emitLeadingTrivia(false);
         try p.bumpAs(.identifier);
         try p.finishNode();
         return;
     }
 
     const cp = p.checkpoint();
-    try p.emitTrivia(true);
     try p.startNode(.enum_pattern);
+    try p.emitLeadingTrivia(false);
     try p.startNode(.path_expr);
 
     const parsed_type_args = try parseEnumPathSegment(p);
@@ -193,8 +193,8 @@ fn parseIdentOrEnumPattern(p: *Parser, allow_type_pattern: bool) std.mem.Allocat
     // 仅当由 `<` 触发试探、既未成功解析出泛型实参又未出现 `.` 或 `(` 时，才回退为简单 `var_pattern`
     if (next == .less and !parsed_type_args and !has_dot_or_paren) {
         p.rollback(cp);
-        try p.emitTrivia(true);
         try p.startNode(.var_pattern);
+        try p.emitLeadingTrivia(false);
         try p.bumpAs(.identifier);
         try p.finishNode();
     }
@@ -202,13 +202,13 @@ fn parseIdentOrEnumPattern(p: *Parser, allow_type_pattern: bool) std.mem.Allocat
 
 /// 解析枚举构造器路径中的单个 `path_segment`（标识符与可选泛型实参），返回是否解析出了类型实参表。
 fn parseEnumPathSegment(p: *Parser) std.mem.Allocator.Error!bool {
-    try p.emitTrivia(true);
     try p.startNode(.path_segment);
     if (p.isNewlineDeclBoundary()) {
         try p.emitError(.expected_identifier);
         try p.finishNode();
         return false;
     }
+    try p.emitLeadingTrivia(false);
     _ = try p.expectIdent();
     var parsed_args = false;
     if (p.at(.less)) {
@@ -238,8 +238,8 @@ pub fn parseHandlePattern(p: *Parser) std.mem.Allocator.Error!void {
 
 /// 解析 `catch` / `handle` 共用的 `(ident | _) : Type (| Type)*` 模式结构。
 fn parseTypedClausePattern(p: *Parser, kind: common.SyntaxKind) std.mem.Allocator.Error!void {
-    try p.emitTrivia(true);
     try p.startNode(kind);
+    try p.emitLeadingTrivia(false);
     if (p.at(.wildcard)) {
         try p.bump();
     } else {

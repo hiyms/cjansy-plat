@@ -73,8 +73,8 @@ pub fn parseBlock(p: *Parser) std.mem.Allocator.Error!void {
     p.restrictions = .{};
     defer p.restrictions = saved;
 
-    try p.emitTrivia(true);
     try p.startNode(.block);
+    try p.emitLeadingTrivia(false);
     _ = try p.expect(.l_curl);
     _ = try parseStmtList(p, .r_curl, false);
     _ = try p.expectClosing(.r_curl);
@@ -83,12 +83,11 @@ pub fn parseBlock(p: *Parser) std.mem.Allocator.Error!void {
 
 /// 解析语句序列 `stmt_list`，持续消费直到遇到终止符（`}`、`case` 或文件尾），返回解析出的语句条数。
 pub fn parseStmtList(p: *Parser, stop_tag: TokenTag, stop_at_case: bool) std.mem.Allocator.Error!usize {
-    try p.emitTrivia(true);
     try p.startNode(.stmt_list);
 
     var count: usize = 0;
     while (!p.isAtEof()) {
-        _ = try p.eatSeparators();
+        _ = try p.eatSemicolons();
         const cur = p.peek();
         if (cur == .end or cur == stop_tag) break;
         if (stop_at_case and cur == .kw_case) break;
@@ -104,7 +103,7 @@ pub fn parseStmtList(p: *Parser, stop_tag: TokenTag, stop_at_case: bool) std.mem
             try p.bumpErrorRun(.expected_expression, true);
         }
         count += 1;
-        _ = try p.eatSeparators();
+        _ = try p.eatSemicolons();
     }
 
     try p.finishNode();
@@ -113,8 +112,8 @@ pub fn parseStmtList(p: *Parser, stop_tag: TokenTag, stop_at_case: bool) std.mem
 
 /// 解析表达式语句 `expression_statement`（含同行尾随可选 `;`）。
 fn parseExprStmt(p: *Parser) std.mem.Allocator.Error!void {
-    try p.emitTrivia(true);
     try p.startNode(.expression_statement);
+    try p.emitLeadingTrivia(false);
     const lhs = try parseExprBp(p, Prec.lowest);
     if (lhs == .missing and !p.isAtEof()) {
         const cur = p.peek();
@@ -386,8 +385,8 @@ fn parsePrefixExpr(p: *Parser) std.mem.Allocator.Error!LhsKind {
         p.restrictions.allow_let_condition = false;
         defer p.restrictions = saved;
 
-        try p.emitTrivia(true);
         try p.startNode(.unary_expr);
+        try p.emitLeadingTrivia(false);
         try p.bump();
         if (p.hasNewlineBefore()) {
             try p.emitError(.expected_expression);
@@ -433,8 +432,12 @@ fn parsePostfixExpr(p: *Parser) std.mem.Allocator.Error!LhsKind {
     while (true) {
         const before = p.cursor;
 
-        // 1. 允许跨行的成员访问 `.seg`（单层平铺进 `path_expr`）
+        // 1. 允许跨行的成员访问 `.seg`（非路径表达式首段包裹为 `path_segment`，全链平铺进 `path_expr`）
         if (p.at(.dot)) {
+            if (lhs != .path_node) {
+                try p.wrapNode(.path_segment);
+                try p.finishNode();
+            }
             try p.wrapNode(.path_expr);
             try parseFlatPathTail(p);
             try p.finishNode();
@@ -489,6 +492,10 @@ fn parsePostfixExpr(p: *Parser) std.mem.Allocator.Error!LhsKind {
                 const after_q = peekAfterQuest(p);
                 switch (after_q) {
                     .dot => {
+                        if (lhs != .path_node) {
+                            try p.wrapNode(.path_segment);
+                            try p.finishNode();
+                        }
                         try p.wrapNode(.path_expr);
                         try parseFlatPathTail(p);
                         try p.finishNode();
@@ -627,8 +634,8 @@ fn parseAtomExpr(p: *Parser) std.mem.Allocator.Error!LhsKind {
             return .general;
         },
         .wildcard => {
-            try p.emitTrivia(true);
             try p.startNode(.wildcard_expr);
+            try p.emitLeadingTrivia(false);
             try p.bump();
             try p.finishNode();
             return .general;
@@ -691,8 +698,8 @@ fn parseAtomExpr(p: *Parser) std.mem.Allocator.Error!LhsKind {
             return .general;
         },
         .kw_break, .kw_continue => {
-            try p.emitTrivia(true);
             try p.startNode(.jump_expr);
+            try p.emitLeadingTrivia(false);
             try p.bump();
             try p.finishNode();
             return .general;
@@ -772,8 +779,8 @@ fn parseAtomExpr(p: *Parser) std.mem.Allocator.Error!LhsKind {
 
 /// 解析 `if` / `while` 条件中的 `let pattern (| pattern)* <- expr` 模式解构节点。
 fn parseLetConditionDestructor(p: *Parser) std.mem.Allocator.Error!void {
-    try p.emitTrivia(true);
     try p.startNode(.let_pattern_destructor);
+    try p.emitLeadingTrivia(false);
     try p.bump(); // let
     try pattern.parsePattern(p, true);
     while (try p.eat(.bit_or)) {
@@ -804,8 +811,8 @@ fn isSameLineLParenAfterCurrent(p: *const Parser) bool {
 
 /// 解析平铺的点分路径表达式（`a`、`a.b`、`this.x`、`super.f`、`This.foo`、`Int64.Max`、`a?.b`）。
 fn parsePathExpr(p: *Parser) std.mem.Allocator.Error!void {
-    try p.emitTrivia(true);
     try p.startNode(.path_expr);
+    try p.emitLeadingTrivia(false);
     try parseExprPathSegment(p);
     try parseFlatPathTail(p);
     try p.finishNode();
@@ -814,13 +821,13 @@ fn parsePathExpr(p: *Parser) std.mem.Allocator.Error!void {
 /// 解析路径表达式中的单个 `path_segment`（名称与可选泛型实参表）；
 /// 当点号之后跨行到达新声明边界（如 `obj.\npublic func g()`）时立即停止，避免吞并下一行声明修饰符。
 fn parseExprPathSegment(p: *Parser) std.mem.Allocator.Error!void {
-    try p.emitTrivia(true);
     try p.startNode(.path_segment);
     if (p.isNewlineDeclBoundary()) {
         try p.emitError(.expected_identifier);
         try p.finishNode();
         return;
     }
+    try p.emitLeadingTrivia(false);
     const tag = p.peek();
     if (tag == .kw_this or tag == .kw_super or tag == .kw_this_type or Parser.isPrimitiveTypeTag(tag)) {
         try p.bump();
@@ -837,8 +844,8 @@ fn parseExprPathSegment(p: *Parser) std.mem.Allocator.Error!void {
 
 /// 解析数值与 `Rune` 类型转换表达式（如 `Int64(x)`、`Rune(65)`）。
 fn parseTypeConvExpr(p: *Parser) std.mem.Allocator.Error!void {
-    try p.emitTrivia(true);
     try p.startNode(.type_conv_expr);
+    try p.emitLeadingTrivia(false);
     try type_parser.parsePrimitiveType(p);
     if (try p.expect(.l_paren)) {
         _ = try parseExprWithRestrictions(p, .{});
@@ -849,8 +856,8 @@ fn parseTypeConvExpr(p: *Parser) std.mem.Allocator.Error!void {
 
 /// 解析 `VArray<T, $N>(...)` 或 `VArray<T, $N> { ... }` 值数组构造表达式。
 fn parseVArrayExpr(p: *Parser) std.mem.Allocator.Error!void {
-    try p.emitTrivia(true);
     try p.startNode(.varray_expr);
+    try p.emitLeadingTrivia(false);
     try type_parser.parseVArrayType(p);
     if (p.peekNoNl() == .l_paren) {
         try parseCallArgs(p);
@@ -901,8 +908,8 @@ fn parenExprHasTopComma(p: *const Parser) bool {
 /// 解析 `()`（`unit_literal`）、`(expr)`（`paren_expr`）或 `(e1, e2, ...)`（`tuple_lit`）。
 fn parseParenUnitOrTupleExpr(p: *Parser) std.mem.Allocator.Error!LhsKind {
     if (p.peekNth(1) == .r_paren) {
-        try p.emitTrivia(true);
         try p.startNode(.unit_literal);
+        try p.emitLeadingTrivia(false);
         try p.bump(); // (
         try p.bump(); // )
         try p.finishNode();
@@ -910,8 +917,8 @@ fn parseParenUnitOrTupleExpr(p: *Parser) std.mem.Allocator.Error!LhsKind {
     }
 
     if (parenExprHasTopComma(p)) {
-        try p.emitTrivia(true);
         try p.startNode(.tuple_lit);
+        try p.emitLeadingTrivia(false);
         try p.bump(); // (
         while (!p.shouldStopList(.paren_expr_list)) {
             const before = p.cursor;
@@ -936,8 +943,8 @@ fn parseParenUnitOrTupleExpr(p: *Parser) std.mem.Allocator.Error!LhsKind {
         .allow_range_colon = true,
         .allow_let_condition = p.restrictions.allow_let_condition,
     };
-    try p.emitTrivia(true);
     try p.startNode(.paren_expr);
+    try p.emitLeadingTrivia(false);
     try p.bump(); // (
     _ = try parseExprWithRestrictions(p, inner_r);
     _ = try p.expectClosing(.r_paren);
@@ -947,8 +954,8 @@ fn parseParenUnitOrTupleExpr(p: *Parser) std.mem.Allocator.Error!LhsKind {
 
 /// 解析数组字面量 `[e1, *spread, e2]`，支持缺失逗号恢复与外层边界保护。
 fn parseArrayLit(p: *Parser) std.mem.Allocator.Error!void {
-    try p.emitTrivia(true);
     try p.startNode(.array_lit);
+    try p.emitLeadingTrivia(false);
     try p.bump(); // [
     while (!p.shouldStopList(.square_expr_list)) {
         const before = p.cursor;
@@ -987,8 +994,8 @@ fn parseCallArgs(p: *Parser) std.mem.Allocator.Error!void {
 
 /// 解析单个实参节点 `func_arg`（支持命名实参 `name: expr` 与 `inout expr`）。
 pub fn parseFuncArg(p: *Parser) std.mem.Allocator.Error!void {
-    try p.emitTrivia(true);
     try p.startNode(.func_arg);
+    try p.emitLeadingTrivia(false);
 
     if (Parser.isIdentLike(p.peek()) and p.peekNth(1) == .colon) {
         try p.bumpAs(.identifier);
@@ -1007,8 +1014,8 @@ fn parseSubscriptArgs(p: *Parser) std.mem.Allocator.Error!void {
     while (!p.shouldStopList(.square_expr_list)) {
         const before = p.cursor;
         if (p.at(.range_op) or p.at(.closed_range_op)) {
-            try p.emitTrivia(true);
             try p.startNode(.range_expr);
+            try p.emitLeadingTrivia(false);
             try p.bump(); // .. or ..=
             if (!p.shouldStopList(.square_expr_list) and !p.at(.comma) and !p.at(.colon)) {
                 _ = try parseExprBp(p, Prec.shift);
@@ -1045,8 +1052,8 @@ fn parseIfExpr(p: *Parser) std.mem.Allocator.Error!void {
     if (!try p.enterDepth()) return;
     defer p.leaveDepth();
 
-    try p.emitTrivia(true);
     try p.startNode(.if_expr);
+    try p.emitLeadingTrivia(false);
     try p.bump(); // if
     if (try p.expect(.l_paren)) {
         _ = try parseExprWithRestrictions(p, .{
@@ -1075,8 +1082,8 @@ fn parseIfExpr(p: *Parser) std.mem.Allocator.Error!void {
 
 /// 解析有选择器或无选择器的 `match` 表达式。
 fn parseMatchExpr(p: *Parser) std.mem.Allocator.Error!void {
-    try p.emitTrivia(true);
     try p.startNode(.match_expr);
+    try p.emitLeadingTrivia(false);
     try p.bump(); // match
 
     var has_selector = false;
@@ -1089,7 +1096,7 @@ fn parseMatchExpr(p: *Parser) std.mem.Allocator.Error!void {
 
     if (try p.expect(.l_curl)) {
         while (!p.isAtEof() and !p.at(.r_curl)) {
-            _ = try p.eatSeparators();
+            _ = try p.eatSemicolons();
             if (p.at(.r_curl) or p.isAtEof()) break;
             const before = p.cursor;
             if (p.at(.kw_case)) {
@@ -1111,8 +1118,8 @@ fn parseMatchExpr(p: *Parser) std.mem.Allocator.Error!void {
 
 /// 解析有选择器 `match` 中的单个分支 `case pat (| pat)* [where expr] => stmt_list`。
 fn parseMatchCase(p: *Parser) std.mem.Allocator.Error!void {
-    try p.emitTrivia(true);
     try p.startNode(.match_case);
+    try p.emitLeadingTrivia(false);
     try p.bump(); // case
     try pattern.parsePattern(p, true);
     while (try p.eat(.bit_or)) {
@@ -1128,8 +1135,8 @@ fn parseMatchCase(p: *Parser) std.mem.Allocator.Error!void {
 
 /// 解析无选择器 `match` 中的单个分支 `case (expr | _) => stmt_list`。
 fn parseMatchCaseOther(p: *Parser) std.mem.Allocator.Error!void {
-    try p.emitTrivia(true);
     try p.startNode(.match_case_other);
+    try p.emitLeadingTrivia(false);
     try p.bump(); // case
     if (p.at(.wildcard) and p.peekNth(1) == .double_arrow) {
         try pattern.parseWildcardPattern(p);
@@ -1143,8 +1150,8 @@ fn parseMatchCaseOther(p: *Parser) std.mem.Allocator.Error!void {
 
 /// 解析模式守卫 `where expr`。
 fn parsePatternGuard(p: *Parser) std.mem.Allocator.Error!void {
-    try p.emitTrivia(true);
     try p.startNode(.pattern_guard);
+    try p.emitLeadingTrivia(false);
     try p.bump(); // where
     _ = try parseExprWithRestrictions(p, .{ .allow_trailing_closure = false });
     try p.finishNode();
@@ -1152,8 +1159,8 @@ fn parsePatternGuard(p: *Parser) std.mem.Allocator.Error!void {
 
 /// 解析 `while (condition) block`。
 fn parseWhileExpr(p: *Parser) std.mem.Allocator.Error!void {
-    try p.emitTrivia(true);
     try p.startNode(.while_expr);
+    try p.emitLeadingTrivia(false);
     try p.bump(); // while
     if (try p.expect(.l_paren)) {
         _ = try parseExprWithRestrictions(p, .{
@@ -1173,8 +1180,8 @@ fn parseWhileExpr(p: *Parser) std.mem.Allocator.Error!void {
 
 /// 解析 `do block while (expr)`。
 fn parseDoWhileExpr(p: *Parser) std.mem.Allocator.Error!void {
-    try p.emitTrivia(true);
     try p.startNode(.do_while_expr);
+    try p.emitLeadingTrivia(false);
     try p.bump(); // do
     if (p.at(.l_curl)) {
         try parseBlock(p);
@@ -1192,8 +1199,8 @@ fn parseDoWhileExpr(p: *Parser) std.mem.Allocator.Error!void {
 
 /// 解析 `for (pattern in expr [where guard]) block`。
 fn parseForInExpr(p: *Parser) std.mem.Allocator.Error!void {
-    try p.emitTrivia(true);
     try p.startNode(.for_in_expr);
+    try p.emitLeadingTrivia(false);
     try p.bump(); // for
     if (try p.expect(.l_paren)) {
         try pattern.parsePattern(p, false);
@@ -1215,8 +1222,8 @@ fn parseForInExpr(p: *Parser) std.mem.Allocator.Error!void {
 
 /// 解析 `try [(resources)] block catch* handle* [finally]`。
 fn parseTryExpr(p: *Parser) std.mem.Allocator.Error!void {
-    try p.emitTrivia(true);
     try p.startNode(.try_expr);
+    try p.emitLeadingTrivia(false);
     try p.bump(); // try
 
     if (p.at(.l_paren)) {
@@ -1251,8 +1258,8 @@ fn parseTryExpr(p: *Parser) std.mem.Allocator.Error!void {
     }
 
     if (p.at(.kw_finally)) {
-        try p.emitTrivia(true);
         try p.startNode(.finally_clause);
+        try p.emitLeadingTrivia(false);
         try p.bump(); // finally
         if (p.at(.l_curl)) {
             try parseBlock(p);
@@ -1267,8 +1274,8 @@ fn parseTryExpr(p: *Parser) std.mem.Allocator.Error!void {
 
 /// 解析 `try (...)` 中的单个资源声明 `name [: Type] = expr`。
 fn parseResourceSpec(p: *Parser) std.mem.Allocator.Error!void {
-    try p.emitTrivia(true);
     try p.startNode(.resource_spec);
+    try p.emitLeadingTrivia(false);
     _ = try p.expectIdent();
     if (try p.eat(.colon)) {
         try type_parser.parseType(p);
@@ -1281,8 +1288,8 @@ fn parseResourceSpec(p: *Parser) std.mem.Allocator.Error!void {
 
 /// 解析 `catch (pattern) block`。
 fn parseCatchClause(p: *Parser) std.mem.Allocator.Error!void {
-    try p.emitTrivia(true);
     try p.startNode(.catch_clause);
+    try p.emitLeadingTrivia(false);
     try p.bump(); // catch
     if (try p.expect(.l_paren)) {
         try pattern.parseCatchPattern(p);
@@ -1298,8 +1305,8 @@ fn parseCatchClause(p: *Parser) std.mem.Allocator.Error!void {
 
 /// 解析代数效应 `handle (pattern) block`。
 fn parseHandleClause(p: *Parser) std.mem.Allocator.Error!void {
-    try p.emitTrivia(true);
     try p.startNode(.handle_clause);
+    try p.emitLeadingTrivia(false);
     try p.bump(); // handle
     if (try p.expect(.l_paren)) {
         try pattern.parseHandlePattern(p);
@@ -1315,8 +1322,8 @@ fn parseHandleClause(p: *Parser) std.mem.Allocator.Error!void {
 
 /// 解析 `throw expr`。
 fn parseThrowExpr(p: *Parser) std.mem.Allocator.Error!void {
-    try p.emitTrivia(true);
     try p.startNode(.throw_expr);
+    try p.emitLeadingTrivia(false);
     try p.bump(); // throw
     try parseExpr(p);
     try p.finishNode();
@@ -1324,8 +1331,8 @@ fn parseThrowExpr(p: *Parser) std.mem.Allocator.Error!void {
 
 /// 解析 `return [expr]`；同行后续为终止符、`,` 或 `case` 时作为无值返回。
 fn parseReturnExpr(p: *Parser) std.mem.Allocator.Error!void {
-    try p.emitTrivia(true);
     try p.startNode(.return_expr);
+    try p.emitLeadingTrivia(false);
     try p.bump(); // return
     const next_no_nl = p.peekNoNl();
     if (!p.atStmtTerminator() and next_no_nl != .comma and next_no_nl != .kw_case) {
@@ -1336,8 +1343,8 @@ fn parseReturnExpr(p: *Parser) std.mem.Allocator.Error!void {
 
 /// 解析 `perform expr`。
 fn parsePerformExpr(p: *Parser) std.mem.Allocator.Error!void {
-    try p.emitTrivia(true);
     try p.startNode(.perform_expr);
+    try p.emitLeadingTrivia(false);
     try p.bump(); // perform
     try parseExpr(p);
     try p.finishNode();
@@ -1345,8 +1352,8 @@ fn parsePerformExpr(p: *Parser) std.mem.Allocator.Error!void {
 
 /// 解析 `resume [expr] [with expr | throwing expr]`，同行判定 `with` / `throwing` 与表达式终止。
 fn parseResumeExpr(p: *Parser) std.mem.Allocator.Error!void {
-    try p.emitTrivia(true);
     try p.startNode(.resume_expr);
+    try p.emitLeadingTrivia(false);
     try p.bump(); // resume
     const next_no_nl = p.peekNoNl();
     if (!p.atStmtTerminator() and
@@ -1365,8 +1372,8 @@ fn parseResumeExpr(p: *Parser) std.mem.Allocator.Error!void {
 
 /// 解析 `spawn [(context)] { ... }`。
 fn parseSpawnExpr(p: *Parser) std.mem.Allocator.Error!void {
-    try p.emitTrivia(true);
     try p.startNode(.spawn_expr);
+    try p.emitLeadingTrivia(false);
     try p.bump(); // spawn
     if (p.at(.l_paren)) {
         try p.bump();
@@ -1383,8 +1390,8 @@ fn parseSpawnExpr(p: *Parser) std.mem.Allocator.Error!void {
 
 /// 解析 `synchronized (mutex) block`。
 fn parseSynchronizedExpr(p: *Parser) std.mem.Allocator.Error!void {
-    try p.emitTrivia(true);
     try p.startNode(.synchronized_expr);
+    try p.emitLeadingTrivia(false);
     try p.bump(); // synchronized
     if (try p.expect(.l_paren)) {
         _ = try parseExprWithRestrictions(p, .{ .allow_trailing_closure = false });
@@ -1400,8 +1407,8 @@ fn parseSynchronizedExpr(p: *Parser) std.mem.Allocator.Error!void {
 
 /// 解析 `unsafe block`。
 fn parseUnsafeExpr(p: *Parser) std.mem.Allocator.Error!void {
-    try p.emitTrivia(true);
     try p.startNode(.unsafe_expr);
+    try p.emitLeadingTrivia(false);
     try p.bump(); // unsafe
     if (p.at(.l_curl)) {
         try parseBlock(p);
@@ -1454,11 +1461,11 @@ fn parseLambdaExpr(p: *Parser, allow_omitted_arrow: bool, has_leading_annotation
     p.restrictions = .{};
     defer p.restrictions = saved;
 
-    try p.emitTrivia(true);
     try p.startNode(.lambda_expr);
+    try p.emitLeadingTrivia(false);
 
     if (has_leading_annotations) {
-        try decl.parseLeadingBuiltinAnnotations(p);
+        try decl.parseLeadingBuiltinAnnotations(p, false);
         if (!p.at(.l_curl)) {
             try p.emitError(.expected_block);
             try p.finishNode();
@@ -1471,8 +1478,8 @@ fn parseLambdaExpr(p: *Parser, allow_omitted_arrow: bool, has_leading_annotation
 
     if (has_arrow) {
         if (!p.at(.double_arrow)) {
-            try p.emitTrivia(true);
             try p.startNode(.func_param_list);
+            try p.emitLeadingTrivia(false);
             while (!p.isAtEof() and !p.at(.double_arrow) and !p.at(.r_curl) and !p.isNewlineDeclBoundary()) {
                 const before = p.cursor;
                 try decl.parseFuncParam(p, false);
@@ -1492,7 +1499,6 @@ fn parseLambdaExpr(p: *Parser, allow_omitted_arrow: bool, has_leading_annotation
         try p.emitError(.expected_token);
     }
 
-    try p.emitTrivia(true);
     try p.startNode(.block);
     _ = try parseStmtList(p, .r_curl, false);
     try p.finishNode();
@@ -1511,8 +1517,8 @@ pub fn isIfAvailableStart(p: *const Parser) bool {
 
 /// 解析 `@IfAvailable(arg, lambda1, lambda2)` 表达式。
 fn parseIfAvailableExpr(p: *Parser) std.mem.Allocator.Error!void {
-    try p.emitTrivia(true);
     try p.startNode(.if_available_expr);
+    try p.emitLeadingTrivia(false);
     try p.bump(); // @
     try p.bumpAs(.identifier); // IfAvailable
     if (p.peekNoNl() == .l_paren) {
@@ -1528,8 +1534,8 @@ fn parseMacroExpandExpr(p: *Parser) std.mem.Allocator.Error!void {
     if (!try p.enterDepth()) return;
     defer p.leaveDepth();
 
-    try p.emitTrivia(true);
     try p.startNode(.macro_expand_expr);
+    try p.emitLeadingTrivia(false);
     try decl.parseMacroHeader(p, false);
 
     if (p.at(.l_paren)) {
@@ -1546,14 +1552,14 @@ fn parseMacroExpandExpr(p: *Parser) std.mem.Allocator.Error!void {
 /// - `quote` 与 `(` 之间禁止换行；
 /// - 识别 `lexer` 产出的 `\`（单字节 `.illegal`）与其物理紧邻的 `(`、`)`、`$`、`$ident`、`@`、`@!` 构成转义，
 ///   被转义的括号不计入配对深度，被转义的 `$` 不触发代码插值；
-/// - 未转义的 `$(expr)` 与 `$ident` 切分为 `quote_interpolation`，先关闭 `token_part` 再在外层发射前导 Trivia；
+/// - 未转义的 `$(expr)` 与 `$ident` 切分为 `quote_interpolation`，先关闭 `token_part` 再由后续节点承接前导 Trivia；
 /// - 孤立未转义 `$` 与不匹配的小括号均报告语法错误并维持无损。
 fn parseQuoteExpr(p: *Parser) std.mem.Allocator.Error!void {
     if (!try p.enterDepth()) return;
     defer p.leaveDepth();
 
-    try p.emitTrivia(true);
     try p.startNode(.quote_expr);
+    try p.emitLeadingTrivia(false);
     try p.bump(); // quote
 
     if (p.at(.l_paren) and p.hasNewlineBefore()) {
@@ -1568,14 +1574,13 @@ fn parseQuoteExpr(p: *Parser) std.mem.Allocator.Error!void {
     var in_token_part = false;
 
     while (p.cursor < p.tokens.len) {
-        // 先只读定位下一个非 Trivia 词法单元，决定在 `token_part` 内还是外发射前导 Trivia
+        // 先只读定位下一个非 Trivia 词法单元，决定前导 Trivia 归属于哪个节点
         const sig_idx = p.nextSignificantIndex(p.cursor, true);
         if (sig_idx >= p.tokens.len or p.tokens[sig_idx].tag == .end) {
             if (in_token_part) {
                 try p.finishNode();
                 in_token_part = false;
             }
-            try p.emitTrivia(true);
             break;
         }
 
@@ -1589,46 +1594,14 @@ fn parseQuoteExpr(p: *Parser) std.mem.Allocator.Error!void {
         const is_interp_ident = tok.tag == .dollar_identifier;
         const is_outer_rparen = tok.tag == .r_paren and lparen_depth == 1;
 
-        if (is_interp_paren or is_interp_ident or is_outer_rparen) {
+        if (is_interp_paren) {
             if (in_token_part) {
                 try p.finishNode();
                 in_token_part = false;
             }
-            try p.emitTrivia(true);
-            try p.emitPendingWhitespace();
-        } else {
-            if (!in_token_part) {
-                try p.emitTrivia(true);
-                try p.emitPendingWhitespace();
-                try p.startNode(.token_part);
-                in_token_part = true;
-            } else {
-                try p.emitTrivia(true);
-            }
-        }
-
-        if (p.cursor >= p.tokens.len) break;
-        const cur = p.tokens[p.cursor];
-
-        // 1. 识别反斜杠转义：`\(`、`\)`、`\$`、`\$x`、`\@`、`\@!`
-        if (cur.tag == .illegal and std.mem.eql(u8, p.tokenText(cur), "\\")) {
-            if (p.cursor + 1 < p.tokens.len) {
-                const next = p.tokens[p.cursor + 1];
-                if (Parser.isAdjacent(cur, next) and isValidQuoteEscapeTarget(next.tag)) {
-                    try p.bump(); // \
-                    try p.bump(); // 转义目标，不参与括号配对与插值
-                    continue;
-                }
-            }
-            try p.emitError(.illegal_token);
-            try p.bump();
-            continue;
-        }
-
-        // 2. 未转义的 `$(expr)` 代码插值
-        if (is_interp_paren) {
             try p.startNode(.quote_interpolation);
-            try p.bump(); // $
+            try p.emitLeadingTrivia(true);
+            try p.bumpAllowDoc(); // $
             try p.bumpNoNl(); // (
             _ = try parseExprWithRestrictions(p, .{});
             _ = try p.expectClosing(.r_paren);
@@ -1636,43 +1609,78 @@ fn parseQuoteExpr(p: *Parser) std.mem.Allocator.Error!void {
             continue;
         }
 
-        // 3. 未转义的 `$ident` 代码插值
         if (is_interp_ident) {
+            if (in_token_part) {
+                try p.finishNode();
+                in_token_part = false;
+            }
             try p.startNode(.quote_interpolation);
-            try p.bump();
+            try p.emitLeadingTrivia(true);
+            try p.bumpAllowDoc();
             try p.finishNode();
             continue;
         }
 
-        // 4. 孤立未转义 `$`：按规范需写为 `\$`
-        if (cur.tag == .dollar) {
-            try p.emitError(.unexpected_token);
-            try p.bump();
-            continue;
-        }
-
-        // 5. 小括号配对追踪
-        if (cur.tag == .l_paren) {
-            lparen_depth += 1;
-            try p.bump();
-            continue;
-        }
-
-        if (cur.tag == .r_paren) {
+        if (is_outer_rparen) {
+            if (in_token_part) {
+                try p.finishNode();
+                in_token_part = false;
+            }
             lparen_depth -= 1;
-            try p.bump();
+            try p.bumpAllowDoc(); // )
+            break;
+        }
+
+        if (!in_token_part) {
+            try p.startNode(.token_part);
+            try p.emitLeadingTrivia(true);
+            in_token_part = true;
+        }
+
+        // 1. 识别反斜杠转义：`\(`、`\)`、`\$`、`\$x`、`\@`、`\@!`
+        if (tok.tag == .illegal and std.mem.eql(u8, p.tokenText(tok), "\\")) {
+            if (sig_idx + 1 < p.tokens.len) {
+                const next = p.tokens[sig_idx + 1];
+                if (Parser.isAdjacent(tok, next) and isValidQuoteEscapeTarget(next.tag)) {
+                    try p.bumpAllowDoc(); // \
+                    try p.bumpAllowDoc(); // 转义目标，不参与括号配对与插值
+                    continue;
+                }
+            }
+            try p.emitError(.illegal_token);
+            try p.bumpAllowDoc();
+            continue;
+        }
+
+        // 2. 孤立未转义 `$`：按规范需写为 `\$`
+        if (tok.tag == .dollar) {
+            try p.emitError(.unexpected_token);
+            try p.bumpAllowDoc();
+            continue;
+        }
+
+        // 3. 嵌套小括号配对追踪
+        if (tok.tag == .l_paren) {
+            lparen_depth += 1;
+            try p.bumpAllowDoc();
+            continue;
+        }
+
+        if (tok.tag == .r_paren) {
+            lparen_depth -= 1;
+            try p.bumpAllowDoc();
             if (lparen_depth == 0) break;
             continue;
         }
 
-        // 6. 普通 quoteToken（含组合运算符 `??`、`>>`、`>>=`、`>=` 与嵌套 `quote` / `@Macro`）
-        if (p.combinedOpAt(p.cursor)) |comb| {
-            try p.bumpCombined(comb, true);
+        // 4. 普通 quoteToken（含组合运算符 `??`、`>>`、`>>=`、`>=` 与嵌套 `quote` / `@Macro`）
+        if (p.combinedOpAt(sig_idx)) |comb| {
+            try p.bumpCombinedAllowDoc(comb, true);
         } else {
-            if (cur.tag == .illegal) {
+            if (tok.tag == .illegal) {
                 try p.emitError(.illegal_token);
             }
-            try p.bump();
+            try p.bumpAllowDoc();
         }
     }
 
@@ -1714,13 +1722,10 @@ fn parseStringOrInterpolation(p: *Parser) std.mem.Allocator.Error!void {
     }
     defer p.leaveDepth();
 
-    // 发射前导 Trivia 与水平空白后再开启 `str_interpolation_expr`，使节点首字符精确对齐引号
-    try p.emitTrivia(true);
-    try p.emitPendingWhitespace();
+    try p.startNode(.str_interpolation_expr);
+    try p.emitLeadingTrivia(false);
     const range = p.safeRange(tok.span);
     p.cursor += 1;
-
-    try p.startNode(.str_interpolation_expr);
 
     var seg_start: u32 = 0;
     var scan_pos: u32 = 0;
@@ -1858,9 +1863,9 @@ fn parseInterpolationBlock(p: *Parser, local_start: u32, local_end: u32) std.mem
 
     try child.startNode(.block);
     _ = try parseStmtList(&child, .end, false);
-    try child.emitTrivia(true);
-    try child.emitTrailingWhitespace();
     try child.finishNode();
+    try child.emitTrivia(true, false);
+    try child.emitTrailingWhitespace();
 
     try p.events.appendSlice(p.allocator, child.events.items);
     try p.errors.appendSlice(p.allocator, child.errors.items);
