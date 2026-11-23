@@ -10,7 +10,8 @@ pub fn build(b: *std.Build) void {
     const optimize = b.standardOptimizeOption(.{});
 
     const exec_lexer = b.option(bool, "exec_lexer", "Build cjfrontend executable with lexer subcommand") orelse false;
-    const build_exe = exec_lexer;
+    const exec_parser = b.option(bool, "exec_parser", "Build cjfrontend executable with parser subcommand") orelse false;
+    const build_exe = exec_lexer or exec_parser;
 
     const common_dep = b.dependency("common", .{
         .target = target,
@@ -47,6 +48,7 @@ pub fn build(b: *std.Build) void {
         })) |clap_dep| {
             const exe_options = b.addOptions();
             exe_options.addOption(bool, "exec_lexer", exec_lexer);
+            exe_options.addOption(bool, "exec_parser", exec_parser);
 
             const exe = b.addExecutable(.{
                 .name = "cjfrontend",
@@ -55,6 +57,7 @@ pub fn build(b: *std.Build) void {
                     .target = target,
                     .optimize = optimize,
                     .imports = &.{
+                        .{ .name = "common", .module = common_dep.module("common") },
                         .{ .name = "frontend", .module = mod },
                         .{ .name = "clap", .module = clap_dep.module("clap") },
                         .{ .name = "build_options", .module = exe_options.createModule() },
