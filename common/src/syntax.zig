@@ -670,6 +670,31 @@ pub inline fn toSyntaxKind(token_tag: TokenTag) ?SyntaxKind {
     return token_to_syntax_table[@backingInt(token_tag)];
 }
 
+/// 按注释源码文本区分单行注释、文档注释与块注释。
+///
+/// 文档注释为 `///...`（不含 `////...`）与 `/**...*/`（不含 `/**/` 与 `/***...`）；
+/// 其余 `//` 开头为单行注释，`/*` 开头为块注释。
+pub fn classifyComment(text: []const u8) SyntaxKind {
+    if (std.mem.startsWith(u8, text, "//")) {
+        if (text.len >= 3 and text[2] == '/' and (text.len == 3 or text[3] != '/')) {
+            return .doc_comment;
+        }
+        return .line_comment;
+    }
+    if (std.mem.startsWith(u8, text, "/**") and text.len >= 5 and text[3] != '*') {
+        return .doc_comment;
+    }
+    return .block_comment;
+}
+
+/// 把词法单元标签与其源码文本转换为 CST 叶子标签。
+///
+/// 注释按文本细分为单行注释、块注释与文档注释；`sentinel` 是解析器内部占位，映射为 `illegal`。
+pub inline fn tokenToSyntaxKind(tag: TokenTag, text: []const u8) SyntaxKind {
+    if (tag == .comment) return classifyComment(text);
+    return token_to_syntax_table[@backingInt(tag)] orelse .illegal;
+}
+
 test "SyntaxKind 为空白、换行与三类注释提供独立标签" {
     const trivia = [_]SyntaxKind{ .whitespace, .newline, .line_comment, .block_comment, .doc_comment };
     for (trivia, 0..) |kind, i| {
@@ -712,4 +737,25 @@ test "除注释与占位外每个词法单元标签都能转换" {
             else => try std.testing.expect(converted != null),
         }
     }
+}
+
+test "注释文本按形态分类" {
+    try std.testing.expectEqual(SyntaxKind.line_comment, classifyComment("//"));
+    try std.testing.expectEqual(SyntaxKind.line_comment, classifyComment("// note"));
+    try std.testing.expectEqual(SyntaxKind.line_comment, classifyComment("//// note"));
+    try std.testing.expectEqual(SyntaxKind.doc_comment, classifyComment("///"));
+    try std.testing.expectEqual(SyntaxKind.doc_comment, classifyComment("/// doc"));
+    try std.testing.expectEqual(SyntaxKind.doc_comment, classifyComment("/** x */"));
+    try std.testing.expectEqual(SyntaxKind.block_comment, classifyComment("/* note */"));
+    try std.testing.expectEqual(SyntaxKind.block_comment, classifyComment("/**/"));
+    try std.testing.expectEqual(SyntaxKind.block_comment, classifyComment("/*** x */"));
+}
+
+test "词法单元标签与源码文本共同确定 CST 叶子标签" {
+    try std.testing.expectEqual(SyntaxKind.identifier, tokenToSyntaxKind(.identifier, "x"));
+    try std.testing.expectEqual(SyntaxKind.newline, tokenToSyntaxKind(.nl, "\n"));
+    try std.testing.expectEqual(SyntaxKind.eof, tokenToSyntaxKind(.end, ""));
+    try std.testing.expectEqual(SyntaxKind.doc_comment, tokenToSyntaxKind(.comment, "/// doc"));
+    try std.testing.expectEqual(SyntaxKind.line_comment, tokenToSyntaxKind(.comment, "// note"));
+    try std.testing.expectEqual(SyntaxKind.illegal, tokenToSyntaxKind(.sentinel, ""));
 }

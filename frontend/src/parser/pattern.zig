@@ -62,7 +62,7 @@ pub fn parsePattern(p: *Parser, allow_type_pattern: bool) std.mem.Allocator.Erro
             }
         },
         else => {
-            if (Parser.isIdentLike(tag)) {
+            if (tag.isIdentLike()) {
                 const next = p.peekNth(1);
                 if (allow_type_pattern and next == .colon) {
                     try parseTypePattern(p);

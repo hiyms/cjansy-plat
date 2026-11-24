@@ -1,12 +1,15 @@
 # `common` 外部 API
 
-入口模块为 `common`（对应 `common/src/root.zig`），对外导出通用基础类型、词法与 CST 标签、源文件管理、诊断结构及 UTF-8 解码能力。
+入口模块为 `common`（对应 `common/src/root.zig`），对外导出通用基础类型、词法与 CST 标签、语法错误与解析事件、内置注解名称、源文件管理、诊断结构及 UTF-8 解码能力。
 
 ## 模块导出
 
-- `common.common`：通用字节区间与错误集合。
-- `common.token`：词法单元与词法标签。
+- `common.common`：通用字节区间。
+- `common.token`：词法单元、词法标签与标签分类。
 - `common.syntax`：Lossless CST 节点标签与转换函数。
+- `common.parse_error`：语法错误码、语法错误及其到诊断的转换。
+- `common.event`：语法解析事件流协议。
+- `common.annotation`：仓颉内置注解名称表。
 - `common.source`：源文件管理、编辑与行列索引。
 - `common.diagnostic`：统一诊断数据结构。
 - `common.utf8`：UTF-8 解码与 Unicode 码点判定。
@@ -26,19 +29,6 @@ pub const Span = struct {
 
 源文件中的左闭右开字节区间，起止值相对于所属文件开头。顶层可通过 `common.Span` 访问。
 
-### `ParseError`
-
-```zig
-pub const ParseError = error{
-    UnexpectedToken,
-    UnexpectedEndOfInput,
-    InvalidCharacter,
-    UnsupportFeature,
-};
-```
-
-公共库通用错误集合。顶层可通过 `common.ParseError` 访问。
-
 ---
 
 ## 词法单元（`common.token`）
@@ -50,6 +40,16 @@ pub const TokenTag = enum { ... };
 ```
 
 词法分析阶段产出的词法单元标签枚举（涵盖运算符、分隔符、关键字、标识符、字面量、`comment`、`nl`、`end`、`sentinel`、`illegal`）。顶层可通过 `common.TokenTag` 访问。
+
+标签上提供以下只读判定方法：
+
+| 方法 | 说明 |
+| :--- | :--- |
+| `pub inline fn isContextKeyword(self: TokenTag) bool` | 是否为上下文关键字（`public`、`open` 等可在标识符位置复用的软关键字）。 |
+| `pub inline fn isIdentLike(self: TokenTag) bool` | 是否可作为标识符使用（普通标识符与上下文关键字）。 |
+| `pub inline fn isPackageIdentLike(self: TokenTag) bool` | 是否可作为包名段使用（标识符、上下文关键字与反引号包名）。 |
+| `pub inline fn isPrimitiveType(self: TokenTag) bool` | 是否为内建基础类型关键字（不含 `This` 与 `VArray`）。 |
+| `pub inline fn isNumericOrRuneType(self: TokenTag) bool` | 是否为数值或字符类型转换关键字（`Int8`..`Float64` 及 `Rune`）。 |
 
 ### `Token`
 
@@ -87,6 +87,150 @@ pub fn toSyntaxKind(token_tag: TokenTag) ?SyntaxKind
 ```
 
 将 `TokenTag` 转换为对应的 `SyntaxKind`：`.nl` 转为 `.newline`，`.end` 转为 `.eof`，`.comment` 与 `.sentinel` 返回 `null`，其余标签按同名成员转换。顶层可通过 `common.toSyntaxKind` 访问。
+
+### `classifyComment`
+
+```zig
+pub fn classifyComment(text: []const u8) SyntaxKind
+```
+
+按注释源码文本区分 `.line_comment`、`.block_comment` 与 `.doc_comment`：`///...`（不含 `////...`）与 `/**...*/`（不含 `/**/` 与 `/***...`）为文档注释。顶层可通过 `common.classifyComment` 访问。
+
+### `tokenToSyntaxKind`
+
+```zig
+pub fn tokenToSyntaxKind(tag: TokenTag, text: []const u8) SyntaxKind
+```
+
+把词法单元标签与其源码文本转换为 CST 叶子标签；注释按文本细分，`sentinel` 映射为 `.illegal`。顶层可通过 `common.tokenToSyntaxKind` 访问。
+
+---
+
+## 语法错误（`common.parse_error`）
+
+### `ParseErrorCode`
+
+```zig
+pub const ParseErrorCode = enum(u8) {
+    expected_expression,
+    expected_token,
+    expected_item,
+    non_associative_comparison,
+    recursive_depth_limit,
+    invalid_literal,
+    expected_type,
+    expected_pattern,
+    expected_identifier,
+    expected_block,
+    non_associative_assignment,
+    non_associative_operator,
+    invalid_assignment_target,
+    unclosed_delimiter,
+    illegal_token,
+    unexpected_token,
+    invalid_interpolation,
+    dangling_doc_comment,
+};
+```
+
+语法分析阶段可遇到的错误码。顶层可通过 `common.ParseErrorCode` 访问。
+
+### `ParseError`
+
+```zig
+pub const ParseError = struct {
+    code: ParseErrorCode,
+    range: TextRange,
+
+    pub inline fn toDiagnostic(
+        self: ParseError,
+        allocator: std.mem.Allocator,
+        file: FileId,
+        source: []const u8,
+    ) std.mem.Allocator.Error!Diagnostic
+};
+```
+
+语法分析错误，携带错误码与源码字节区间；`toDiagnostic` 为 `parseErrorToDiagnostic` 的便捷转发方法。顶层可通过 `common.ParseError` 访问。
+
+### `parseErrorToDiagnostic`
+
+```zig
+pub fn parseErrorToDiagnostic(
+    allocator: std.mem.Allocator,
+    file: FileId,
+    source: []const u8,
+    err: ParseError,
+) std.mem.Allocator.Error!Diagnostic
+```
+
+将单个 `ParseError` 转换为平台统一的 `Diagnostic`（`severity = .err`、`source = .parser`、`related = &.{}`）。
+
+内存所有权与零分配约定：
+
+- 编译期可完全确定的错误码（`recursive_depth_limit`、`non_associative_comparison`、`non_associative_assignment`、`non_associative_operator`、`invalid_assignment_target`、`unclosed_delimiter`、`invalid_interpolation`、`dangling_doc_comment`）以及 `err.range` 无有效可展示源码片段时，`Diagnostic.message` 直接返回编译期静态字符串切片，不调用 `allocator`，调用方不可对其单独调用 `free`。
+- 其余需要拼入源码片段的错误码在 `err.range` 有效且非空时，按合法 UTF-8 码点边界安全截断片段（最多 32 字节）并通过 `allocator` 格式化分配 `Diagnostic.message`。
+- `source` 仅作只读借用；推荐使用 `std.heap.ArenaAllocator` 统一托管整批诊断消息的生命周期。
+
+---
+
+## 解析事件（`common.event`）
+
+### `TokenEvent` 与 `Event`
+
+```zig
+pub const TokenEvent = struct {
+    kind: SyntaxKind,
+    range: TextRange,
+};
+
+pub const Event = union(enum) {
+    /// 标识语法节点开始。
+    start_node: SyntaxKind,
+    /// 将当前父节点已完成子节点列表的最后一项包裹进新节点，成为其首个子节点。
+    wrap_node: SyntaxKind,
+    /// 发射叶子词法单元（含合成的 `whitespace`、细分的注释、`newline`、组合运算符与插值片段）。
+    token: TokenEvent,
+    /// 标识当前语法节点结束。
+    finish_node: void,
+    /// 记录语法诊断，不破坏节点开闭平衡。
+    parse_error: ParseError,
+};
+```
+
+`start_node` 与 `wrap_node` 的总发射次数与 `finish_node` 严格相等；位置信息仅由 `token` 与 `parse_error` 携带。顶层可通过 `common.Event`、`common.TokenEvent` 访问。
+
+### `CompactEvent`
+
+```zig
+pub const CompactEvent = struct {
+    pub const Tag = enum(u8) { start_node, wrap_node, token, finish_node, parse_error };
+    range: TextRange,
+    payload: u16,
+    tag: Tag,
+
+    pub inline fn startNode(kind: SyntaxKind) CompactEvent
+    pub inline fn wrapNode(kind: SyntaxKind) CompactEvent
+    pub inline fn token(kind: SyntaxKind, range: TextRange) CompactEvent
+    pub inline fn finishNode() CompactEvent
+    pub inline fn parseError(err: ParseError) CompactEvent
+    pub inline fn toEvent(self: CompactEvent) Event
+};
+```
+
+12 字节的紧凑事件存储，避免对外 `Event` 联合体的尾部填充开销。顶层可通过 `common.CompactEvent` 访问。
+
+---
+
+## 内置注解（`common.annotation`）
+
+### `isBuiltinAnnotationName`
+
+```zig
+pub inline fn isBuiltinAnnotationName(name: []const u8) bool
+```
+
+判定给定标识符文本是否为仓颉内置注解名称（`When`、`Deprecated`、`C` 等，与参考编译器及 `cangjie_spec` 一致）。顶层可通过 `common.isBuiltinAnnotationName` 访问。
 
 ---
 

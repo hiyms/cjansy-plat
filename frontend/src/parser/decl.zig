@@ -172,7 +172,7 @@ fn parseFeaturesDirective(p: *Parser) std.mem.Allocator.Error!void {
 
         if (try p.eat(.comma)) {
             if (p.shouldStopList(.brace_list)) break;
-        } else if (Parser.isIdentLike(p.peek()) and !p.shouldStopList(.brace_list)) {
+        } else if (p.peek().isIdentLike() and !p.shouldStopList(.brace_list)) {
             try p.emitError(.expected_token);
         } else {
             break;
@@ -217,7 +217,7 @@ fn parsePackageHeader(p: *Parser) std.mem.Allocator.Error!void {
         try p.emitError(.expected_identifier);
     } else {
         try p.emitLeadingTrivia(false);
-        if (Parser.isPackageIdentLike(p.peek()) and p.peekNth(1) == .double_colon) {
+        if (p.peek().isPackageIdentLike() and p.peekNth(1) == .double_colon) {
             _ = try p.expectPackageIdent();
             try p.bump(); // ::
         }
@@ -289,17 +289,17 @@ fn skipParenIndex(p: *const Parser, start_idx: usize) ?usize {
 pub fn isBuiltinAnnotationAtIndex(p: *const Parser, at_idx: usize) bool {
     if (at_idx >= p.tokens.len or p.tokens[at_idx].tag != .at) return false;
     var idx = p.nextSignificantIndex(at_idx + 1, true);
-    if (idx >= p.tokens.len or !Parser.isIdentLike(p.tokens[idx].tag)) return false;
+    if (idx >= p.tokens.len or !p.tokens[idx].tag.isIdentLike()) return false;
 
     var last_name = p.tokenText(p.tokens[idx]);
     idx = p.nextSignificantIndex(idx + 1, true);
     while (idx < p.tokens.len and p.tokens[idx].tag == .dot) {
         const next_id = p.nextSignificantIndex(idx + 1, true);
-        if (next_id >= p.tokens.len or !Parser.isIdentLike(p.tokens[next_id].tag)) break;
+        if (next_id >= p.tokens.len or !p.tokens[next_id].tag.isIdentLike()) break;
         last_name = p.tokenText(p.tokens[next_id]);
         idx = p.nextSignificantIndex(next_id + 1, true);
     }
-    return Parser.isBuiltinAnnotationName(last_name);
+    return common.isBuiltinAnnotationName(last_name);
 }
 
 /// 只读判断当前位置是否位于内置注解起始处。
@@ -312,12 +312,12 @@ fn skipLeadingBuiltinAnnotationsIndex(p: *const Parser, start_idx: usize) usize 
     var idx = p.nextSignificantIndex(start_idx, true);
     while (idx < p.tokens.len and isBuiltinAnnotationAtIndex(p, idx)) {
         idx = p.nextSignificantIndex(idx + 1, true); // skip @
-        if (idx < p.tokens.len and Parser.isIdentLike(p.tokens[idx].tag)) {
+        if (idx < p.tokens.len and p.tokens[idx].tag.isIdentLike()) {
             idx = p.nextSignificantIndex(idx + 1, true);
         }
         while (idx < p.tokens.len and p.tokens[idx].tag == .dot) {
             idx = p.nextSignificantIndex(idx + 1, true);
-            if (idx < p.tokens.len and Parser.isIdentLike(p.tokens[idx].tag)) {
+            if (idx < p.tokens.len and p.tokens[idx].tag.isIdentLike()) {
                 idx = p.nextSignificantIndex(idx + 1, true);
             }
         }
@@ -335,12 +335,12 @@ fn skipMacroOrAnnotationHeaderIndex(p: *const Parser, start_idx: usize) usize {
     const tag = p.tokens[idx].tag;
     if (tag != .at and tag != .at_excl) return idx;
     idx = p.nextSignificantIndex(idx + 1, true);
-    if (idx < p.tokens.len and Parser.isIdentLike(p.tokens[idx].tag)) {
+    if (idx < p.tokens.len and p.tokens[idx].tag.isIdentLike()) {
         idx = p.nextSignificantIndex(idx + 1, true);
     }
     while (idx < p.tokens.len and p.tokens[idx].tag == .dot) {
         idx = p.nextSignificantIndex(idx + 1, true);
-        if (idx < p.tokens.len and Parser.isIdentLike(p.tokens[idx].tag)) {
+        if (idx < p.tokens.len and p.tokens[idx].tag.isIdentLike()) {
             idx = p.nextSignificantIndex(idx + 1, true);
         }
     }
@@ -391,7 +391,7 @@ fn parseImportContent(p: *Parser, allow_org_and_group: bool) std.mem.Allocator.E
     }
     try p.emitLeadingTrivia(false);
 
-    if (allow_org_and_group and Parser.isPackageIdentLike(p.peek()) and p.peekNth(1) == .double_colon) {
+    if (allow_org_and_group and p.peek().isPackageIdentLike() and p.peekNth(1) == .double_colon) {
         _ = try p.expectPackageIdent();
         try p.bump(); // ::
     }
@@ -402,7 +402,7 @@ fn parseImportContent(p: *Parser, allow_org_and_group: bool) std.mem.Allocator.E
         return;
     }
 
-    if (!p.isNewlineDeclBoundary() and Parser.isPackageIdentLike(p.peek())) {
+    if (!p.isNewlineDeclBoundary() and p.peek().isPackageIdentLike()) {
         _ = try p.expectPackageIdent();
         while (p.at(.dot)) {
             try p.bump(); // .
@@ -421,7 +421,7 @@ fn parseImportContent(p: *Parser, allow_org_and_group: bool) std.mem.Allocator.E
                 try p.finishNode();
                 return;
             }
-            if (Parser.isPackageIdentLike(p.peek())) {
+            if (p.peek().isPackageIdentLike()) {
                 _ = try p.expectPackageIdent();
             } else {
                 try p.emitError(.expected_identifier);
@@ -450,7 +450,7 @@ fn parseImportMultiGroup(p: *Parser) std.mem.Allocator.Error!void {
         try parseImportContent(p, false);
         if (try p.eat(.comma)) {
             if (p.shouldStopList(.brace_list)) break;
-        } else if (Parser.isPackageIdentLike(p.peek()) and !p.shouldStopList(.brace_list)) {
+        } else if (p.peek().isPackageIdentLike() and !p.shouldStopList(.brace_list)) {
             try p.emitError(.expected_token);
         } else {
             break;
@@ -532,7 +532,7 @@ fn isConstModifierAtIndex(p: *const Parser, const_idx: usize, scope: DeclScope) 
             .kw_operator,
             => {
                 // 在类/结构体中若该上下文关键字直接后接 `(`，则是主构造器名
-                if ((scope == .class_body or scope == .struct_body) and Parser.isContextKeywordTag(tok.tag)) {
+                if ((scope == .class_body or scope == .struct_body) and tok.tag.isContextKeyword()) {
                     const after_id = p.nextSignificantIndex(idx + 1, true);
                     if (after_id < p.tokens.len and p.tokens[after_id].tag == .l_paren) {
                         if (skipParenIndex(p, after_id)) |after_paren| {
@@ -718,7 +718,7 @@ fn peekDeclKindAt(p: *const Parser, start_idx: usize, scope: DeclScope) ?SyntaxK
         },
         .kw_foreign => .foreign_decl,
         else => |tag| {
-            if ((scope == .class_body or scope == .struct_body) and Parser.isIdentLike(tag)) {
+            if ((scope == .class_body or scope == .struct_body) and tag.isIdentLike()) {
                 const next = p.nextSignificantIndex(idx + 1, true);
                 if (next < p.tokens.len and p.tokens[next].tag == .l_paren) {
                     return .primary_ctor_decl;
@@ -971,7 +971,7 @@ fn isEnumConstructorStartAt(p: *const Parser, start_idx: usize) bool {
         break;
     }
     if (idx >= p.tokens.len) return false;
-    if (!Parser.isIdentLike(p.tokens[idx].tag)) return false;
+    if (!p.tokens[idx].tag.isIdentLike()) return false;
     // 若跳过注解与宏头后构成合法枚举成员声明（如 `public func` / `prop`），则非构造器
     if (peekDeclKindAt(p, idx, .enum_body) != null) return false;
     return true;
@@ -1086,7 +1086,7 @@ fn parseFuncDecl(p: *Parser, scope: DeclScope) std.mem.Allocator.Error!void {
     try parseDeclModifiers(p, scope);
     _ = try p.expect(.kw_func);
 
-    if (Parser.isIdentLike(p.peek())) {
+    if (p.peek().isIdentLike()) {
         try p.bumpAs(.identifier);
     } else if (!try eatOverloadableOperator(p)) {
         try p.emitError(.expected_identifier);
@@ -1378,7 +1378,7 @@ fn parseTypeParameterList(p: *Parser) std.mem.Allocator.Error!void {
             continue;
         } else if (p.shouldStopList(.type_param_list)) {
             break;
-        } else if (Parser.isIdentLike(p.peek())) {
+        } else if (p.peek().isIdentLike()) {
             try p.emitError(.expected_token);
         } else {
             break;
@@ -1495,7 +1495,7 @@ fn canStartFuncParam(p: *const Parser, is_primary_ctor: bool) bool {
     if (p.isNewlineDeclBoundary()) return false;
     const tag = p.peek();
     if (tag == .wildcard or tag == .ellipsis or tag == .at or tag == .at_excl) return true;
-    return Parser.isIdentLike(tag);
+    return tag.isIdentLike();
 }
 
 /// 解析单个函数或主构造器参数（含注解、访问修饰符、`let`/`var`、参数名或 `_`、`!`、类型与默认值）。

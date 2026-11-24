@@ -42,72 +42,17 @@ pub const Error = error{
 
 - `pub const max_recursion_depth: u32 = 256`：最大递归嵌套深度上限，超限时记录 `ParseErrorCode.recursive_depth_limit` 并安全中止深层展开。
 
-### `ParseErrorCode`
+### `ParseErrorCode`、`ParseError` 与 `parseErrorToDiagnostic`
 
-```zig
-pub const ParseErrorCode = enum(u8) {
-    expected_expression,
-    expected_token,
-    expected_item,
-    non_associative_comparison,
-    recursive_depth_limit,
-    invalid_literal,
-    expected_type,
-    expected_pattern,
-    expected_identifier,
-    expected_block,
-    non_associative_assignment,
-    non_associative_operator,
-    invalid_assignment_target,
-    unclosed_delimiter,
-    illegal_token,
-    unexpected_token,
-    invalid_interpolation,
-    dangling_doc_comment,
-};
-```
+这三个接口定义于 `common.parse_error`，在 `frontend.parser` 中作为同类型别名与函数别名重新导出，用法与 `common` 模块一致：
 
-### `ParseError`
-
-```zig
-pub const ParseError = struct {
-    code: ParseErrorCode,
-    range: common.TextRange,
-
-    pub inline fn toDiagnostic(
-        self: ParseError,
-        allocator: std.mem.Allocator,
-        file: common.FileId,
-        source: []const u8,
-    ) std.mem.Allocator.Error!common.Diagnostic
-};
-```
-
-解析阶段记录的轻量语法错误。`toDiagnostic` 为 `parseErrorToDiagnostic` 的便捷转发方法。
+- `pub const ParseErrorCode = common.ParseErrorCode`
+- `pub const ParseError = common.ParseError`
+- `pub const parseErrorToDiagnostic = common.parse_error.parseErrorToDiagnostic`
 
 ### `TokenEvent` 与 `Event`
 
-```zig
-pub const TokenEvent = struct {
-    kind: common.SyntaxKind,
-    range: common.TextRange,
-};
-
-pub const Event = union(enum) {
-    /// 标识语法节点开始。
-    start_node: common.SyntaxKind,
-    /// 将当前父节点已完成子节点列表的最后一项包裹进新节点，成为其首个子节点。
-    wrap_node: common.SyntaxKind,
-    /// 发射叶子词法单元（含合成的 `whitespace`、细分的注释、`newline`、组合运算符与插值片段）。
-    token: TokenEvent,
-    /// 标识当前语法节点结束。
-    finish_node: void,
-    /// 记录语法诊断，不破坏节点开闭平衡。
-    parse_error: ParseError,
-};
-```
-
-`start_node` 与 `wrap_node` 的总发射次数与 `finish_node` 严格相等。
+事件流协议定义于 `common.event`，在 `frontend.parser` 中以 `pub const TokenEvent = common.TokenEvent` 与 `pub const Event = common.Event` 重新导出。`start_node` 与 `wrap_node` 的总发射次数与 `finish_node` 严格相等，叶子位置信息仅由 `token` 与 `parse_error` 携带。
 
 ### `Parser`（别名 `frontend.parser.t`）
 
@@ -118,20 +63,9 @@ pub const Event = union(enum) {
 | `pub fn deinit(self: *Parser) void` | 释放解析器内部事件缓冲区与 `errors` 列表内存，不释放借用的 `source` 与 `tokens`。 |
 | `pub fn gen(self: *Parser) std.mem.Allocator.Error!?Event` | 产出下一个 `Event`，全部事件消费完毕返回 `null`。首次调用时执行整份输入解析并缓存事件流与 `errors`；若期间发生内存不足，会自动清空半成品数据并复位状态。 |
 
-### `parseErrorToDiagnostic`
+### `parseErrorToDiagnostic` 的内存约定
 
-```zig
-pub fn parseErrorToDiagnostic(
-    allocator: std.mem.Allocator,
-    file: common.FileId,
-    source: []const u8,
-    err: ParseError,
-) std.mem.Allocator.Error!common.Diagnostic
-```
-
-将单个 `ParseError` 转换为平台统一的 `common.Diagnostic`（`severity = .err`、`source = .parser`、`related = &.{}`）。
-
-内存所有权与零分配约定：
+`common.parse_error.parseErrorToDiagnostic` 遵循诊断消息混合所有权约定：
 
 - 编译期可完全确定的错误码（`recursive_depth_limit`、`non_associative_comparison`、`non_associative_assignment`、`non_associative_operator`、`invalid_assignment_target`、`unclosed_delimiter`、`invalid_interpolation`、`dangling_doc_comment`）以及 `err.range` 无有效可展示源码片段时，`Diagnostic.message` 直接返回编译期静态字符串切片，不调用 `allocator`，调用方不可对其单独调用 `free`。
 - 其余需要拼入源码片段的错误码在 `err.range` 有效且非空时，按合法 UTF-8 码点边界安全截断片段并通过 `allocator` 格式化分配 `Diagnostic.message`。

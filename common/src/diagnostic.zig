@@ -59,7 +59,7 @@ pub const Diagnostic = struct {
 
     /// 按 `severity`（`err` 最先）、`file`、`range.start`、`range.end` 比较两条诊断的顺序。
     pub fn order(a: Diagnostic, b: Diagnostic) std.math.Order {
-        const sev = std.math.order(@intFromEnum(a.severity), @intFromEnum(b.severity));
+        const sev = std.math.order(@backingInt(a.severity), @backingInt(b.severity));
         if (sev != .eq) return sev;
         const file_idx = std.math.order(a.file.index, b.file.index);
         if (file_idx != .eq) return file_idx;
@@ -77,10 +77,10 @@ pub const Diagnostic = struct {
 };
 
 test "Severity 数值顺序满足 err 最先" {
-    try std.testing.expectEqual(@as(u8, 0), @intFromEnum(Severity.err));
-    try std.testing.expectEqual(@as(u8, 1), @intFromEnum(Severity.warning));
-    try std.testing.expectEqual(@as(u8, 2), @intFromEnum(Severity.info));
-    try std.testing.expectEqual(@as(u8, 3), @intFromEnum(Severity.hint));
+    try std.testing.expectEqual(@as(u8, 0), @backingInt(Severity.err));
+    try std.testing.expectEqual(@as(u8, 1), @backingInt(Severity.warning));
+    try std.testing.expectEqual(@as(u8, 2), @backingInt(Severity.info));
+    try std.testing.expectEqual(@as(u8, 3), @backingInt(Severity.hint));
 }
 
 test "Source.eql 正确比较各阶段与 linter 规则名" {

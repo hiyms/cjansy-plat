@@ -341,6 +341,83 @@ pub const TokenTag = enum {
     double_colon,
     /// `features`
     kw_features,
+
+    /// 判定该标签是否为上下文关键字（`public`、`open` 等可在标识符位置复用的软关键字）。
+    pub inline fn isContextKeyword(self: TokenTag) bool {
+        return switch (self) {
+            .kw_public,
+            .kw_private,
+            .kw_protected,
+            .kw_internal,
+            .kw_override,
+            .kw_redef,
+            .kw_abstract,
+            .kw_sealed,
+            .kw_open,
+            .kw_with,
+            .kw_throwing,
+            .kw_handle,
+            => true,
+            else => false,
+        };
+    }
+
+    /// 判定该标签是否可作为标识符使用（普通标识符与上下文关键字）。
+    pub inline fn isIdentLike(self: TokenTag) bool {
+        return self == .identifier or self.isContextKeyword();
+    }
+
+    /// 判定该标签是否可作为包名段使用（标识符、上下文关键字与反引号包名）。
+    pub inline fn isPackageIdentLike(self: TokenTag) bool {
+        return self.isIdentLike() or self == .package_identifier;
+    }
+
+    /// 判定该标签是否为内建基础类型关键字（不含 `This` 与 `VArray`）。
+    pub inline fn isPrimitiveType(self: TokenTag) bool {
+        return switch (self) {
+            .kw_int8,
+            .kw_int16,
+            .kw_int32,
+            .kw_int64,
+            .kw_int_native,
+            .kw_uint8,
+            .kw_uint16,
+            .kw_uint32,
+            .kw_uint64,
+            .kw_uint_native,
+            .kw_float16,
+            .kw_float32,
+            .kw_float64,
+            .kw_rune,
+            .kw_bool,
+            .kw_nothing,
+            .kw_unit,
+            => true,
+            else => false,
+        };
+    }
+
+    /// 判定该标签是否为数值或字符类型转换关键字（`Int8`..`Float64` 及 `Rune`）。
+    pub inline fn isNumericOrRuneType(self: TokenTag) bool {
+        return switch (self) {
+            .kw_int8,
+            .kw_int16,
+            .kw_int32,
+            .kw_int64,
+            .kw_int_native,
+            .kw_uint8,
+            .kw_uint16,
+            .kw_uint32,
+            .kw_uint64,
+            .kw_uint_native,
+            .kw_float16,
+            .kw_float32,
+            .kw_float64,
+            .kw_rune,
+            => true,
+            else => false,
+        };
+    }
 };
 
 pub const Token = struct {
@@ -355,3 +432,25 @@ test "Token 只承载标签与区间" {
     try std.testing.expectEqual(@as(u32, 7), token.span.end);
 }
 
+test "上下文关键字与标识符位置判定" {
+    try std.testing.expect(TokenTag.kw_public.isContextKeyword());
+    try std.testing.expect(TokenTag.kw_open.isContextKeyword());
+    try std.testing.expect(!TokenTag.kw_class.isContextKeyword());
+    try std.testing.expect(TokenTag.identifier.isIdentLike());
+    try std.testing.expect(TokenTag.kw_handle.isIdentLike());
+    try std.testing.expect(!TokenTag.kw_class.isIdentLike());
+    try std.testing.expect(TokenTag.package_identifier.isPackageIdentLike());
+    try std.testing.expect(TokenTag.kw_redef.isPackageIdentLike());
+    try std.testing.expect(!TokenTag.kw_class.isPackageIdentLike());
+}
+
+test "内建类型关键字判定" {
+    try std.testing.expect(TokenTag.kw_int64.isPrimitiveType());
+    try std.testing.expect(TokenTag.kw_unit.isPrimitiveType());
+    try std.testing.expect(!TokenTag.kw_this_type.isPrimitiveType());
+    try std.testing.expect(!TokenTag.kw_varray.isPrimitiveType());
+    try std.testing.expect(TokenTag.kw_float32.isNumericOrRuneType());
+    try std.testing.expect(TokenTag.kw_rune.isNumericOrRuneType());
+    try std.testing.expect(!TokenTag.kw_bool.isNumericOrRuneType());
+    try std.testing.expect(!TokenTag.kw_nothing.isNumericOrRuneType());
+}

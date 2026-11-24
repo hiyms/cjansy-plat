@@ -27,245 +27,25 @@ pub const pattern = @import("./parser/pattern.zig");
 /// 递归下降与 Pratt 嵌套深度上限，防止极端输入耗尽调用空间。
 pub const max_recursion_depth: u32 = 256;
 
-/// 解析错误码。
-pub const ParseErrorCode = enum(u8) {
-    expected_expression,
-    expected_token,
-    expected_item,
-    non_associative_comparison,
-    recursive_depth_limit,
-    invalid_literal,
-    expected_type,
-    expected_pattern,
-    expected_identifier,
-    expected_block,
-    non_associative_assignment,
-    non_associative_operator,
-    invalid_assignment_target,
-    unclosed_delimiter,
-    illegal_token,
-    unexpected_token,
-    invalid_interpolation,
-    dangling_doc_comment,
-};
+/// 语法错误码，定义于 `common.parse_error`。
+pub const ParseErrorCode = common.ParseErrorCode;
 
-/// 解析错误，携带错误码与源码字节区间。
-pub const ParseError = struct {
-    code: ParseErrorCode,
-    range: common.TextRange,
-
-    /// 将当前 `ParseError` 转换为平台统一的 `common.Diagnostic`。
-    ///
-    /// 若错误消息可在编译期确定，则返回的 `Diagnostic.message` 为静态字符串切片（不经过
-    /// `allocator` 分配，不可单独释放）；仅当需拼接源码片段时通过 `allocator` 分配内存。
-    /// 推荐传入 `ArenaAllocator` 统一管理诊断消息的生命周期。
-    pub inline fn toDiagnostic(
-        self: ParseError,
-        allocator: std.mem.Allocator,
-        file: common.FileId,
-        source: []const u8,
-    ) std.mem.Allocator.Error!common.Diagnostic {
-        return parseErrorToDiagnostic(allocator, file, source, self);
-    }
-};
-
-/// 诊断消息中嵌入源码片段的最大字节长度（按合法 UTF-8 码点边界截断）。
-const max_snippet_bytes: usize = 32;
-
-/// 安全提取用于诊断展示的单行源码片段；区间越界、倒置、为空或首行仅空白时返回 `null`。
-///
-/// 返回的切片借用自 `source`，调用者不可释放，生命周期不超过 `source`。
-fn extractDiagnosticSnippet(source: []const u8, range: common.TextRange) ?[]const u8 {
-    if (range.start >= range.end or range.end > source.len) return null;
-    var slice = source[range.start..range.end];
-    if (std.mem.indexOfAny(u8, slice, "\r\n")) |nl_pos| {
-        slice = slice[0..nl_pos];
-    }
-    slice = std.mem.trim(u8, slice, " \t\x0c");
-    if (slice.len == 0) return null;
-    if (slice.len <= max_snippet_bytes) return slice;
-
-    // 按 UTF-8 码点边界截断，避免切断多字节字符
-    var pos: usize = 0;
-    while (pos < slice.len) {
-        const cp = common.utf8.decodeAt(slice, pos) orelse break;
-        if (pos + cp.len > max_snippet_bytes) break;
-        pos += cp.len;
-    }
-    return if (pos > 0) slice[0..pos] else null;
-}
+/// 语法错误，定义于 `common.parse_error`。
+pub const ParseError = common.ParseError;
 
 /// 将单个 `ParseError` 转换为平台统一的 `common.Diagnostic`。
-///
-/// 遵循诊断消息混合所有权约定：
-/// - 对于编译期可完全确定的错误码，或 `err.range` 无有效可展示源码片段时，`Diagnostic.message`
-///   直接返回编译期静态字符串切片，不调用 `allocator`，调用者不可对其单独 `free`。
-/// - 对于需要拼入源码片段的错误，通过 `allocator` 分配 `Diagnostic.message`。
-/// - `Diagnostic.related` 始终为空静态切片，`source` 仅作只读借用。
-/// 推荐传入 `ArenaAllocator` 统一托管诊断消息的生命周期。
-pub fn parseErrorToDiagnostic(
-    allocator: std.mem.Allocator,
-    file: common.FileId,
-    source: []const u8,
-    err: ParseError,
-) std.mem.Allocator.Error!common.Diagnostic {
-    const message: []const u8 = switch (err.code) {
-        // 编译期完全确定的固定错误消息：零堆分配
-        .recursive_depth_limit => "syntax nesting exceeds maximum recursion depth",
-        .non_associative_comparison => "comparison operators are non-associative",
-        .non_associative_assignment => "assignment operators are non-associative",
-        .non_associative_operator => "operator is non-associative",
-        .invalid_assignment_target => "invalid assignment target",
-        .unclosed_delimiter => "unclosed delimiter",
-        .invalid_interpolation => "invalid string interpolation",
-        .dangling_doc_comment => "dangling doc comment has no target declaration",
+pub const parseErrorToDiagnostic = common.parse_error.parseErrorToDiagnostic;
 
-        // 存在有效源码片段时动态格式化，否则直接返回编译期静态字符串（零分配）
-        .expected_expression => if (extractDiagnosticSnippet(source, err.range)) |s|
-            try std.fmt.allocPrint(allocator, "expected expression near `{s}`", .{s})
-        else
-            "expected expression",
-        .expected_token => if (extractDiagnosticSnippet(source, err.range)) |s|
-            try std.fmt.allocPrint(allocator, "expected token near `{s}`", .{s})
-        else
-            "expected token",
-        .expected_item => if (extractDiagnosticSnippet(source, err.range)) |s|
-            try std.fmt.allocPrint(allocator, "expected declaration or item near `{s}`", .{s})
-        else
-            "expected declaration or item",
-        .invalid_literal => if (extractDiagnosticSnippet(source, err.range)) |s|
-            try std.fmt.allocPrint(allocator, "invalid literal `{s}`", .{s})
-        else
-            "invalid literal",
-        .expected_type => if (extractDiagnosticSnippet(source, err.range)) |s|
-            try std.fmt.allocPrint(allocator, "expected type near `{s}`", .{s})
-        else
-            "expected type",
-        .expected_pattern => if (extractDiagnosticSnippet(source, err.range)) |s|
-            try std.fmt.allocPrint(allocator, "expected pattern near `{s}`", .{s})
-        else
-            "expected pattern",
-        .expected_identifier => if (extractDiagnosticSnippet(source, err.range)) |s|
-            try std.fmt.allocPrint(allocator, "expected identifier near `{s}`", .{s})
-        else
-            "expected identifier",
-        .expected_block => if (extractDiagnosticSnippet(source, err.range)) |s|
-            try std.fmt.allocPrint(allocator, "expected block near `{s}`", .{s})
-        else
-            "expected block",
-        .illegal_token => if (extractDiagnosticSnippet(source, err.range)) |s|
-            try std.fmt.allocPrint(allocator, "illegal token `{s}`", .{s})
-        else
-            "illegal token",
-        .unexpected_token => if (extractDiagnosticSnippet(source, err.range)) |s|
-            try std.fmt.allocPrint(allocator, "unexpected token `{s}`", .{s})
-        else
-            "unexpected token",
-    };
+/// 词法叶子事件，定义于 `common.event`。
+pub const TokenEvent = common.TokenEvent;
 
-    return .{
-        .file = file,
-        .range = err.range,
-        .severity = .err,
-        .source = .parser,
-        .message = message,
-        .related = &.{},
-    };
-}
-
-/// 词法叶子事件，携带经语法分析确定后的 CST 叶子标签与源码字节区间。
-pub const TokenEvent = struct {
-    kind: SyntaxKind,
-    range: common.TextRange,
-};
-
-/// 解析事件。
+/// 解析事件，定义于 `common.event`。
 ///
 /// Parser 只产生事件而把 Green CST 构建交给 GreenBuilder，以保证绿树的只读性。
-/// `start_node` 与 `wrap_node` 的总次数与 `finish_node` 严格相等。位置信息仅由
-/// `token` 和 `parse_error` 携带。
-pub const Event = union(enum) {
-    /// 标识语法节点开始。
-    start_node: SyntaxKind,
-    /// 将当前父节点已完成子节点列表的最后一项包进新节点，成为其首个子节点。
-    ///
-    /// 如对于 `a + b + c`，产生事件 `[a], wrap_node(binary_expr), token(+), [b], finish_node, wrap_node(binary_expr), token(+), [c], finish_node`。
-    wrap_node: SyntaxKind,
-    /// 发射叶子词法单元。
-    token: TokenEvent,
-    /// 标识当前语法节点结束。
-    finish_node: void,
-    /// 记录语法诊断，不破坏节点开闭平衡。
-    parse_error: ParseError,
-};
+pub const Event = common.Event;
 
-/// 内部紧凑事件存储（12 字节），避免对外 `Event` 联合体的尾部填充开销。
-pub const CompactEvent = struct {
-    /// 紧凑事件类型标签。
-    pub const Tag = enum(u8) {
-        start_node,
-        wrap_node,
-        token,
-        finish_node,
-        parse_error,
-    };
-
-    range: common.TextRange = .{ .start = 0, .end = 0 },
-    payload: u16 = 0,
-    tag: Tag,
-
-    /// 构造 `start_node` 紧凑事件。
-    pub inline fn startNode(kind: SyntaxKind) CompactEvent {
-        return .{ .payload = @backingInt(kind), .tag = .start_node };
-    }
-
-    /// 构造 `wrap_node` 紧凑事件。
-    pub inline fn wrapNode(kind: SyntaxKind) CompactEvent {
-        return .{ .payload = @backingInt(kind), .tag = .wrap_node };
-    }
-
-    /// 构造 `token` 紧凑事件。
-    pub inline fn token(kind: SyntaxKind, range: common.TextRange) CompactEvent {
-        return .{ .range = range, .payload = @backingInt(kind), .tag = .token };
-    }
-
-    /// 构造 `finish_node` 紧凑事件。
-    pub inline fn finishNode() CompactEvent {
-        return .{ .tag = .finish_node };
-    }
-
-    /// 构造 `parse_error` 紧凑事件。
-    pub inline fn parseError(err: ParseError) CompactEvent {
-        return .{ .range = err.range, .payload = @backingInt(err.code), .tag = .parse_error };
-    }
-
-    /// 转换为对外导出的 `Event`。
-    pub inline fn toEvent(self: CompactEvent) Event {
-        return switch (self.tag) {
-            .start_node => .{ .start_node = @fromBackingInt(@intCast(self.payload)) },
-            .wrap_node => .{ .wrap_node = @fromBackingInt(@intCast(self.payload)) },
-            .token => .{ .token = .{ .kind = @fromBackingInt(@intCast(self.payload)), .range = self.range } },
-            .finish_node => .finish_node,
-            .parse_error => .{ .parse_error = .{
-                .code = @fromBackingInt(@intCast(self.payload)),
-                .range = self.range,
-            } },
-        };
-    }
-};
-
-comptime {
-    std.debug.assert(@sizeOf(CompactEvent) == 12);
-}
-
-/// 编译期构造的非注释词法标签到 CST 叶子标签的直接查找表（`.sentinel` 与 `.comment` 占位为 `.illegal`）。
-const non_comment_syntax_table: [@typeInfo(TokenTag).@"enum".field_names.len]SyntaxKind = blk: {
-    var table: [@typeInfo(TokenTag).@"enum".field_names.len]SyntaxKind = @splat(.illegal);
-    for (std.enums.values(TokenTag)) |tag| {
-        table[@backingInt(tag)] = common.toSyntaxKind(tag) orelse .illegal;
-    }
-    break :blk table;
-};
+/// 内部紧凑事件存储，定义于 `common.event`。
+const CompactEvent = common.CompactEvent;
 
 /// 解析上下文限制标志，控制尾随闭包、区间步长、半开切片与 `if`/`while` 的 `let` 解构条件。
 pub const Restrictions = packed struct {
@@ -312,37 +92,6 @@ pub const ListContext = enum {
     pattern_list,
     brace_list,
 };
-
-/// 仓颉内置注解名称表，与参考编译器及 `cangjie_spec` 一致。
-const builtin_annotations = std.StaticStringMap(void).initComptime(.{
-    .{ "Annotation", {} },
-    .{ "Deprecated", {} },
-    .{ "When", {} },
-    .{ "Frozen", {} },
-    .{ "Intrinsic", {} },
-    .{ "Attribute", {} },
-    .{ "ConstSafe", {} },
-    .{ "OverflowThrowing", {} },
-    .{ "OverflowWrapping", {} },
-    .{ "OverflowSaturating", {} },
-    .{ "C", {} },
-    .{ "CallingConv", {} },
-    .{ "FastNative", {} },
-    .{ "Java", {} },
-    .{ "JavaMirror", {} },
-    .{ "JavaImpl", {} },
-    .{ "JavaHasDefault", {} },
-    .{ "ObjC", {} },
-    .{ "ObjCMirror", {} },
-    .{ "ObjCImpl", {} },
-    .{ "ObjCInit", {} },
-    .{ "ObjCOptional", {} },
-    .{ "ForeignName", {} },
-    .{ "ForeignGetterName", {} },
-    .{ "ForeignSetterName", {} },
-    .{ "EnsurePreparedToMock", {} },
-    .{ "NonProduct", {} },
-});
 
 /// 语法解析器。
 ///
@@ -488,11 +237,6 @@ pub const Parser = struct {
         return ev;
     }
 
-    /// 判定给定标识符文本是否属于仓颉内置注解名称表。
-    pub inline fn isBuiltinAnnotationName(name: []const u8) bool {
-        return builtin_annotations.has(name);
-    }
-
     /// 将当前切片内的局部字节位置通过饱和加法映射为全局文件字节位置，防止 `u32` 溢出。
     pub inline fn globalPos(self: *const Parser, local: u32) u32 {
         return self.base_offset +| local;
@@ -511,106 +255,6 @@ pub const Parser = struct {
     pub inline fn tokenText(self: *const Parser, tok: common.Token) []const u8 {
         const r = self.safeRange(tok.span);
         return self.source[r.start..r.end];
-    }
-
-    /// 判定标签是否为规范中的上下文关键字或可在标识符位置复用的词法标签。
-    pub inline fn isContextKeywordTag(tag: TokenTag) bool {
-        return switch (tag) {
-            .kw_public,
-            .kw_private,
-            .kw_protected,
-            .kw_internal,
-            .kw_override,
-            .kw_redef,
-            .kw_abstract,
-            .kw_sealed,
-            .kw_open,
-            .kw_with,
-            .kw_throwing,
-            .kw_handle,
-            => true,
-            else => false,
-        };
-    }
-
-    /// 判定标签是否可作为标识符使用（含普通标识符与上下文关键字）。
-    pub inline fn isIdentLike(tag: TokenTag) bool {
-        return tag == .identifier or isContextKeywordTag(tag);
-    }
-
-    /// 判定标签是否为包名段可用标识符（含普通标识符、上下文关键字与反引号包名）。
-    pub inline fn isPackageIdentLike(tag: TokenTag) bool {
-        return isIdentLike(tag) or tag == .package_identifier;
-    }
-
-    /// 判定标签是否为内建基础类型关键字（不含 `This` 与 `VArray`）。
-    pub inline fn isPrimitiveTypeTag(tag: TokenTag) bool {
-        return switch (tag) {
-            .kw_int8,
-            .kw_int16,
-            .kw_int32,
-            .kw_int64,
-            .kw_int_native,
-            .kw_uint8,
-            .kw_uint16,
-            .kw_uint32,
-            .kw_uint64,
-            .kw_uint_native,
-            .kw_float16,
-            .kw_float32,
-            .kw_float64,
-            .kw_rune,
-            .kw_bool,
-            .kw_nothing,
-            .kw_unit,
-            => true,
-            else => false,
-        };
-    }
-
-    /// 判定标签是否为数值或字符类型转换关键字（`Int8`..`Float64` 及 `Rune`）。
-    pub inline fn isNumericOrRuneTypeTag(tag: TokenTag) bool {
-        return switch (tag) {
-            .kw_int8,
-            .kw_int16,
-            .kw_int32,
-            .kw_int64,
-            .kw_int_native,
-            .kw_uint8,
-            .kw_uint16,
-            .kw_uint32,
-            .kw_uint64,
-            .kw_uint_native,
-            .kw_float16,
-            .kw_float32,
-            .kw_float64,
-            .kw_rune,
-            => true,
-            else => false,
-        };
-    }
-
-    /// 根据注释源码文本将其划分为单行注释、文档注释或块注释标签。
-    ///
-    /// 文档注释覆盖 `///...`（不含 `////...`）与 `/**...*/`（不含 `/**/` 与 `/***...`）。
-    pub inline fn classifyComment(self: *const Parser, tok: common.Token) SyntaxKind {
-        const text = self.tokenText(tok);
-        if (std.mem.startsWith(u8, text, "//")) {
-            if (text.len >= 3 and text[2] == '/' and (text.len == 3 or text[3] != '/')) {
-                return .doc_comment;
-            }
-            return .line_comment;
-        }
-        if (std.mem.startsWith(u8, text, "/**") and text.len >= 5 and text[3] != '*') {
-            return .doc_comment;
-        }
-        return .block_comment;
-    }
-
-    /// 将任意词法单元转换为对应的 CST 叶子标签。
-    pub inline fn tokenToSyntaxKind(self: *const Parser, tok: common.Token) SyntaxKind {
-        if (tok.tag == .comment) return self.classifyComment(tok);
-        return non_comment_syntax_table[@backingInt(tok.tag)];
     }
 
     /// 返回自 `start_idx` 起跳过注释（以及可选跳过换行）后的首个词法单元下标；到达末尾返回 `tokens.len`。
@@ -899,7 +543,7 @@ pub const Parser = struct {
         while (self.cursor < self.tokens.len) {
             const tok = self.tokens[self.cursor];
             if (tok.tag == .comment) {
-                const kind = self.classifyComment(tok);
+                const kind = common.classifyComment(self.tokenText(tok));
                 const range = self.safeRange(tok.span);
                 try self.emitLeaf(kind, range);
                 if (!allow_doc_comment) {
@@ -969,7 +613,7 @@ pub const Parser = struct {
         var last_doc_idx: ?usize = null;
         while (idx < self.sig_idx) : (idx += 1) {
             const tok = self.tokens[idx];
-            if (tok.tag == .comment and self.classifyComment(tok) == .doc_comment) {
+            if (tok.tag == .comment and common.classifyComment(self.tokenText(tok)) == .doc_comment) {
                 last_doc_idx = idx;
             }
         }
@@ -977,7 +621,7 @@ pub const Parser = struct {
         while (self.cursor <= stop_idx) {
             const tok = self.tokens[self.cursor];
             if (tok.tag == .comment) {
-                try self.emitLeaf(self.classifyComment(tok), self.safeRange(tok.span));
+                try self.emitLeaf(common.classifyComment(self.tokenText(tok)), self.safeRange(tok.span));
             } else if (tok.tag == .nl) {
                 try self.emitLeaf(.newline, self.safeRange(tok.span));
             }
@@ -997,7 +641,7 @@ pub const Parser = struct {
         if (self.cursor >= self.tokens.len) return;
         const tok = self.tokens[self.cursor];
         if (tok.tag == .end) return;
-        const kind = kind_override orelse self.tokenToSyntaxKind(tok);
+        const kind = kind_override orelse common.tokenToSyntaxKind(tok.tag, self.tokenText(tok));
         try self.emitLeaf(kind, self.safeRange(tok.span));
         self.setCursor(self.cursor + 1);
     }
@@ -1083,7 +727,7 @@ pub const Parser = struct {
 
     /// 消费一个标识符或上下文关键字并统一发射为 `SyntaxKind.identifier`；不匹配时记录 `expected_identifier`。
     pub inline fn expectIdent(self: *Parser) std.mem.Allocator.Error!bool {
-        if (isIdentLike(self.sig_tag)) {
+        if (self.sig_tag.isIdentLike()) {
             try self.bumpAs(.identifier);
             return true;
         }
@@ -1098,7 +742,7 @@ pub const Parser = struct {
             try self.bump();
             return true;
         }
-        if (isIdentLike(tag)) {
+        if (tag.isIdentLike()) {
             try self.bumpAs(.identifier);
             return true;
         }
@@ -1118,7 +762,7 @@ pub const Parser = struct {
         try self.emitLeadingTrivia(false);
         if (self.cursor < self.tokens.len and self.tokens[self.cursor].tag != .end) {
             const cur = self.tokens[self.cursor];
-            try self.emitLeaf(self.tokenToSyntaxKind(cur), self.safeRange(cur.span));
+            try self.emitLeaf(common.tokenToSyntaxKind(cur.tag, self.tokenText(cur)), self.safeRange(cur.span));
             self.setCursor(self.cursor + 1);
         }
         try self.finishNode();
@@ -1140,7 +784,7 @@ pub const Parser = struct {
         try self.emitLeadingTrivia(false);
         if (self.cursor < self.tokens.len and self.tokens[self.cursor].tag != .end) {
             const cur = self.tokens[self.cursor];
-            try self.emitLeaf(self.tokenToSyntaxKind(cur), self.safeRange(cur.span));
+            try self.emitLeaf(common.tokenToSyntaxKind(cur.tag, self.tokenText(cur)), self.safeRange(cur.span));
             self.setCursor(self.cursor + 1);
         }
 
@@ -1308,7 +952,7 @@ pub const Parser = struct {
             .kw_inout,
             .at,
             => true,
-            else => isPrimitiveTypeTag(tag) or isIdentLike(tag),
+            else => tag.isPrimitiveType() or tag.isIdentLike(),
         };
     }
 
@@ -1332,7 +976,7 @@ pub const Parser = struct {
                 const next = self.peekNth(1);
                 break :blk next == .integer_literal or next == .float_literal;
             },
-            else => isIdentLike(tag),
+            else => tag.isIdentLike(),
         };
     }
 
@@ -2588,102 +2232,32 @@ test "LSP 逐字符实时输入前缀测试：任意截断位置均无损且事�
     }
 }
 
-test "Parser.errors 与 parseErrorToDiagnostic 零分配静态消息及动态片段格式化" {
+test "Parser.errors 保留非结合比较错误并转换为 Diagnostic" {
     const gpa = std.testing.allocator;
     const file_id: common.FileId = .{ .index = 3, .generation = 1 };
+    const src = "let ok = a < b && c > d\nlet bad = \"hi ${a < b < c}\"\n";
 
-    // 1. 编译期确定消息的错误码使用 failing_allocator 验证严格零堆分配
-    const static_codes = [_]ParseErrorCode{
-        .recursive_depth_limit,
-        .non_associative_comparison,
-        .non_associative_assignment,
-        .non_associative_operator,
-        .invalid_assignment_target,
-        .unclosed_delimiter,
-        .invalid_interpolation,
-        .dangling_doc_comment,
-    };
-    for (static_codes) |code| {
-        const err_item: ParseError = .{ .code = code, .range = .{ .start = 0, .end = 3 } };
-        const diag = try err_item.toDiagnostic(std.testing.failing_allocator, file_id, "abc");
-        try std.testing.expectEqual(file_id, diag.file);
-        try std.testing.expectEqual(err_item.range, diag.range);
-        try std.testing.expectEqual(common.Severity.err, diag.severity);
-        try std.testing.expect(common.DiagnosticSource.eql(.parser, diag.source));
-        try std.testing.expect(diag.message.len > 0);
-        try std.testing.expectEqual(@as(usize, 0), diag.related.len);
+    var tok_list: std.ArrayList(common.Token) = .empty;
+    defer tok_list.deinit(gpa);
+
+    var lex = try lexer.Lexer.new(src);
+    while (true) {
+        const tok = try lex.gen();
+        try tok_list.append(gpa, tok);
+        if (tok.tag == .end) break;
     }
 
-    // 2. 需源码片段的错误码在空区间、越界与倒置区间下同样零分配返回编译期静态消息
-    const snippet_codes = [_]ParseErrorCode{
-        .expected_expression,
-        .expected_token,
-        .expected_item,
-        .invalid_literal,
-        .expected_type,
-        .expected_pattern,
-        .expected_identifier,
-        .expected_block,
-        .illegal_token,
-        .unexpected_token,
-    };
-    const invalid_ranges = [_]common.TextRange{
-        .{ .start = 0, .end = 0 },
-        .{ .start = 5, .end = 2 },
-        .{ .start = 0, .end = 999 },
-    };
-    for (snippet_codes) |code| {
-        for (invalid_ranges) |r| {
-            const diag = try parseErrorToDiagnostic(std.testing.failing_allocator, file_id, "let x", .{
-                .code = code,
-                .range = r,
-            });
-            try std.testing.expect(diag.message.len > 0);
-        }
-    }
+    var parser = Parser.new(gpa, src, tok_list.items);
+    defer parser.deinit();
+    while (try parser.gen()) |_| {}
 
-    // 3. 有效源码片段动态格式化与多字节 UTF-8 截断安全校验
-    {
-        var arena = std.heap.ArenaAllocator.init(gpa);
-        defer arena.deinit();
-        const alloc = arena.allocator();
+    try std.testing.expectEqual(@as(usize, 1), parser.errors.items.len);
+    try std.testing.expectEqual(ParseErrorCode.non_associative_comparison, parser.errors.items[0].code);
 
-        const long_utf8 = "这是一段非常非常长的中文标识符用于测试按码点截断边界不会破坏编码";
-        for (snippet_codes) |code| {
-            const diag = try parseErrorToDiagnostic(alloc, file_id, long_utf8, .{
-                .code = code,
-                .range = .{ .start = 0, .end = @intCast(long_utf8.len) },
-            });
-            try std.testing.expect(std.unicode.utf8ValidateSlice(diag.message));
-            try std.testing.expect(std.mem.indexOf(u8, diag.message, "这是一段") != null);
-        }
-    }
-
-    // 4. 完整解析流程：验证 Parser.errors 包含插值子解析错误、排除回溯临时错误并转换为 Diagnostic 数组
-    {
-        const src = "let ok = a < b && c > d\nlet bad = \"hi ${a < b < c}\"\n";
-        var tok_list: std.ArrayList(common.Token) = .empty;
-        defer tok_list.deinit(gpa);
-
-        var lex = try lexer.Lexer.new(src);
-        while (true) {
-            const tok = try lex.gen();
-            try tok_list.append(gpa, tok);
-            if (tok.tag == .end) break;
-        }
-
-        var parser = Parser.new(gpa, src, tok_list.items);
-        defer parser.deinit();
-        while (try parser.gen()) |_| {}
-
-        try std.testing.expectEqual(@as(usize, 1), parser.errors.items.len);
-        try std.testing.expectEqual(ParseErrorCode.non_associative_comparison, parser.errors.items[0].code);
-
-        const diag = try parser.errors.items[0].toDiagnostic(std.testing.failing_allocator, file_id, src);
-        try std.testing.expectEqual(file_id, diag.file);
-        try std.testing.expectEqual(common.Severity.err, diag.severity);
-        try std.testing.expectEqualStrings("comparison operators are non-associative", diag.message);
-    }
+    const diag = try parser.errors.items[0].toDiagnostic(std.testing.failing_allocator, file_id, src);
+    try std.testing.expectEqual(file_id, diag.file);
+    try std.testing.expectEqual(common.Severity.err, diag.severity);
+    try std.testing.expectEqualStrings("comparison operators are non-associative", diag.message);
 }
 
 test "完全 leading trivia、文件末尾 trivia 归属 source_file 与链式成员 path_segment 包装" {

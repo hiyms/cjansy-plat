@@ -568,12 +568,12 @@ fn isAnnotatedTrailingLambdaSameLine(p: *const Parser) bool {
     var idx = start_idx;
     while (idx < p.tokens.len and decl.isBuiltinAnnotationAtIndex(p, idx)) {
         idx = p.nextSignificantIndex(idx + 1, true);
-        if (idx < p.tokens.len and Parser.isIdentLike(p.tokens[idx].tag)) {
+        if (idx < p.tokens.len and p.tokens[idx].tag.isIdentLike()) {
             idx = p.nextSignificantIndex(idx + 1, true);
         }
         while (idx < p.tokens.len and p.tokens[idx].tag == .dot) {
             idx = p.nextSignificantIndex(idx + 1, true);
-            if (idx < p.tokens.len and Parser.isIdentLike(p.tokens[idx].tag)) {
+            if (idx < p.tokens.len and p.tokens[idx].tag.isIdentLike()) {
                 idx = p.nextSignificantIndex(idx + 1, true);
             }
         }
@@ -774,11 +774,11 @@ fn parseAtomExpr(p: *Parser) std.mem.Allocator.Error!LhsKind {
             return .path_node;
         },
         else => {
-            if (Parser.isNumericOrRuneTypeTag(tag) and isSameLineLParenAfterCurrent(p)) {
+            if (tag.isNumericOrRuneType() and isSameLineLParenAfterCurrent(p)) {
                 try parseTypeConvExpr(p);
                 return .general;
             }
-            if (Parser.isPrimitiveTypeTag(tag) or Parser.isIdentLike(tag)) {
+            if (tag.isPrimitiveType() or tag.isIdentLike()) {
                 try parsePathExpr(p);
                 return .path_node;
             }
@@ -831,7 +831,7 @@ fn parsePathExpr(p: *Parser) std.mem.Allocator.Error!void {
     // 首段已由 `parseAtomExpr` 确认非声明边界、已发射前导 Trivia 且标签合法
     try p.startNode(.path_segment);
     const tag = p.sig_tag;
-    if (tag == .kw_this or tag == .kw_super or tag == .kw_this_type or Parser.isPrimitiveTypeTag(tag)) {
+    if (tag == .kw_this or tag == .kw_super or tag == .kw_this_type or tag.isPrimitiveType()) {
         try p.bump();
     } else {
         try p.bumpAs(.identifier);
@@ -855,9 +855,9 @@ fn parseExprPathSegment(p: *Parser) std.mem.Allocator.Error!void {
     }
     try p.emitLeadingTrivia(false);
     const tag = p.sig_tag;
-    if (tag == .kw_this or tag == .kw_super or tag == .kw_this_type or Parser.isPrimitiveTypeTag(tag)) {
+    if (tag == .kw_this or tag == .kw_super or tag == .kw_this_type or tag.isPrimitiveType()) {
         try p.bump();
-    } else if (Parser.isIdentLike(tag)) {
+    } else if (tag.isIdentLike()) {
         try p.bumpAs(.identifier);
     } else {
         try p.emitError(.expected_identifier);
@@ -1063,7 +1063,7 @@ pub fn parseFuncArg(p: *Parser) std.mem.Allocator.Error!void {
     try p.startNode(.func_arg);
     try p.emitLeadingTrivia(false);
 
-    if (Parser.isIdentLike(p.peek()) and p.peekNth(1) == .colon) {
+    if (p.peek().isIdentLike() and p.peekNth(1) == .colon) {
         try p.bumpAs(.identifier);
         try p.bump(); // :
     }
@@ -1299,7 +1299,7 @@ fn parseTryExpr(p: *Parser) std.mem.Allocator.Error!void {
             try parseResourceSpec(p);
             if (try p.eat(.comma)) {
                 if (p.shouldStopList(.paren_expr_list)) break;
-            } else if (Parser.isIdentLike(p.peek()) and !p.shouldStopList(.paren_expr_list)) {
+            } else if (p.peek().isIdentLike() and !p.shouldStopList(.paren_expr_list)) {
                 try p.emitError(.expected_token);
             } else {
                 break;
@@ -1566,7 +1566,7 @@ fn parseLambdaExpr(p: *Parser, allow_omitted_arrow: bool, has_leading_annotation
                 try decl.parseFuncParam(p, false);
                 if (try p.eat(.comma)) {
                     if (p.at(.double_arrow) or p.at(.r_curl)) break;
-                } else if ((Parser.isIdentLike(p.peek()) or p.at(.wildcard)) and !p.isNewlineDeclBoundary()) {
+                } else if ((p.peek().isIdentLike() or p.at(.wildcard)) and !p.isNewlineDeclBoundary()) {
                     try p.emitError(.expected_token);
                 } else {
                     break;

@@ -9,16 +9,29 @@ pub const token = @import("token.zig");
 pub const syntax = @import("syntax.zig");
 pub const source = @import("source.zig");
 pub const diagnostic = @import("diagnostic.zig");
+pub const parse_error = @import("parse_error.zig");
+pub const event = @import("event.zig");
+pub const annotation = @import("annotation.zig");
 pub const utf8 = @import("utf8.zig");
 
 pub const Span = common.Span;
-pub const ParseError = common.ParseError;
 
 pub const TokenTag = token.TokenTag;
 pub const Token = token.Token;
 
 pub const SyntaxKind = syntax.SyntaxKind;
 pub const toSyntaxKind = syntax.toSyntaxKind;
+pub const classifyComment = syntax.classifyComment;
+pub const tokenToSyntaxKind = syntax.tokenToSyntaxKind;
+
+pub const ParseErrorCode = parse_error.ParseErrorCode;
+pub const ParseError = parse_error.ParseError;
+
+pub const TokenEvent = event.TokenEvent;
+pub const Event = event.Event;
+pub const CompactEvent = event.CompactEvent;
+
+pub const isBuiltinAnnotationName = annotation.isBuiltinAnnotationName;
 
 pub const Source = source.Source;
 pub const FileId = source.FileId;
@@ -45,5 +58,8 @@ test {
     _ = syntax;
     _ = source;
     _ = diagnostic;
+    _ = parse_error;
+    _ = event;
+    _ = annotation;
     _ = utf8;
 }

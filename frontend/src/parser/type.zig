@@ -29,9 +29,9 @@ pub fn parseType(p: *Parser) std.mem.Allocator.Error!void {
         .kw_this_type => try parseThisType(p),
         .kw_varray => try parseVArrayType(p),
         else => |tag| {
-            if (Parser.isPrimitiveTypeTag(tag)) {
+            if (tag.isPrimitiveType()) {
                 try parsePrimitiveType(p);
-            } else if (Parser.isIdentLike(tag)) {
+            } else if (tag.isIdentLike()) {
                 try parsePathType(p);
             } else {
                 try p.emitError(.expected_type);
@@ -48,8 +48,8 @@ pub fn canStartType(p: *const Parser) bool {
         tag == .l_paren or
         tag == .kw_this_type or
         tag == .kw_varray or
-        Parser.isPrimitiveTypeTag(tag) or
-        Parser.isIdentLike(tag);
+        tag.isPrimitiveType() or
+        tag.isIdentLike();
 }
 
 /// 解析基础内置类型节点（如 `Int64`、`Bool`、`Unit`）。
@@ -290,7 +290,7 @@ fn parseParenTupleOrFuncType(p: *Parser) std.mem.Allocator.Error!void {
 
 /// 解析可选带参数名标签的类型元素（`ident : Type` 或 `Type`）。
 fn parseOptionalLabeledType(p: *Parser) std.mem.Allocator.Error!void {
-    if (Parser.isIdentLike(p.peek()) and p.peekNth(1) == .colon) {
+    if (p.peek().isIdentLike() and p.peekNth(1) == .colon) {
         try p.bumpAs(.identifier);
         try p.bump(); // :
     }
@@ -356,7 +356,7 @@ fn looksLikeExprTypeArgs(p: *const Parser) bool {
                 has_content = true;
             },
             else => {
-                if (Parser.isPrimitiveTypeTag(tag) or Parser.isIdentLike(tag)) {
+                if (tag.isPrimitiveType() or tag.isIdentLike()) {
                     has_content = true;
                 } else {
                     return false;
