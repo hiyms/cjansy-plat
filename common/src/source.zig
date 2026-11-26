@@ -2,7 +2,7 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-//! 全局源文件管理：为每个文件分配 FileId，持有内容、附加信息与换行缓存。
+//! 全局源文件管理：为每个文件分配 FileId，持有内容、附加信息、换行缓存与两个内存池。
 //!
 //! 文件分为两类：工作区文件允许在程序运行期间通过应用 Edit 变更内容；非工作区文件
 //! 通常由磁盘上的真实文件载入，内容在运行期间不变。两类可以相互转换。
@@ -194,7 +194,12 @@ pub const Source = struct {
         }
         if (text.len > std.math.maxInt(u32)) return error.TooLarge;
 
-        var f: File = .{ .kind = kind, .extra = try extra.clone(self.gpa) };
+        var f: File = .{
+            .kind = kind,
+            .extra = try extra.clone(self.gpa),
+            .arena = .init(self.gpa),
+            .contract_arena = .init(self.gpa),
+        };
         errdefer f.deinit(self.gpa);
         try f.text.appendSlice(self.gpa, text);
         if (path) |p| f.path = try self.gpa.dupe(u8, p);
@@ -246,7 +251,8 @@ pub const Source = struct {
         return self.addInternal(.external, real_path, text, extra);
     }
 
-    /// 删除文件，释放内容、换行缓存、附加信息与路径，并从路径索引中移除。
+    /// 删除文件，释放内容、换行缓存、两个内存池、附加信息与路径，并从路径索引中
+    /// 移除。
     ///
     /// 槽位保留并递增代次，之后压入空闲列表供复用。删除不会对磁盘产生任何副作用。
     pub fn remove(self: *Source, id: FileId) Error!void {
@@ -491,6 +497,48 @@ test "空编辑序列不做任何事" {
     const id = try source.addWorkspace(null, "abc", .{});
     try source.applyEdits(id, &.{});
     try std.testing.expectEqual(@as(u32, 0), source.get(id).?.version);
+}
+
+test "两个内存池不随编辑清空" {
+    const gpa = std.testing.allocator;
+    var source = Source.init(gpa);
+    defer source.deinit();
+
+    const id = try source.addWorkspace(null, "let a = 1;\n", .{});
+    const f = source.get(id).?;
+
+    const scratch = try f.allocator().dupe(u8, "scratch");
+    const nodes = try f.contractAlloc(u32, 2);
+    nodes[0] = 11;
+    nodes[1] = 13;
+    const name = try f.contractDupe(u8, "Drawable");
+    const empty = try f.contractDupe(u8, "");
+
+    try source.applyEdits(id, &.{
+        .{ .range = .{ .start = 0, .end = 3 }, .new_text = "var" },
+        .{ .range = .{ .start = 8, .end = 9 }, .new_text = "2" },
+    });
+
+    // 新建文件可能重新分配槽位数组，两个内存池里已经写入的内容仍然有效
+    _ = try source.addWorkspace(null, "let b = 2;\n", .{});
+
+    try std.testing.expectEqualStrings("var a = 2;\n", try source.content(id));
+    try std.testing.expectEqualStrings("scratch", scratch);
+    try std.testing.expectEqualStrings("Drawable", name);
+    try std.testing.expectEqual(@as(usize, 0), empty.len);
+    try std.testing.expectEqualSlices(u32, &.{ 11, 13 }, nodes);
+}
+
+test "删除文件释放两个内存池" {
+    const gpa = std.testing.allocator;
+    var source = Source.init(gpa);
+    defer source.deinit();
+
+    const id = try source.addWorkspace(null, "abc", .{});
+    const f = source.get(id).?;
+    _ = try f.allocator().dupe(u8, "internal");
+    _ = try f.contractDupe(u8, "contract");
+    try source.remove(id);
 }
 
 test "两类文件相互转换" {

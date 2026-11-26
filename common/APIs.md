@@ -1,6 +1,6 @@
 # `common` 外部 API
 
-入口模块为 `common`（对应 `common/src/root.zig`），对外导出通用基础类型、词法与 CST 标签、语法错误与解析事件、内置注解名称、源文件管理、诊断结构及 UTF-8 解码能力。
+入口模块为 `common`（对应 `common/src/root.zig`），对外导出通用基础类型、词法与 CST 标签、语法错误与解析事件、内置注解名称、源文件管理、诊断结构、UTF-8 解码能力及语法树结构。
 
 ## 模块导出
 
@@ -13,6 +13,65 @@
 - `common.source`：源文件管理、编辑与行列索引。
 - `common.diagnostic`：统一诊断数据结构。
 - `common.utf8`：UTF-8 解码与 Unicode 码点判定。
+- `common.tree`：不可变语法树结构。
+
+---
+
+## 语法树（`common.tree`）
+
+### `GreenNode`
+
+```zig
+pub const GreenNode = struct {
+    kind: SyntaxKind,
+    text_len: u32,
+    payload: Payload,
+
+    pub const Payload = union(enum) {
+        leaf: []const u8,
+        tree: []const *const GreenNode,
+    };
+};
+```
+
+表示单个不可变语法节点，构造完成后只读。构造时由传入的 `arena` 分配叶子文本副本与子节点指针数组，调用方通过释放 `arena` 统一回收。顶层可通过 `common.GreenNode` 访问。
+
+提供以下 `inline` 方法（返回的指针与切片均借用自所属 `arena`，调用者不得单独释放）：
+- `isLeaf(self: *const GreenNode) bool`
+- `childCount(self: *const GreenNode) usize`（叶子返回 `0`）
+- `childAt(self: *const GreenNode, index: usize) ?*const GreenNode`
+- `children(self: *const GreenNode) []const *const GreenNode`（叶子返回 `&.{}`）
+- `tokenText(self: *const GreenNode) ?[]const u8`
+- `childOfKind(self: *const GreenNode, kind: SyntaxKind) ?*const GreenNode`
+
+### `GreenTree`
+
+```zig
+pub const GreenTree = struct {
+    root: *const GreenNode,
+};
+```
+
+对根 `GreenNode` 节点的封装。顶层可通过 `common.GreenTree` 访问。
+
+- `pub inline fn textLen(self: GreenTree) u32`：返回整棵树覆盖的文本长度。
+- `pub fn nodeAt(self: GreenTree, offset: u32) ?*const GreenNode`：定位包含给定字节位置的叶子节点，返回的指针借用自所属 `arena`。
+
+### `SyntaxTree`
+
+```zig
+pub const SyntaxTree = struct {
+    file: FileId,
+    version: u32,
+    tree: GreenTree,
+};
+```
+
+语法树的进一步包装，持有 `FileId` 和文件版本号以判定是否过期。顶层可通过 `common.SyntaxTree` 访问。
+
+- `pub inline fn isOutdated(self: SyntaxTree, file: FileId, current_version: u32) bool`：文件标识或版本号任一不匹配即判定树已过期。
+- `pub inline fn textLen(self: SyntaxTree) u32`：转发 `GreenTree.textLen`。
+- `pub fn nodeAt(self: SyntaxTree, offset: u32) ?*const GreenNode`：转发 `GreenTree.nodeAt`。
 
 ---
 
@@ -321,7 +380,14 @@ pub const Position = struct {
 - `FileType = enum { Source, Header }`：标识源码文件或索引文件。
 - `PackageNameConstraint`：`{ org: ?[]const u8 = null, root_package: []const u8, sub_package: ?[][]const u8 = null }`，提供 `clone(gpa)` 与 `deinit(gpa)`。
 - `FileExtraInfo`：`{ requirePackageName: ?PackageNameConstraint = null, features: std.StringHashMapUnmanaged(bool) = .empty, typ: FileType = .Source }`，提供 `clone(gpa)` 与 `deinit(gpa)`。
-- `File`：由 `Source` 独占持有，公开字段含 `kind`、`path`、`extra`、`version`、`line_index`，通过 `pub fn content(self: *const File) []const u8` 获取当前只读文本切片（在下次编辑前有效）。
+- `File`：由 `Source` 独占持有，公开字段含 `kind`、`path`、`extra`、`version`、`line_index`、`arena` 与 `contract_arena`。两个内存池都是 `std.heap.ArenaAllocator`，创建文件时建立，随文件的删除或 `Source.deinit` 整体释放，编辑不会清空。
+
+| 签名 | 说明 |
+| :--- | :--- |
+| `pub fn content(self: *const File) []const u8` | 当前文本切片，在下次编辑前有效。 |
+| `pub fn allocator(self: *File) std.mem.Allocator` | 从 `arena` 分配，供文件内部使用；分配的内容随文件释放。返回的分配器句柄持有指向当前 `File` 的指针，`Source` 新建文件导致槽位数组重新分配后失效，继续分配须重新从 `Source.get` 获取。 |
+| `pub fn contractAlloc(self: *File, comptime T: type, n: usize) std.mem.Allocator.Error![]T` | 从 `contract_arena` 申请一次填充的空间，填充完成后只作为只读数据使用。 |
+| `pub fn contractDupe(self: *File, comptime T: type, values: []const T) std.mem.Allocator.Error![]const T` | 把已有数据复制进 `contract_arena` 并返回只读切片。 |
 
 顶层可通过 `common.File`、`common.FileKind`、`common.FileType`、`common.FileExtraInfo`、`common.PackageNameConstraint` 访问。
 

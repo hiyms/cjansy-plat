@@ -2,7 +2,7 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-//! 单个文件的表示：内容缓冲、附加信息、换行缓存，以及文件的可编辑性。
+//! 单个文件的表示：内容缓冲、附加信息、换行缓存、两个内存池，以及文件的可编辑性。
 
 const std = @import("std");
 const LineIndex = @import("LineIndex.zig").LineIndex;
@@ -111,7 +111,8 @@ pub const FileKind = enum {
     external,
 };
 
-/// 单个文件。由 `Source` 独占持有，写入只能通过 `Source.applyEdits`。
+/// 单个文件。由 `Source` 独占持有，文本写入只能通过 `Source.applyEdits`，
+/// 两个内存池分别通过 `allocator` 与 `contractAlloc`/`contractDupe` 写入。
 pub const File = struct {
     kind: FileKind,
     /// 规范化之后的绝对路径；未关联磁盘的工作区文件为 null。非空时与
@@ -126,16 +127,48 @@ pub const File = struct {
     version: u32 = 0,
     /// 换行缓存，与 `text` 一同维护。
     line_index: LineIndex = .{},
+    /// 文件内部使用的内存池，创建文件时建立，删除文件时整体释放。编辑不会清空。
+    arena: std.heap.ArenaAllocator,
+    /// 供平台使用者读取的内存池，创建文件时建立，删除文件时整体释放。
+    ///
+    /// 写入之后的值在文件存续期间不再更改，编辑不会清空。
+    contract_arena: std.heap.ArenaAllocator,
 
     /// 当前文本。切片在使用期间只读；再次编辑之后需要重新取得。
     pub fn content(self: *const File) []const u8 {
         return self.text.items;
     }
 
-    /// 释放内容缓冲、换行缓存、附加信息与路径。
+    /// 文件内部使用的分配器，从 `arena` 取内存。
+    ///
+    /// 分配的内容随文件释放，编辑不会清空。返回的分配器持有指向本结构的指针：
+    /// `Source` 新建文件可能重新分配槽位数组，使这个句柄失效。继续分配时从
+    /// `Source.get` 重新取得的 `File` 上取新的分配器，已经分配的内容不受影响。
+    pub fn allocator(self: *File) std.mem.Allocator {
+        return self.arena.allocator();
+    }
+
+    /// 平台使用者申请内存，从 `contract_arena` 取。
+    ///
+    /// 返回的空间只用于一次填充，填充完成后按只读数据使用。内容在文件存续期间
+    /// 不变，编辑不会清空，调用方不得释放。已经填好的数据用 `contractDupe` 复制。
+    pub fn contractAlloc(self: *File, comptime T: type, n: usize) std.mem.Allocator.Error![]T {
+        return self.contract_arena.allocator().alloc(T, n);
+    }
+
+    /// 把 `values` 复制进 `contract_arena`，返回只读切片。
+    ///
+    /// 内容在文件存续期间不变，编辑不会清空，调用方不得释放。
+    pub fn contractDupe(self: *File, comptime T: type, values: []const T) std.mem.Allocator.Error![]const T {
+        return self.contract_arena.allocator().dupe(T, values);
+    }
+
+    /// 释放内容缓冲、换行缓存、两个内存池、附加信息与路径。
     pub fn deinit(self: *File, gpa: std.mem.Allocator) void {
         self.text.deinit(gpa);
         self.line_index.deinit(gpa);
+        self.arena.deinit();
+        self.contract_arena.deinit();
         self.extra.deinit(gpa);
         if (self.path) |path| gpa.free(path);
         self.* = undefined;

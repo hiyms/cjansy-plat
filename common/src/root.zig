@@ -13,6 +13,7 @@ pub const parse_error = @import("parse_error.zig");
 pub const event = @import("event.zig");
 pub const annotation = @import("annotation.zig");
 pub const utf8 = @import("utf8.zig");
+pub const tree = @import("tree.zig");
 
 pub const Span = common.Span;
 
@@ -52,6 +53,10 @@ pub const Diagnostic = diagnostic.Diagnostic;
 
 pub const Codepoint = utf8.Codepoint;
 
+pub const GreenNode = tree.GreenNode;
+pub const GreenTree = tree.GreenTree;
+pub const SyntaxTree = tree.SyntaxTree;
+
 test {
     _ = common;
     _ = token;
@@ -62,4 +67,5 @@ test {
     _ = event;
     _ = annotation;
     _ = utf8;
+    _ = tree;
 }
