@@ -44,6 +44,17 @@ pub const GreenNode = struct {
 - `tokenText(self: *const GreenNode) ?[]const u8`
 - `childOfKind(self: *const GreenNode, kind: SyntaxKind) ?*const GreenNode`
 
+### `LocatedGreen`
+
+```zig
+pub const LocatedGreen = struct {
+    green: *const GreenNode,
+    start: u32,
+};
+```
+
+携带绝对起始字节偏移的绿树节点定位结果。顶层可通过 `common.LocatedGreen` 访问。
+
 ### `GreenTree`
 
 ```zig
@@ -55,7 +66,8 @@ pub const GreenTree = struct {
 对根 `GreenNode` 节点的封装。顶层可通过 `common.GreenTree` 访问。
 
 - `pub inline fn textLen(self: GreenTree) u32`：返回整棵树覆盖的文本长度。
-- `pub fn nodeAt(self: GreenTree, offset: u32) ?*const GreenNode`：定位包含给定字节位置的叶子节点，返回的指针借用自所属 `arena`。
+- `pub fn nodeAt(self: GreenTree, offset: u32) ?LocatedGreen`：定位包含给定字节位置的叶子节点及其绝对起始偏移，返回结果中的 `green` 指针借用自所属 `arena`。
+- `pub inline fn traversal(self: GreenTree, gpa: std.mem.Allocator) GreenTraversal`：创建前向遍历当前绿树的迭代器，结束后须调用 `GreenTraversal.deinit` 释放。
 
 ### `SyntaxTree`
 
@@ -71,7 +83,58 @@ pub const SyntaxTree = struct {
 
 - `pub inline fn isOutdated(self: SyntaxTree, file: FileId, current_version: u32) bool`：文件标识或版本号任一不匹配即判定树已过期。
 - `pub inline fn textLen(self: SyntaxTree) u32`：转发 `GreenTree.textLen`。
-- `pub fn nodeAt(self: SyntaxTree, offset: u32) ?*const GreenNode`：转发 `GreenTree.nodeAt`。
+- `pub inline fn nodeAt(self: SyntaxTree, offset: u32) ?LocatedGreen`：转发 `GreenTree.nodeAt`。
+
+### `QueryContext`
+
+单次语法树查询会话的红节点分配与去重上下文，基于外部传入的 `gpa` 自持有 `arena` 与 `(green, offset)` 去重缓存。顶层可通过 `common.QueryContext` 访问。
+
+- `pub fn init(gpa: std.mem.Allocator) QueryContext`：初始化查询上下文。
+- `pub fn deinit(self: *QueryContext) void`：释放去重缓存与内部 `arena` 中的全部红节点数据。
+- `pub inline fn allocator(self: *QueryContext) std.mem.Allocator`：获取内部 `arena` 分配器。
+- `pub fn allocRed(self: *QueryContext, green: *const GreenNode, parent: ?*const RedNode, offset: u32) std.mem.Allocator.Error!*const RedNode`：在内部 `arena` 中按 `(green, offset)` 分配或复用 `RedNode`；同一 `QueryContext` 内相同的 `(green, offset)` 必然返回同一指针。返回的指针随 `deinit` 统一回收，调用者不得单独释放。
+
+### `RedNode`
+
+```zig
+pub const RedNode = struct {
+    green: *const GreenNode,
+    parent_node: ?*const RedNode,
+    text_offset: u32,
+};
+```
+
+绑定了父节点指针与绝对文件偏移的语法树视图节点，由 `QueryContext` 托管生命周期（预期短于底层 `GreenNode`）。顶层可通过 `common.RedNode` 访问。
+
+提供以下方法（返回的节点指针与切片均借用自对应的 `QueryContext` 或绿树 `arena`，调用者不得单独释放）：
+- `pub inline fn kind(self: *const RedNode) SyntaxKind`
+- `pub inline fn textLen(self: *const RedNode) u32`
+- `pub inline fn offset(self: *const RedNode) u32`
+- `pub inline fn range(self: *const RedNode) TextRange`
+- `pub inline fn parent(self: *const RedNode) ?*const RedNode`
+- `pub inline fn isLeaf(self: *const RedNode) bool`
+- `pub inline fn tokenText(self: *const RedNode) ?[]const u8`
+- `pub inline fn childCount(self: *const RedNode) usize`
+- `pub fn childAt(self: *const RedNode, ctx: *QueryContext, index: usize) std.mem.Allocator.Error!?*const RedNode`
+- `pub fn children(self: *const RedNode, ctx: *QueryContext) std.mem.Allocator.Error![]const *const RedNode`
+- `pub fn findTokenAt(self: *const RedNode, ctx: *QueryContext, target_offset: u32) std.mem.Allocator.Error!?*const RedNode`
+- `pub inline fn ancestors(self: *const RedNode) AncestorIter`
+
+### `AncestorIter`
+
+沿父节点链向上遍历 `RedNode` 的迭代器，从起始节点自身开始直至根节点。顶层可通过 `common.AncestorIter` 访问。
+
+- `pub inline fn next(self: *AncestorIter) ?*const RedNode`：返回当前红节点并推进至父节点；越过根节点后返回 `null`。
+
+### `GreenTraversal`
+
+对 `GreenTree` 执行非递归深度优先前向遍历的迭代器，无需分配 `RedNode`，事件类型为 `GreenTraversal.Event = union(enum) { enter: LocatedGreen, leave: LocatedGreen }`。顶层可通过 `common.GreenTraversal` 访问。
+
+- `pub inline fn init(gpa: std.mem.Allocator, tree: GreenTree) GreenTraversal`：从绿树根节点初始化遍历器。
+- `pub fn initFromNode(gpa: std.mem.Allocator, node: *const GreenNode, start_offset: u32) GreenTraversal`：从指定节点与起始偏移初始化遍历器。
+- `pub fn deinit(self: *GreenTraversal) void`：释放遍历器内部的临时缓冲。
+- `pub fn next(self: *GreenTraversal) std.mem.Allocator.Error!?Event`：产出下一个 `.enter` 或 `.leave` 事件，结束时返回 `null`。
+- `pub fn skipChildren(self: *GreenTraversal) void`：跳过当前活动帧的剩余子节点（`.enter` 后调用跳过当前节点的子节点，`.leave` 后调用跳过其父节点的剩余子节点，未进入或结束后调用无效果）。
 
 ---
 

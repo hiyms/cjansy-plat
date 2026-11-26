@@ -54,8 +54,13 @@ pub const Diagnostic = diagnostic.Diagnostic;
 pub const Codepoint = utf8.Codepoint;
 
 pub const GreenNode = tree.GreenNode;
+pub const LocatedGreen = tree.LocatedGreen;
 pub const GreenTree = tree.GreenTree;
 pub const SyntaxTree = tree.SyntaxTree;
+pub const QueryContext = tree.QueryContext;
+pub const RedNode = tree.RedNode;
+pub const AncestorIter = tree.AncestorIter;
+pub const GreenTraversal = tree.GreenTraversal;
 
 test {
     _ = common;

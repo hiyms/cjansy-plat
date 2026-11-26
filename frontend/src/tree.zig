@@ -216,13 +216,19 @@ test "GreenBuilder 构建叶子、包裹节点并复制叶子文本" {
     try std.testing.expectEqual(SyntaxKind.add, binary.childOfKind(.add).?.kind);
     try std.testing.expect(tree.root.childOfKind(.binary_expr) == binary);
 
-    try std.testing.expectEqualStrings("1", tree.nodeAt(0).?.tokenText().?);
-    try std.testing.expectEqualStrings("+", tree.nodeAt(1).?.tokenText().?);
-    try std.testing.expectEqualStrings("2", tree.nodeAt(2).?.tokenText().?);
+    const loc0 = tree.nodeAt(0).?;
+    try std.testing.expectEqual(@as(u32, 0), loc0.start);
+    try std.testing.expectEqualStrings("1", loc0.green.tokenText().?);
+    const loc1 = tree.nodeAt(1).?;
+    try std.testing.expectEqual(@as(u32, 1), loc1.start);
+    try std.testing.expectEqualStrings("+", loc1.green.tokenText().?);
+    const loc2 = tree.nodeAt(2).?;
+    try std.testing.expectEqual(@as(u32, 2), loc2.start);
+    try std.testing.expectEqualStrings("2", loc2.green.tokenText().?);
     try std.testing.expect(tree.nodeAt(3) == null);
 
     source_buffer[0] = '9';
-    try std.testing.expectEqualStrings("1", tree.nodeAt(0).?.tokenText().?);
+    try std.testing.expectEqualStrings("1", tree.nodeAt(0).?.green.tokenText().?);
 }
 
 test "treeBuild 分发事件并忽略解析诊断" {
@@ -242,7 +248,9 @@ test "treeBuild 分发事件并忽略解析诊断" {
     const tree = try treeBuild(gpa, arena.allocator(), source, &events);
     try std.testing.expectEqual(SyntaxKind.source_file, tree.root.kind);
     try std.testing.expectEqual(@as(u32, 1), tree.textLen());
-    try std.testing.expectEqualStrings("a", tree.nodeAt(0).?.tokenText().?);
+    const loc = tree.nodeAt(0).?;
+    try std.testing.expectEqual(@as(u32, 0), loc.start);
+    try std.testing.expectEqualStrings("a", loc.green.tokenText().?);
 }
 
 /// 供分配失败测试调用的构建例程，覆盖 start_node、token、wrap_node 与 finish_node。
