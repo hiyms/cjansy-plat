@@ -6,8 +6,13 @@
 
 pub const lexer = @import("lexer.zig");
 pub const parser = @import("parser.zig");
+pub const tree = @import("tree.zig");
+
+pub const GreenBuilder = tree.GreenBuilder;
+pub const treeBuild = tree.treeBuild;
 
 test {
     _ = @import("./lexer.zig");
     _ = @import("./parser.zig");
+    _ = @import("./tree.zig");
 }
