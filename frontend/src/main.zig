@@ -28,7 +28,7 @@ fn isSubCommandEnabled(comptime cmd: SubCommand) bool {
 fn subCommandDescription(comptime cmd: SubCommand) []const u8 {
     return switch (cmd) {
         .lexer => "Lex a Cangjie source file.",
-        .parser => "Parse Cangjie tokens or a source file into syntax events.",
+        .parser => "Parse Cangjie tokens or a source file into a syntax tree or events.",
     };
 }
 
@@ -60,16 +60,21 @@ const OutputFormat = enum {
     json,
 };
 
+const ParseOutputType = enum {
+    event,
+    tree,
+};
+
 const lexer_option_params = clap.parseParamsComptime(
-    \\-h, --help         Display this help and exit.
-    \\--output <format>  Output format: plain or json.
+    \\-h, --help             Display this help and exit.
+    \\-f, --format <format>  Output format: plain or json.
     \\
 );
 
 const lexer_params = clap.parseParamsComptime(
-    \\-h, --help         Display this help and exit.
-    \\--output <format>  Output format: plain or json.
-    \\<file>...          Input file path (exactly one required).
+    \\-h, --help             Display this help and exit.
+    \\-f, --format <format>  Output format: plain or json.
+    \\<file>...              Input file path (exactly one required).
     \\
 );
 
@@ -80,13 +85,15 @@ const lexer_parsers = .{
 
 const parser_params = clap.parseParamsComptime(
     \\-h, --help                Display this help and exit.
-    \\--output <format>         Output format: plain or json.
+    \\-f, --format <format>     Output format: plain or json.
+    \\-t <type>                 Output type: event or tree (default: tree).
     \\-s, --source-file <file>  Read and lex a Cangjie source file instead of reading JSON tokens from stdin.
     \\
 );
 
 const parser_parsers = .{
     .format = clap.parsers.enumeration(OutputFormat),
+    .type = clap.parsers.enumeration(ParseOutputType),
     .file = clap.parsers.string,
 };
 
@@ -221,7 +228,7 @@ fn dispatchSubCommand(
 
 const ParsedLexerArgs = struct {
     show_help: bool = false,
-    output: ?OutputFormat = null,
+    format: ?OutputFormat = null,
     file_path: ?[]const u8 = null,
     file_count: usize = 0,
 };
@@ -248,7 +255,7 @@ fn parseLexerArgs(
         .res = res,
         .parsed = .{
             .show_help = res.args.help != 0,
-            .output = res.args.output,
+            .format = res.args.format,
             .file_path = if (files.len == 1) files[0] else null,
             .file_count = files.len,
         },
@@ -283,7 +290,7 @@ fn lexerMain(io: Io, gpa: std.mem.Allocator, iter: anytype) !u8 {
     };
 
     const stdout_file: Io.File = .stdout();
-    const format: OutputFormat = args_bundle.parsed.output orelse
+    const format: OutputFormat = args_bundle.parsed.format orelse
         if (try stdout_file.isTty(io)) .plain else .json;
 
     var stdout_buf: [4096]u8 = undefined;
@@ -308,7 +315,8 @@ fn lexerMain(io: Io, gpa: std.mem.Allocator, iter: anytype) !u8 {
 
 const ParsedParserArgs = struct {
     show_help: bool = false,
-    output: ?OutputFormat = null,
+    format: ?OutputFormat = null,
+    output_type: ParseOutputType = .tree,
     source_file: ?[]const u8 = null,
 };
 
@@ -333,13 +341,14 @@ fn parseParserArgs(
         .res = res,
         .parsed = .{
             .show_help = res.args.help != 0,
-            .output = res.args.output,
+            .format = res.args.format,
+            .output_type = res.args.t orelse .tree,
             .source_file = res.args.@"source-file",
         },
     };
 }
 
-/// 执行 `parser` 子命令：默认从 `stdin` 逐行读取 JSON 序列化的 `Token` 并输出语法事件流，
+/// 执行 `parser` 子命令：默认从 `stdin` 逐行读取 JSON 序列化的 `Token` 并按 `-t` 输出语法树或事件流，
 /// 指定 `-s` / `--source-file` 时自动读取并词法扫描对应源文件后再解析。
 /// 成功返回 `0`，参数错误、读取错误、词法错误或输入 JSON 非法返回 `1`。
 fn parserMain(io: Io, gpa: std.mem.Allocator, iter: anytype) !u8 {
@@ -357,8 +366,9 @@ fn parserMain(io: Io, gpa: std.mem.Allocator, iter: anytype) !u8 {
     }
 
     const stdout_file: Io.File = .stdout();
-    const format: OutputFormat = args_bundle.parsed.output orelse
+    const format: OutputFormat = args_bundle.parsed.format orelse
         if (try stdout_file.isTty(io)) .plain else .json;
+    const output_type = args_bundle.parsed.output_type;
 
     var stdout_buf: [4096]u8 = undefined;
     var stdout_writer = stdout_file.writerStreaming(io, &stdout_buf);
@@ -375,13 +385,13 @@ fn parserMain(io: Io, gpa: std.mem.Allocator, iter: anytype) !u8 {
         };
         defer gpa.free(source);
 
-        break :blk parseSource(gpa, source, format, out) catch |err|
+        break :blk parseSource(gpa, source, format, output_type, out) catch |err|
             return stdout_writer.err orelse err;
     } else blk: {
         var stdin_buf: [4096]u8 = undefined;
         var stdin_reader = Io.File.stdin().readerStreaming(io, &stdin_buf);
 
-        break :blk parseTokenJsonStream(gpa, &stdin_reader.interface, format, out) catch |err| switch (err) {
+        break :blk parseTokenJsonStream(gpa, &stdin_reader.interface, format, output_type, out) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
             error.ReadFailed => read_err_blk: {
                 const read_err = stdin_reader.err orelse err;
@@ -397,12 +407,13 @@ fn parserMain(io: Io, gpa: std.mem.Allocator, iter: anytype) !u8 {
     return if (ok) 0 else 1;
 }
 
-/// 对仓颉源码执行内部词法分析与语法解析，并按 `format` 将全部事件写入 `out`。
+/// 对仓颉源码执行内部词法分析与语法解析，并按 `output_type` 与 `format` 将结果写入 `out`。
 /// 词法分析出现 `Lexer.Error` 时按对应格式输出错误并返回 `false`。
 fn parseSource(
     gpa: std.mem.Allocator,
     source: []const u8,
     format: OutputFormat,
+    output_type: ParseOutputType,
     out: *Io.Writer,
 ) !bool {
     var lexer = frontend.lexer.Lexer.new(source) catch |err| {
@@ -422,16 +433,17 @@ fn parseSource(
         if (tok.tag == .end) break;
     }
 
-    try parseTokens(gpa, source, tokens.items, format, out);
+    try parseTokens(gpa, source, tokens.items, format, output_type, out);
     return true;
 }
 
-/// 从 `reader` 逐行读取 JSON 序列化的 `common.Token` 并执行语法解析，将全部事件写入 `out`。
+/// 从 `reader` 逐行读取 JSON 序列化的 `common.Token` 并执行语法解析，按 `output_type` 与 `format` 将结果写入 `out`。
 /// 输入行格式非法、包含上游错误对象或区间倒置时按对应格式输出错误并返回 `false`。
 fn parseTokenJsonStream(
     gpa: std.mem.Allocator,
     reader: *Io.Reader,
     format: OutputFormat,
+    output_type: ParseOutputType,
     out: *Io.Writer,
 ) !bool {
     const UpstreamError = struct {
@@ -499,24 +511,156 @@ fn parseTokenJsonStream(
     defer gpa.free(placeholder_source);
     @memset(placeholder_source, ' ');
 
-    try parseTokens(gpa, placeholder_source, tokens.items, format, out);
+    try parseTokens(gpa, placeholder_source, tokens.items, format, output_type, out);
     return true;
 }
 
-/// 将词法单元切片送入语法解析器，并按 `format` 将产出的全部事件写入 `out`。
+/// 将词法单元切片送入语法解析器，按 `output_type` 与 `format` 输出事件流或绿树到 `out`。
 fn parseTokens(
     gpa: std.mem.Allocator,
     source: []const u8,
     tokens: []const common.Token,
     format: OutputFormat,
+    output_type: ParseOutputType,
     out: *Io.Writer,
 ) !void {
     var parser = frontend.parser.Parser.new(gpa, source, tokens);
     defer parser.deinit();
 
-    while (try parser.gen()) |ev| {
-        try writeEvent(gpa, out, format, ev);
+    switch (output_type) {
+        .event => {
+            while (try parser.gen()) |ev| {
+                try writeEvent(gpa, out, format, ev);
+            }
+        },
+        .tree => {
+            var events: std.ArrayList(common.Event) = .empty;
+            defer events.deinit(gpa);
+            while (try parser.gen()) |ev| {
+                try events.append(gpa, ev);
+            }
+
+            var arena = std.heap.ArenaAllocator.init(gpa);
+            defer arena.deinit();
+            const tree = try frontend.treeBuild(gpa, arena.allocator(), source, events.items);
+            try writeTree(gpa, out, format, tree);
+        },
     }
+}
+
+/// 按 `format` 将构建完成的绿树写入 `out`：`plain` 采用类似 `tree` 的树形文本，`json` 输出单个嵌套 JSON 对象。
+/// `tree` 与 `out` 均借用自调用者，本函数不释放它们的内存。
+fn writeTree(
+    gpa: std.mem.Allocator,
+    out: *Io.Writer,
+    format: OutputFormat,
+    tree: common.GreenTree,
+) !void {
+    switch (format) {
+        .plain => {
+            try writeTreeNodeLabelPlain(out, tree.root, 0);
+            try out.writeByte('\n');
+
+            var branch_continuations: std.ArrayList(bool) = .empty;
+            defer branch_continuations.deinit(gpa);
+            try writeTreeChildrenPlain(gpa, out, tree.root, 0, &branch_continuations);
+        },
+        .json => {
+            try writeTreeNodeJson(out, tree.root);
+            try out.writeByte('\n');
+        },
+    }
+}
+
+/// 将单个绿树节点的类型、字节区间与可选叶子文本写入 `out`（不含前缀树枝与末尾换行）。
+fn writeTreeNodeLabelPlain(
+    out: *Io.Writer,
+    node: *const common.GreenNode,
+    start_offset: u32,
+) !void {
+    const end_offset = start_offset + node.text_len;
+    try out.print("{s} [{d}..{d}]", .{ @tagName(node.kind), start_offset, end_offset });
+    if (node.tokenText()) |text| {
+        try out.writeByte(' ');
+        try writePlainLeafText(out, text);
+    }
+}
+
+/// 将叶子文本编码为单行带双引号的字符串写入 `out`，确保换行、控制字符与非法字节不破坏树形排版。
+fn writePlainLeafText(out: *Io.Writer, text: []const u8) !void {
+    if (std.unicode.utf8ValidateSlice(text)) {
+        try std.json.Stringify.encodeJsonString(text, .{}, out);
+        return;
+    }
+
+    try out.writeByte('"');
+    for (text) |b| {
+        switch (b) {
+            '\\' => try out.writeAll("\\\\"),
+            '"' => try out.writeAll("\\\""),
+            '\n' => try out.writeAll("\\n"),
+            '\r' => try out.writeAll("\\r"),
+            '\t' => try out.writeAll("\\t"),
+            0x20...0x21, 0x23...0x5B, 0x5D...0x7E => try out.writeByte(b),
+            else => {
+                try out.writeAll("\\x");
+                try out.printInt(b, 16, .lower, .{ .width = 2, .fill = '0' });
+            },
+        }
+    }
+    try out.writeByte('"');
+}
+
+/// 递归以类 `tree` 的框线格式将 `node` 的全部子节点写入 `out`。
+/// `node`、`out` 与 `branch_continuations` 均借用自调用者，本函数不释放它们。
+fn writeTreeChildrenPlain(
+    gpa: std.mem.Allocator,
+    out: *Io.Writer,
+    node: *const common.GreenNode,
+    start_offset: u32,
+    branch_continuations: *std.ArrayList(bool),
+) !void {
+    const children = node.children();
+    var child_offset = start_offset;
+    for (children, 0..) |child, idx| {
+        const is_last = idx + 1 == children.len;
+        for (branch_continuations.items) |has_next| {
+            try out.writeAll(if (has_next) "│   " else "    ");
+        }
+        try out.writeAll(if (is_last) "└── " else "├── ");
+        try writeTreeNodeLabelPlain(out, child, child_offset);
+        try out.writeByte('\n');
+
+        if (!child.isLeaf()) {
+            try branch_continuations.append(gpa, !is_last);
+            defer _ = branch_continuations.pop();
+            try writeTreeChildrenPlain(gpa, out, child, child_offset, branch_continuations);
+        }
+        child_offset += child.text_len;
+    }
+}
+
+/// 递归将单个绿树节点以紧凑嵌套 JSON 格式写入 `out`。
+/// 直接流式写入以避免 `std.json.Stringify` 固定深度检查对深层语法树的限制。
+fn writeTreeNodeJson(out: *Io.Writer, node: *const common.GreenNode) !void {
+    try out.writeAll("{\"kind\":");
+    try std.json.Stringify.encodeJsonString(@tagName(node.kind), .{}, out);
+    try out.print(",\"text_len\":{d}", .{node.text_len});
+    switch (node.payload) {
+        .leaf => |text| {
+            try out.writeAll(",\"text\":");
+            try std.json.Stringify.value(text, .{}, out);
+        },
+        .tree => |children| {
+            try out.writeAll(",\"children\":[");
+            for (children, 0..) |child, idx| {
+                if (idx != 0) try out.writeByte(',');
+                try writeTreeNodeJson(out, child);
+            }
+            try out.writeByte(']');
+        },
+    }
+    try out.writeByte('}');
 }
 
 /// 按 `format` 将单个语法解析事件写入 `out`。
@@ -757,44 +901,44 @@ test "parseEnabledSubCommand 仅接受已启用子命令" {
     try std.testing.expectError(error.NameNotPartOfEnum, parseEnabledSubCommand("unknown_cmd"));
 }
 
-test "parseLexerArgs 校验输入文件数量、帮助参数与 --output 选项" {
+test "parseLexerArgs 校验输入文件数量、帮助参数与 -f/--format 选项" {
     const gpa = std.testing.allocator;
 
-    // 恰好 1 个文件 + --output=plain
+    // 恰好 1 个文件 + --format=plain
     {
-        const raw = [_][]const u8{ "--output=plain", "foo.cj" };
+        const raw = [_][]const u8{ "--format=plain", "foo.cj" };
         var iter = clap.args.SliceIterator{ .args = &raw };
         var diag = clap.Diagnostic{};
         var bundle = try parseLexerArgs(gpa, &iter, &diag);
         defer bundle.res.deinit();
 
         try std.testing.expect(!bundle.parsed.show_help);
-        try std.testing.expectEqual(@as(?OutputFormat, .plain), bundle.parsed.output);
+        try std.testing.expectEqual(@as(?OutputFormat, .plain), bundle.parsed.format);
         try std.testing.expectEqual(@as(usize, 1), bundle.parsed.file_count);
         try std.testing.expectEqualStrings("foo.cj", bundle.parsed.file_path.?);
     }
 
-    // --output=json 放在文件路径之后
+    // -f=json 放在文件路径之后
     {
-        const raw = [_][]const u8{ "foo.cj", "--output=json" };
+        const raw = [_][]const u8{ "foo.cj", "-f=json" };
         var iter = clap.args.SliceIterator{ .args = &raw };
         var diag = clap.Diagnostic{};
         var bundle = try parseLexerArgs(gpa, &iter, &diag);
         defer bundle.res.deinit();
 
-        try std.testing.expectEqual(@as(?OutputFormat, .json), bundle.parsed.output);
+        try std.testing.expectEqual(@as(?OutputFormat, .json), bundle.parsed.format);
         try std.testing.expectEqualStrings("foo.cj", bundle.parsed.file_path.?);
     }
 
-    // 空格分隔形式的 --output 与重复指定时后值覆盖前值
+    // 空格分隔形式的 -f / --format 与重复指定时后值覆盖前值
     {
-        const raw = [_][]const u8{ "--output", "plain", "--output=json", "foo.cj" };
+        const raw = [_][]const u8{ "-f", "plain", "--format=json", "foo.cj" };
         var iter = clap.args.SliceIterator{ .args = &raw };
         var diag = clap.Diagnostic{};
         var bundle = try parseLexerArgs(gpa, &iter, &diag);
         defer bundle.res.deinit();
 
-        try std.testing.expectEqual(@as(?OutputFormat, .json), bundle.parsed.output);
+        try std.testing.expectEqual(@as(?OutputFormat, .json), bundle.parsed.format);
         try std.testing.expectEqualStrings("foo.cj", bundle.parsed.file_path.?);
     }
 
@@ -845,12 +989,20 @@ test "parseLexerArgs 校验输入文件数量、帮助参数与 --output 选项"
         try std.testing.expectEqual(@as(?[]const u8, null), bundle.parsed.file_path);
     }
 
-    // 非法 --output 值
-    {
-        const raw = [_][]const u8{ "--output=xml", "a.cj" };
+    // 非法 --format 与 -f 值
+    for ([_][]const u8{ "--format=xml", "-f=xml" }) |arg| {
+        const raw = [_][]const u8{ arg, "a.cj" };
         var iter = clap.args.SliceIterator{ .args = &raw };
         var diag = clap.Diagnostic{};
         try std.testing.expectError(error.NameNotPartOfEnum, parseLexerArgs(gpa, &iter, &diag));
+    }
+
+    // 旧 --output 不再受支持
+    {
+        const raw = [_][]const u8{ "--output=plain", "a.cj" };
+        var iter = clap.args.SliceIterator{ .args = &raw };
+        var diag = clap.Diagnostic{};
+        try std.testing.expectError(error.InvalidArgument, parseLexerArgs(gpa, &iter, &diag));
     }
 }
 
@@ -878,11 +1030,12 @@ test "writeLexerHelp 展示单文件用法与选项" {
     try writeLexerHelp(&aw.writer);
     const out = aw.written();
     try std.testing.expect(std.mem.indexOf(u8, out, "Usage: cjfrontend lexer [options] <file>") != null);
-    try std.testing.expect(std.mem.indexOf(u8, out, "--output <format>") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "-f, --format <format>") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "--output") == null);
     try std.testing.expect(std.mem.indexOf(u8, out, "<file>...") == null);
 }
 
-test "writeParserHelp 展示标准输入默认用法与 --source-file 选项" {
+test "writeParserHelp 展示标准输入默认用法与选项" {
     const gpa = std.testing.allocator;
     var aw: Io.Writer.Allocating = .init(gpa);
     defer aw.deinit();
@@ -890,14 +1043,16 @@ test "writeParserHelp 展示标准输入默认用法与 --source-file 选项" {
     try writeParserHelp(&aw.writer);
     const out = aw.written();
     try std.testing.expect(std.mem.indexOf(u8, out, "Usage: cjfrontend parser [options]") != null);
-    try std.testing.expect(std.mem.indexOf(u8, out, "--output <format>") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "-f, --format <format>") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "-t <type>") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "--output") == null);
     try std.testing.expect(std.mem.indexOf(u8, out, "-s, --source-file <file>") != null);
 }
 
-test "parseParserArgs 校验帮助参数、--output 与 -s/--source-file 选项" {
+test "parseParserArgs 校验帮助参数、-f/--format、-t 与 -s/--source-file 选项" {
     const gpa = std.testing.allocator;
 
-    // 默认无参数：从 stdin 读取
+    // 默认无参数：从 stdin 读取，-t 默认为 tree
     {
         const raw = [_][]const u8{};
         var iter = clap.args.SliceIterator{ .args = &raw };
@@ -906,42 +1061,47 @@ test "parseParserArgs 校验帮助参数、--output 与 -s/--source-file 选项"
         defer bundle.res.deinit();
 
         try std.testing.expect(!bundle.parsed.show_help);
-        try std.testing.expectEqual(@as(?OutputFormat, null), bundle.parsed.output);
+        try std.testing.expectEqual(@as(?OutputFormat, null), bundle.parsed.format);
+        try std.testing.expectEqual(ParseOutputType.tree, bundle.parsed.output_type);
         try std.testing.expectEqual(@as(?[]const u8, null), bundle.parsed.source_file);
     }
 
-    // --source-file=path 与 --output=plain
+    // --source-file=path、--format=plain 与 -t event
     {
-        const raw = [_][]const u8{ "--source-file=foo.cj", "--output=plain" };
+        const raw = [_][]const u8{ "--source-file=foo.cj", "--format=plain", "-t", "event" };
         var iter = clap.args.SliceIterator{ .args = &raw };
         var diag = clap.Diagnostic{};
         var bundle = try parseParserArgs(gpa, &iter, &diag);
         defer bundle.res.deinit();
 
-        try std.testing.expectEqual(@as(?OutputFormat, .plain), bundle.parsed.output);
+        try std.testing.expectEqual(@as(?OutputFormat, .plain), bundle.parsed.format);
+        try std.testing.expectEqual(ParseOutputType.event, bundle.parsed.output_type);
         try std.testing.expectEqualStrings("foo.cj", bundle.parsed.source_file.?);
     }
 
-    // -s 简写与空格分隔
+    // -s / -f 简写与 -t=tree
     {
-        const raw = [_][]const u8{ "-s", "bar.cj", "--output", "json" };
+        const raw = [_][]const u8{ "-s", "bar.cj", "-f", "json", "-t=tree" };
         var iter = clap.args.SliceIterator{ .args = &raw };
         var diag = clap.Diagnostic{};
         var bundle = try parseParserArgs(gpa, &iter, &diag);
         defer bundle.res.deinit();
 
-        try std.testing.expectEqual(@as(?OutputFormat, .json), bundle.parsed.output);
+        try std.testing.expectEqual(@as(?OutputFormat, .json), bundle.parsed.format);
+        try std.testing.expectEqual(ParseOutputType.tree, bundle.parsed.output_type);
         try std.testing.expectEqualStrings("bar.cj", bundle.parsed.source_file.?);
     }
 
-    // -s=path 形式
+    // -s=path、-f=plain 与 -t 重复指定时后值覆盖前值
     {
-        const raw = [_][]const u8{"-s=baz.cj"};
+        const raw = [_][]const u8{ "-s=baz.cj", "-f=plain", "-t=event", "-t", "tree" };
         var iter = clap.args.SliceIterator{ .args = &raw };
         var diag = clap.Diagnostic{};
         var bundle = try parseParserArgs(gpa, &iter, &diag);
         defer bundle.res.deinit();
 
+        try std.testing.expectEqual(@as(?OutputFormat, .plain), bundle.parsed.format);
+        try std.testing.expectEqual(ParseOutputType.tree, bundle.parsed.output_type);
         try std.testing.expectEqualStrings("baz.cj", bundle.parsed.source_file.?);
     }
 
@@ -956,12 +1116,20 @@ test "parseParserArgs 校验帮助参数、--output 与 -s/--source-file 选项"
         try std.testing.expect(bundle.parsed.show_help);
     }
 
-    // 非法 --output 值
-    {
-        const raw = [_][]const u8{"--output=xml"};
+    // 非法 --format / -f / -t 值
+    for ([_][]const u8{ "--format=xml", "-f=xml", "-t=ast" }) |arg| {
+        const raw = [_][]const u8{arg};
         var iter = clap.args.SliceIterator{ .args = &raw };
         var diag = clap.Diagnostic{};
         try std.testing.expectError(error.NameNotPartOfEnum, parseParserArgs(gpa, &iter, &diag));
+    }
+
+    // 旧 --output 不再受支持
+    {
+        const raw = [_][]const u8{"--output=json"};
+        var iter = clap.args.SliceIterator{ .args = &raw };
+        var diag = clap.Diagnostic{};
+        try std.testing.expectError(error.InvalidArgument, parseParserArgs(gpa, &iter, &diag));
     }
 
     // 不接受多余位置参数
@@ -973,14 +1141,14 @@ test "parseParserArgs 校验帮助参数、--output 与 -s/--source-file 选项"
     }
 }
 
-test "parseSource plain 与 json 输出可往返反序列化为 Event" {
+test "parseSource event 模式 plain 与 json 输出可往返反序列化为 Event" {
     const gpa = std.testing.allocator;
 
     // plain 输出
     {
         var aw: Io.Writer.Allocating = .init(gpa);
         defer aw.deinit();
-        const ok = try parseSource(gpa, "let x = 1\n", .plain, &aw.writer);
+        const ok = try parseSource(gpa, "let x = 1\n", .plain, .event, &aw.writer);
         try std.testing.expect(ok);
         const out = aw.written();
         try std.testing.expect(std.mem.startsWith(u8, out, "start_node source_file\n"));
@@ -994,7 +1162,7 @@ test "parseSource plain 与 json 输出可往返反序列化为 Event" {
     {
         var aw: Io.Writer.Allocating = .init(gpa);
         defer aw.deinit();
-        const ok = try parseSource(gpa, "let x = 1 + 2", .json, &aw.writer);
+        const ok = try parseSource(gpa, "let x = 1 + 2", .json, .event, &aw.writer);
         try std.testing.expect(ok);
 
         var open_count: usize = 0;
@@ -1020,7 +1188,7 @@ test "parseSource plain 与 json 输出可往返反序列化为 Event" {
     }
 }
 
-test "parseTokenJsonStream 衔接 lexSource json 输出并保留原始字节区间" {
+test "parseTokenJsonStream event 模式衔接 lexSource json 输出并保留原始字节区间" {
     const gpa = std.testing.allocator;
     const src = "func add(a: Int64, b: Int64): Int64 { a + b }\n";
 
@@ -1031,11 +1199,11 @@ test "parseTokenJsonStream 衔接 lexSource json 输出并保留原始字节区�
     var stream_out: Io.Writer.Allocating = .init(gpa);
     defer stream_out.deinit();
     var reader: Io.Reader = .fixed(lex_out.written());
-    try std.testing.expect(try parseTokenJsonStream(gpa, &reader, .json, &stream_out.writer));
+    try std.testing.expect(try parseTokenJsonStream(gpa, &reader, .json, .event, &stream_out.writer));
 
     var direct_out: Io.Writer.Allocating = .init(gpa);
     defer direct_out.deinit();
-    try std.testing.expect(try parseSource(gpa, src, .json, &direct_out.writer));
+    try std.testing.expect(try parseSource(gpa, src, .json, .event, &direct_out.writer));
 
     try std.testing.expectEqualStrings(direct_out.written(), stream_out.written());
 }
@@ -1046,7 +1214,7 @@ test "parseTokenJsonStream 空输入产出完整空 source_file 事件" {
     defer aw.deinit();
     var reader: Io.Reader = .fixed("");
 
-    try std.testing.expect(try parseTokenJsonStream(gpa, &reader, .plain, &aw.writer));
+    try std.testing.expect(try parseTokenJsonStream(gpa, &reader, .plain, .event, &aw.writer));
     try std.testing.expectEqualStrings(
         \\start_node source_file
         \\token eof 0 0
@@ -1063,7 +1231,7 @@ test "parseTokenJsonStream 遇到非法 JSON、上游错误或倒置区间时输
         var aw: Io.Writer.Allocating = .init(gpa);
         defer aw.deinit();
         var reader: Io.Reader = .fixed("{\"tag\":\"kw_let\",\"span\":{\"start\":0,\"end\":3}}\nnot-json\n");
-        const ok = try parseTokenJsonStream(gpa, &reader, .plain, &aw.writer);
+        const ok = try parseTokenJsonStream(gpa, &reader, .plain, .tree, &aw.writer);
         try std.testing.expect(!ok);
         try std.testing.expectEqualStrings("error: InvalidTokenJson at 2\n", aw.written());
     }
@@ -1073,7 +1241,7 @@ test "parseTokenJsonStream 遇到非法 JSON、上游错误或倒置区间时输
         var aw: Io.Writer.Allocating = .init(gpa);
         defer aw.deinit();
         var reader: Io.Reader = .fixed("{\"error\":\"InterpolationDepthExceeded\"}\n");
-        const ok = try parseTokenJsonStream(gpa, &reader, .json, &aw.writer);
+        const ok = try parseTokenJsonStream(gpa, &reader, .json, .tree, &aw.writer);
         try std.testing.expect(!ok);
         try std.testing.expectEqualStrings("{\"error\":\"InterpolationDepthExceeded\"}\n", aw.written());
     }
@@ -1083,7 +1251,7 @@ test "parseTokenJsonStream 遇到非法 JSON、上游错误或倒置区间时输
         var aw: Io.Writer.Allocating = .init(gpa);
         defer aw.deinit();
         var reader: Io.Reader = .fixed("{\"tag\":\"kw_let\",\"span\":{\"start\":5,\"end\":2}}\n");
-        const ok = try parseTokenJsonStream(gpa, &reader, .plain, &aw.writer);
+        const ok = try parseTokenJsonStream(gpa, &reader, .plain, .event, &aw.writer);
         try std.testing.expect(!ok);
         try std.testing.expectEqualStrings("error: InvalidTokenSpan at 1\n", aw.written());
     }
@@ -1103,17 +1271,174 @@ test "parseSource 词法错误时输出对应错误并返回 false" {
         try src_buf.writer.writeAll("}\"");
     }
 
-    const ok = try parseSource(gpa, src_buf.written(), .json, &aw.writer);
+    const ok = try parseSource(gpa, src_buf.written(), .json, .tree, &aw.writer);
     try std.testing.expect(!ok);
     try std.testing.expectEqualStrings("{\"error\":\"InterpolationDepthExceeded\"}\n", aw.written());
 }
 
-test "parseSource 遇到语法错误时输出 parse_error 事件" {
+test "parseSource event 模式遇到语法错误时输出 parse_error 事件" {
     const gpa = std.testing.allocator;
     var aw: Io.Writer.Allocating = .init(gpa);
     defer aw.deinit();
 
-    const ok = try parseSource(gpa, "let = 1", .plain, &aw.writer);
+    const ok = try parseSource(gpa, "let = 1", .plain, .event, &aw.writer);
     try std.testing.expect(ok);
     try std.testing.expect(std.mem.indexOf(u8, aw.written(), "parse_error ") != null);
+}
+
+/// 递归遍历 JSON 语法树并按叶子顺序拼接全部 `text` 字符串，供测试验证无损输出。
+fn collectJsonTreeText(gpa: std.mem.Allocator, value: std.json.Value, out: *std.ArrayList(u8)) !void {
+    const obj = value.object;
+    if (obj.get("text")) |text_val| {
+        try out.appendSlice(gpa, text_val.string);
+        return;
+    }
+    const children = obj.get("children").?.array.items;
+    for (children) |child| {
+        try collectJsonTreeText(gpa, child, out);
+    }
+}
+
+test "parseSource tree 模式 plain 输出类 tree 框线格式" {
+    const gpa = std.testing.allocator;
+
+    // 空输入
+    {
+        var aw: Io.Writer.Allocating = .init(gpa);
+        defer aw.deinit();
+        const ok = try parseSource(gpa, "", .plain, .tree, &aw.writer);
+        try std.testing.expect(ok);
+        try std.testing.expectEqualStrings(
+            \\source_file [0..0]
+            \\└── eof [0..0] ""
+            \\
+        , aw.written());
+    }
+
+    // 多层嵌套树与特殊字符转义
+    {
+        var aw: Io.Writer.Allocating = .init(gpa);
+        defer aw.deinit();
+        const ok = try parseSource(gpa, "let x = 1\n", .plain, .tree, &aw.writer);
+        try std.testing.expect(ok);
+        const out = aw.written();
+        try std.testing.expect(std.mem.startsWith(u8, out, "source_file [0..10]\n├── var_decl [0..9]\n"));
+        try std.testing.expect(std.mem.indexOf(u8, out, "│   ├── kw_let [0..3] \"let\"\n") != null);
+        try std.testing.expect(std.mem.indexOf(u8, out, "├── newline [9..10] \"\\n\"\n") != null);
+        try std.testing.expect(std.mem.endsWith(u8, out, "└── eof [10..10] \"\"\n"));
+    }
+}
+
+test "parseSource tree 模式 json 输出单个嵌套 JSON 并无损还原源码" {
+    const gpa = std.testing.allocator;
+    const src = "let x = 1 + 2\n";
+
+    var aw: Io.Writer.Allocating = .init(gpa);
+    defer aw.deinit();
+    const ok = try parseSource(gpa, src, .json, .tree, &aw.writer);
+    try std.testing.expect(ok);
+
+    const written = aw.written();
+    try std.testing.expect(written.len > 0 and written[written.len - 1] == '\n');
+    const trimmed = written[0 .. written.len - 1];
+    // 整个输出为单个嵌套 JSON，内部无未转义换行
+    try std.testing.expect(std.mem.indexOfScalar(u8, trimmed, '\n') == null);
+
+    const parsed = try std.json.parseFromSlice(std.json.Value, gpa, trimmed, .{});
+    defer parsed.deinit();
+
+    const root = parsed.value.object;
+    try std.testing.expectEqualStrings("source_file", root.get("kind").?.string);
+    try std.testing.expectEqual(@as(i64, @intCast(src.len)), root.get("text_len").?.integer);
+    try std.testing.expect(root.get("children").?.array.items.len >= 2);
+
+    var rebuilt: std.ArrayList(u8) = .empty;
+    defer rebuilt.deinit(gpa);
+    try collectJsonTreeText(gpa, parsed.value, &rebuilt);
+    try std.testing.expectEqualStrings(src, rebuilt.items);
+}
+
+test "parseTokenJsonStream tree 模式衔接 lexSource json 输出" {
+    const gpa = std.testing.allocator;
+    const src = "let x = 1\n";
+
+    var lex_out: Io.Writer.Allocating = .init(gpa);
+    defer lex_out.deinit();
+    try std.testing.expect(try lexSource(gpa, src, .json, &lex_out.writer));
+
+    // tree + json 输出可正常解析并保留总长度与节点结构
+    {
+        var tree_json: Io.Writer.Allocating = .init(gpa);
+        defer tree_json.deinit();
+        var reader: Io.Reader = .fixed(lex_out.written());
+        try std.testing.expect(try parseTokenJsonStream(gpa, &reader, .json, .tree, &tree_json.writer));
+
+        const parsed = try std.json.parseFromSlice(
+            std.json.Value,
+            gpa,
+            std.mem.trimEnd(u8, tree_json.written(), "\n"),
+            .{},
+        );
+        defer parsed.deinit();
+
+        const root = parsed.value.object;
+        try std.testing.expectEqualStrings("source_file", root.get("kind").?.string);
+        try std.testing.expectEqual(@as(i64, @intCast(src.len)), root.get("text_len").?.integer);
+    }
+
+    // tree + plain 输出包含框线与区间
+    {
+        var tree_plain: Io.Writer.Allocating = .init(gpa);
+        defer tree_plain.deinit();
+        var reader: Io.Reader = .fixed(lex_out.written());
+        try std.testing.expect(try parseTokenJsonStream(gpa, &reader, .plain, .tree, &tree_plain.writer));
+        const out = tree_plain.written();
+        try std.testing.expect(std.mem.startsWith(u8, out, "source_file [0..10]\n"));
+        try std.testing.expect(std.mem.endsWith(u8, out, "└── eof [10..10] \"\"\n"));
+    }
+}
+
+test "parseSource tree 模式容忍语法错误与非法 UTF-8 字节" {
+    const gpa = std.testing.allocator;
+
+    // 语法错误仍正常建树并输出合法嵌套 JSON
+    {
+        var aw: Io.Writer.Allocating = .init(gpa);
+        defer aw.deinit();
+        try std.testing.expect(try parseSource(gpa, "let = 1", .json, .tree, &aw.writer));
+
+        const parsed = try std.json.parseFromSlice(
+            std.json.Value,
+            gpa,
+            std.mem.trimEnd(u8, aw.written(), "\n"),
+            .{},
+        );
+        defer parsed.deinit();
+
+        var rebuilt: std.ArrayList(u8) = .empty;
+        defer rebuilt.deinit(gpa);
+        try collectJsonTreeText(gpa, parsed.value, &rebuilt);
+        try std.testing.expectEqualStrings("let = 1", rebuilt.items);
+    }
+
+    // 非法 UTF-8 字节在 plain 下转义为单行，在 json 下保持合法 JSON
+    {
+        const bad_utf8 = [_]u8{ 0xff, '\n' };
+        var plain_out: Io.Writer.Allocating = .init(gpa);
+        defer plain_out.deinit();
+        try std.testing.expect(try parseSource(gpa, &bad_utf8, .plain, .tree, &plain_out.writer));
+        try std.testing.expect(std.mem.indexOf(u8, plain_out.written(), "\"\\xff\"") != null);
+
+        var json_out: Io.Writer.Allocating = .init(gpa);
+        defer json_out.deinit();
+        try std.testing.expect(try parseSource(gpa, &bad_utf8, .json, .tree, &json_out.writer));
+        const parsed = try std.json.parseFromSlice(
+            std.json.Value,
+            gpa,
+            std.mem.trimEnd(u8, json_out.written(), "\n"),
+            .{},
+        );
+        defer parsed.deinit();
+        try std.testing.expectEqualStrings("source_file", parsed.value.object.get("kind").?.string);
+    }
 }
