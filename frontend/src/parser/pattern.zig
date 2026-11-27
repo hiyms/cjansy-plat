@@ -76,6 +76,17 @@ pub fn parsePattern(p: *Parser, allow_type_pattern: bool) std.mem.Allocator.Erro
     }
 }
 
+/// 解析 `patternsMaybeIrrefutable`（`let`/`var`/`const` 与 `for-in` 使用）。
+///
+/// 规范只允许通配、变量绑定、元组与枚举模式，常量模式（含 `()`）需要报错。
+pub fn parseMaybeIrrefutablePattern(p: *Parser, allow_type_pattern: bool) std.mem.Allocator.Error!void {
+    const start = p.events.items.len;
+    try parsePattern(p, allow_type_pattern);
+    if (p.nodeKindAt(start) == .const_pattern) {
+        try p.emitError(.expected_pattern);
+    }
+}
+
 /// 解析通配符模式 `_`。
 pub fn parseWildcardPattern(p: *Parser) std.mem.Allocator.Error!void {
     try p.startNode(.wildcard_pattern);
@@ -125,9 +136,11 @@ fn parseTuplePattern(p: *Parser, allow_type_pattern: bool) std.mem.Allocator.Err
     try p.startNode(.tuple_pattern);
     try p.emitLeadingTrivia(false);
     try p.bump(); // (
+    var count: usize = 0;
     while (!p.shouldStopList(.pattern_list)) {
         const before = p.cursor;
         try parsePattern(p, allow_type_pattern);
+        count += 1;
         if (try p.eat(.comma)) {
             continue;
         } else if (p.shouldStopList(.pattern_list)) {
@@ -141,6 +154,8 @@ fn parseTuplePattern(p: *Parser, allow_type_pattern: bool) std.mem.Allocator.Err
             try p.bumpErrorToken(.expected_pattern);
         }
     }
+    // 元组模式至少包含两个元素
+    if (count < 2) try p.emitError(.expected_pattern);
     _ = try p.expectClosing(.r_paren);
     try p.finishNode();
 }
@@ -173,9 +188,11 @@ fn parseIdentOrEnumPattern(p: *Parser, allow_type_pattern: bool, next: TokenTag)
     if (p.at(.l_paren)) {
         has_dot_or_paren = true;
         try p.bump(); // (
+        var arg_count: usize = 0;
         while (!p.shouldStopList(.pattern_list)) {
             const before = p.cursor;
             try parsePattern(p, allow_type_pattern);
+            arg_count += 1;
             if (try p.eat(.comma)) {
                 continue;
             } else if (p.shouldStopList(.pattern_list)) {
@@ -189,6 +206,8 @@ fn parseIdentOrEnumPattern(p: *Parser, allow_type_pattern: bool, next: TokenTag)
                 try p.bumpErrorToken(.expected_pattern);
             }
         }
+        // 枚举构造器参数表至少包含一个模式
+        if (arg_count == 0) try p.emitError(.expected_pattern);
         _ = try p.expectClosing(.r_paren);
     }
 
@@ -217,6 +236,8 @@ fn parseEnumPathSegment(p: *Parser) std.mem.Allocator.Error!bool {
     var parsed_args = false;
     if (p.at(.less)) {
         parsed_args = try type_parser.tryParsePatternTypeArguments(p);
+        // 类型实参只能附在 `compositeType` 前缀上，后面必须紧跟 `.`
+        if (parsed_args and p.peek() != .dot) try p.emitError(.expected_token);
     }
     try p.finishNode();
     return parsed_args;

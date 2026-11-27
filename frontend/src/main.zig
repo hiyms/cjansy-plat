@@ -526,23 +526,18 @@ fn parseTokens(
 ) !void {
     var parser = frontend.parser.Parser.new(gpa, source, tokens);
     defer parser.deinit();
+    try parser.parse();
 
     switch (output_type) {
         .event => {
-            while (try parser.gen()) |ev| {
+            for (parser.events.items) |ev| {
                 try writeEvent(gpa, out, format, ev);
             }
         },
         .tree => {
-            var events: std.ArrayList(common.Event) = .empty;
-            defer events.deinit(gpa);
-            while (try parser.gen()) |ev| {
-                try events.append(gpa, ev);
-            }
-
             var arena = std.heap.ArenaAllocator.init(gpa);
             defer arena.deinit();
-            const tree = try frontend.treeBuild(gpa, arena.allocator(), source, events.items);
+            const tree = try frontend.treeBuild(gpa, arena.allocator(), source, parser.events.items);
             try writeTree(gpa, out, format, tree);
         },
     }

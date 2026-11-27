@@ -199,7 +199,7 @@ Lossless CST 全部叶子与内部节点标签，包含：
 
 - 空白、换行与三类注释：`whitespace`、`newline`、`line_comment`、`block_comment`、`doc_comment`、`eof`、`illegal`。
 - 标识符、字面量、运算符、分隔符与关键字（含语法期组合标签 `coalescing`、`rshift`、`rshift_assign`、`greater_equal` 与插值文本片段 `string_content`）。
-- 源文件、特性、包、导入、注解、声明、声明体、语句块、泛型、参数、路径、类型、模式、表达式、语句、宏/quote 原始片段与 `error_node`。
+- 源文件、特性、包、导入、注解、声明、声明体、语句块、泛型、参数、路径、类型、模式、表达式、语句、宏/quote 原始片段与 `error_node`。`error_node` 覆盖无法按语法解析的词法单元，以及出现在非法位置的声明；后者的内部节点是正常解析得到的声明节点。
 
 顶层可通过 `common.SyntaxKind` 访问。
 
@@ -253,10 +253,11 @@ pub const ParseErrorCode = enum(u8) {
     unexpected_token,
     invalid_interpolation,
     dangling_doc_comment,
+    invalid_declaration_position,
 };
 ```
 
-语法分析阶段可遇到的错误码。顶层可通过 `common.ParseErrorCode` 访问。
+语法分析阶段可遇到的错误码。`invalid_declaration_position` 表示声明类别或修饰符与所在作用域不相容：parser 记录该错误码，并把正常解析得到的声明节点包在 `error_node` 内。顶层可通过 `common.ParseErrorCode` 访问。
 
 ### `ParseError`
 
@@ -322,26 +323,6 @@ pub const Event = union(enum) {
 ```
 
 `start_node` 与 `wrap_node` 的总发射次数与 `finish_node` 严格相等；位置信息仅由 `token` 与 `parse_error` 携带。顶层可通过 `common.Event`、`common.TokenEvent` 访问。
-
-### `CompactEvent`
-
-```zig
-pub const CompactEvent = struct {
-    pub const Tag = enum(u8) { start_node, wrap_node, token, finish_node, parse_error };
-    range: TextRange,
-    payload: u16,
-    tag: Tag,
-
-    pub inline fn startNode(kind: SyntaxKind) CompactEvent
-    pub inline fn wrapNode(kind: SyntaxKind) CompactEvent
-    pub inline fn token(kind: SyntaxKind, range: TextRange) CompactEvent
-    pub inline fn finishNode() CompactEvent
-    pub inline fn parseError(err: ParseError) CompactEvent
-    pub inline fn toEvent(self: CompactEvent) Event
-};
-```
-
-12 字节的紧凑事件存储，避免对外 `Event` 联合体的尾部填充开销。顶层可通过 `common.CompactEvent` 访问。
 
 ---
 

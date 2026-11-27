@@ -64,6 +64,144 @@ const InfixInfo = struct {
     combined: ?CombinedOp = null,
 };
 
+/// 只读判断最后一个事件是否为不能作为左值的字面量叶子。
+///
+/// 字面量直接以 token 事件发射，没有对应节点，因此 `1 = 2` 这类写法需要单独检查。
+fn lastExprIsLiteralToken(p: *const Parser) bool {
+    if (p.events.items.len == 0) return false;
+    return switch (p.events.items[p.events.items.len - 1]) {
+        .token => |tok| switch (tok.kind) {
+            .integer_literal,
+            .float_literal,
+            .rune_literal,
+            .rune_byte_literal,
+            .string_literal,
+            .multiline_string,
+            .multiline_raw_string,
+            .bool_literal,
+            .unit_literal,
+            => true,
+            else => false,
+        },
+        else => false,
+    };
+}
+
+/// 只读判断路径节点是否以普通标识符或标识符字段访问结束。
+///
+/// 供赋值左值与尾随闭包调用者判定使用：`a`、`a.b`、`a?.b` 通过，`this`、`super`、
+/// `This` 与基础类型关键字单独出现时不通过。
+fn pathEndsWithIdentifier(p: *const Parser, start: usize) bool {
+    var idx = start + 1;
+    var depth: usize = 0;
+    var last_segment: ?usize = null;
+    while (idx < p.events.items.len) : (idx += 1) {
+        switch (p.events.items[idx]) {
+            .start_node, .wrap_node => {
+                if (depth == 0) last_segment = idx;
+                depth += 1;
+            },
+            .finish_node => {
+                if (depth == 0) break;
+                depth -= 1;
+            },
+            .token => |tok| {
+                // 出现字段访问或多段路径时，末尾一定是标识符字段
+                if (depth == 0 and tok.kind == .dot) return true;
+            },
+            .parse_error => {},
+        }
+    }
+    const seg = last_segment orelse return false;
+    if (p.nodeKindAt(seg) != .path_segment) return false;
+    return segmentStartsWithIdentifier(p, seg);
+}
+
+/// 只读判断路径段的第一个有效词法单元是否为普通标识符。
+fn segmentStartsWithIdentifier(p: *const Parser, seg_start: usize) bool {
+    var idx = seg_start + 1;
+    while (idx < p.events.items.len) : (idx += 1) {
+        switch (p.events.items[idx]) {
+            .start_node, .wrap_node, .finish_node => return false,
+            .token => |tok| switch (tok.kind) {
+                .whitespace, .newline, .line_comment, .block_comment, .doc_comment => continue,
+                .identifier => return true,
+                else => return false,
+            },
+            .parse_error => {},
+        }
+    }
+    return false;
+}
+
+/// 只读判断 `call_expr` 的被调用者是否为函数名或变量名路径。
+fn callCalleeIsName(p: *const Parser, start: usize) bool {
+    var idx = start + 1;
+    while (idx < p.events.items.len) : (idx += 1) {
+        switch (p.events.items[idx]) {
+            .start_node, .wrap_node => {
+                if (p.nodeKindAt(idx) != .path_expr) return false;
+                return pathEndsWithIdentifier(p, idx);
+            },
+            .finish_node => return false,
+            .token => |tok| switch (tok.kind) {
+                .whitespace, .newline, .line_comment, .block_comment, .doc_comment => continue,
+                else => return false,
+            },
+            .parse_error => {},
+        }
+    }
+    return false;
+}
+
+/// 只读判断最后一个完整节点是否可以接受尾随闭包。
+fn canTakeTrailingClosure(p: *const Parser) bool {
+    const start = p.lastNodeStart() orelse return false;
+    return switch (p.nodeKindAt(start) orelse return false) {
+        .path_expr => pathEndsWithIdentifier(p, start),
+        .call_expr => callCalleeIsName(p, start),
+        else => false,
+    };
+}
+
+/// 只读判断以 `start` 起始的节点是否为可赋值左值。
+fn isAssignableNode(p: *const Parser, start: usize, allow_wildcard: bool) bool {
+    return switch (p.nodeKindAt(start) orelse return false) {
+        .path_expr => pathEndsWithIdentifier(p, start),
+        .subscript_expr => true,
+        .tuple_lit => tupleIsAssignable(p, start, allow_wildcard),
+        .wildcard_expr => allow_wildcard,
+        else => false,
+    };
+}
+
+/// 只读判断元组左值的每个元素是否都可赋值，且元素数量不少于两个。
+fn tupleIsAssignable(p: *const Parser, start: usize, allow_wildcard: bool) bool {
+    var idx = start + 1;
+    var count: usize = 0;
+    while (idx < p.events.items.len) : (idx += 1) {
+        switch (p.events.items[idx]) {
+            .start_node, .wrap_node => {
+                count += 1;
+                if (!isAssignableNode(p, idx, allow_wildcard)) return false;
+                var depth: usize = 1;
+                idx += 1;
+                while (idx < p.events.items.len and depth > 0) : (idx += 1) {
+                    switch (p.events.items[idx]) {
+                        .start_node, .wrap_node => depth += 1,
+                        .finish_node => depth -= 1,
+                        else => {},
+                    }
+                }
+                idx -= 1;
+            },
+            .finish_node => break,
+            else => {},
+        }
+    }
+    return count >= 2;
+}
+
 /// 解析完整语句块 `{ stmt_list }`，内部重置上下文限制以允许正常尾随闭包。
 pub fn parseBlock(p: *Parser) std.mem.Allocator.Error!void {
     if (!try p.enterDepth()) return;
@@ -93,14 +231,20 @@ pub fn parseStmtList(p: *Parser, stop_tag: TokenTag, stop_at_case: bool) std.mem
         if (stop_at_case and cur == .kw_case) break;
 
         const before = p.cursor;
-        if (decl.peekLocalDeclKind(p)) |decl_kind| {
+        const error_count_before = p.errors.items.len;
+        const consumed_semi = if (decl.peekLocalDeclKind(p)) |decl_kind| blk: {
             try decl.parseDeclWithKind(p, .local_block, decl_kind);
-        } else {
-            try parseExprStmt(p);
-        }
+            break :blk false;
+        } else try parseExprStmt(p);
 
         if (p.cursor == before) {
             try p.bumpErrorRun(.expected_expression, true);
+        } else if (!consumed_semi and p.errors.items.len == error_count_before and
+            !p.atStmtTerminator() and !(stop_at_case and p.peek() == .kw_case))
+        {
+            // 同一行内相邻的表达式或声明之间必须用 `;` 或换行分隔；
+            // 本条语句已有诊断时不再叠加分隔符错误
+            try p.emitError(.expected_token);
         }
         count += 1;
         _ = try p.eatSemicolons();
@@ -110,8 +254,8 @@ pub fn parseStmtList(p: *Parser, stop_tag: TokenTag, stop_at_case: bool) std.mem
     return count;
 }
 
-/// 解析表达式语句 `expression_statement`（含同行尾随可选 `;`）。
-fn parseExprStmt(p: *Parser) std.mem.Allocator.Error!void {
+/// 解析表达式语句 `expression_statement`（含同行尾随可选 `;`），返回是否消费了 `;`。
+fn parseExprStmt(p: *Parser) std.mem.Allocator.Error!bool {
     try p.startNode(.expression_statement);
     try p.emitLeadingTrivia(false);
     const lhs = try parseExprBp(p, Prec.lowest);
@@ -122,10 +266,13 @@ fn parseExprStmt(p: *Parser) std.mem.Allocator.Error!void {
             try p.bumpErrorRun(null, true);
         }
     }
+    var consumed_semi = false;
     if (p.peekNoNl() == .semi) {
         try p.bumpNoNl();
+        consumed_semi = true;
     }
     try p.finishNode();
+    return consumed_semi;
 }
 
 /// 解析完整表达式（默认允许尾随闭包与区间步长）。
@@ -167,6 +314,11 @@ fn parseExprBp(p: *Parser, min_prec: u8) std.mem.Allocator.Error!LhsKind {
 
         switch (info.kind) {
             .assign => {
+                const lhs_assignable = if (p.lastNodeStart()) |lhs_start|
+                    isAssignableNode(p, lhs_start, p.peek() == .assign)
+                else
+                    !lastExprIsLiteralToken(p);
+                if (!lhs_assignable) try p.emitError(.invalid_assignment_target);
                 try p.wrapNode(.assign_expr);
                 if (info.combined) |comb| {
                     try p.bumpCombined(comb, true);
@@ -179,12 +331,16 @@ fn parseExprBp(p: *Parser, min_prec: u8) std.mem.Allocator.Error!LhsKind {
                 last_non_assoc_prec = Prec.assign;
             },
             .range => {
+                const op_tag = p.sig_tag;
                 try p.wrapNode(.range_expr);
                 try p.bump(); // .. or ..=
                 const omit_end = p.restrictions.allow_open_range_end and
                     (p.at(.r_square) or p.at(.comma) or p.at(.colon));
                 if (!omit_end) {
                     _ = try parseExprBp(p, Prec.shift);
+                } else if (op_tag == .closed_range_op) {
+                    // 闭区间不可省略右端点
+                    try p.emitError(.expected_expression);
                 }
                 if (p.restrictions.allow_range_colon and p.at(.colon)) {
                     try p.bump(); // :
@@ -366,14 +522,10 @@ inline fn peekInfixOp(p: *const Parser) ?InfixInfo {
             .right_prec = Prec.additive + 1,
             .kind = .binary,
         },
-        .sub => blk: {
-            // 新行开头的 `-` 按独立语句的一元负号处理，不与上一行合并为二元减法
-            if (p.hasNewlineBefore()) break :blk null;
-            break :blk .{
-                .prec = Prec.additive,
-                .right_prec = Prec.additive + 1,
-                .kind = .binary,
-            };
+        .sub => .{
+            .prec = Prec.additive,
+            .right_prec = Prec.additive + 1,
+            .kind = .binary,
         },
         .mul, .div, .mod => .{
             .prec = Prec.multiplicative,
@@ -477,7 +629,7 @@ fn parsePostfixExpr(p: *Parser) std.mem.Allocator.Error!LhsKind {
                 lhs = .general;
             },
             .l_curl => {
-                if (!p.restrictions.allow_trailing_closure) break;
+                if (!canTakeTrailingClosure(p)) break;
                 if (p.depth >= parser_mod.max_recursion_depth) {
                     try p.emitError(.recursive_depth_limit);
                     break;
@@ -489,8 +641,8 @@ fn parsePostfixExpr(p: *Parser) std.mem.Allocator.Error!LhsKind {
             },
             .at => {
                 // 支持带内置注解的尾随闭包，如 `foo @OverflowWrapping { x => x + 1 }`
-                if (!p.restrictions.allow_trailing_closure) break;
                 if (!isAnnotatedTrailingLambdaSameLine(p)) break;
+                if (!canTakeTrailingClosure(p)) break;
                 if (p.depth >= parser_mod.max_recursion_depth) {
                     try p.emitError(.recursive_depth_limit);
                     break;
@@ -535,7 +687,7 @@ fn parsePostfixExpr(p: *Parser) std.mem.Allocator.Error!LhsKind {
                         lhs = .general;
                     },
                     .l_curl => {
-                        if (!p.restrictions.allow_trailing_closure) break;
+                        // 可选链中的尾随 lambda 属于 `questSeperatedItem` 的合法形态
                         if (p.depth >= parser_mod.max_recursion_depth) {
                             try p.emitError(.recursive_depth_limit);
                             break;
@@ -804,7 +956,6 @@ fn parseLetConditionDestructor(p: *Parser) std.mem.Allocator.Error!void {
     if (try p.expect(.backarrow)) {
         const saved = p.restrictions;
         p.restrictions = .{
-            .allow_trailing_closure = false,
             .allow_range_colon = true,
             .allow_let_condition = false,
         };
@@ -887,7 +1038,7 @@ fn parseVArrayExpr(p: *Parser) std.mem.Allocator.Error!void {
     try type_parser.parseVArrayType(p);
     if (p.peekNoNl() == .l_paren) {
         try parseCallArgs(p);
-    } else if (p.peekNoNl() == .l_curl and p.restrictions.allow_trailing_closure) {
+    } else if (p.peekNoNl() == .l_curl) {
         try parseLambdaExpr(p, true, false);
     }
     try p.finishNode();
@@ -935,11 +1086,13 @@ fn parenExprHasTopComma(p: *const Parser) bool {
     return scanTopCommaInParenFrom(p, start_idx + 1);
 }
 
-/// 解析 `tuple_lit` 中剩余的逗号分隔元素直到闭合 `)` 或外层同步边界。
-fn parseTupleTailElements(p: *Parser) std.mem.Allocator.Error!void {
+/// 解析 `tuple_lit` 中剩余的逗号分隔元素直到闭合 `)` 或外层同步边界，返回解析出的元素数量。
+fn parseTupleTailElements(p: *Parser) std.mem.Allocator.Error!usize {
+    var count: usize = 0;
     while (!p.shouldStopList(.paren_expr_list)) {
         const before = p.cursor;
         _ = try parseExprWithRestrictions(p, .{});
+        count += 1;
         if (try p.eat(.comma)) {
             continue;
         } else if (p.shouldStopList(.paren_expr_list)) {
@@ -951,6 +1104,7 @@ fn parseTupleTailElements(p: *Parser) std.mem.Allocator.Error!void {
         }
         if (p.cursor == before) try p.bumpErrorToken(.expected_expression);
     }
+    return count;
 }
 
 /// 解析 `()`（`unit_literal`）、`(expr)`（`paren_expr`）或 `(e1, e2, ...)`（`tuple_lit`）。
@@ -970,14 +1124,14 @@ fn parseParenUnitOrTupleExpr(p: *Parser) std.mem.Allocator.Error!LhsKind {
             try p.startNode(.tuple_lit);
             try p.emitLeadingTrivia(false);
             try p.bump(); // (
-            try parseTupleTailElements(p);
+            const count = try parseTupleTailElements(p);
+            if (count < 2) try p.emitError(.expected_expression);
             _ = try p.expectClosing(.r_paren);
             try p.finishNode();
             return .general;
         }
 
         const inner_r: parser_mod.Restrictions = .{
-            .allow_trailing_closure = true,
             .allow_range_colon = true,
             .allow_let_condition = true,
         };
@@ -998,7 +1152,8 @@ fn parseParenUnitOrTupleExpr(p: *Parser) std.mem.Allocator.Error!LhsKind {
     _ = try parseExprWithRestrictions(p, .{});
     if (try p.eat(.comma)) {
         p.setNodeKindAt(start_ev_idx, .tuple_lit);
-        try parseTupleTailElements(p);
+        const tail = try parseTupleTailElements(p);
+        if (1 + tail < 2) try p.emitError(.expected_expression);
     } else if (p.sig_tag != .r_paren and
         !p.shouldStopList(.paren_expr_list) and
         p.canStartExpr() and
@@ -1007,7 +1162,8 @@ fn parseParenUnitOrTupleExpr(p: *Parser) std.mem.Allocator.Error!LhsKind {
         // 错误恢复冷路径：首元素后漏逗号但括号内后续仍存在顶层逗号（如 `(a b, c)`）
         p.setNodeKindAt(start_ev_idx, .tuple_lit);
         try p.emitError(.expected_token);
-        try parseTupleTailElements(p);
+        const tail = try parseTupleTailElements(p);
+        if (1 + tail < 2) try p.emitError(.expected_expression);
     }
     _ = try p.expectClosing(.r_paren);
     try p.finishNode();
@@ -1077,14 +1233,19 @@ pub fn parseFuncArg(p: *Parser) std.mem.Allocator.Error!void {
 fn parseSubscriptArgs(p: *Parser) std.mem.Allocator.Error!void {
     try p.bumpNoNl(); // [
 
+    var count: usize = 0;
     while (!p.shouldStopList(.square_expr_list)) {
         const before = p.cursor;
         if (p.at(.range_op) or p.at(.closed_range_op)) {
+            const op_tag = p.sig_tag;
             try p.startNode(.range_expr);
             try p.emitLeadingTrivia(false);
             try p.bump(); // .. or ..=
             if (!p.shouldStopList(.square_expr_list) and !p.at(.comma) and !p.at(.colon)) {
                 _ = try parseExprBp(p, Prec.shift);
+            } else if (op_tag == .closed_range_op) {
+                // 闭区间不可省略右端点
+                try p.emitError(.expected_expression);
             }
             if (try p.eat(.colon)) {
                 _ = try parseExprBp(p, Prec.shift);
@@ -1092,11 +1253,11 @@ fn parseSubscriptArgs(p: *Parser) std.mem.Allocator.Error!void {
             try p.finishNode();
         } else {
             _ = try parseExprWithRestrictions(p, .{
-                .allow_trailing_closure = true,
                 .allow_range_colon = true,
                 .allow_open_range_end = true,
             });
         }
+        count += 1;
 
         if (try p.eat(.comma)) {
             continue;
@@ -1110,6 +1271,7 @@ fn parseSubscriptArgs(p: *Parser) std.mem.Allocator.Error!void {
         if (p.cursor == before) try p.bumpErrorToken(.expected_expression);
     }
 
+    if (count == 0) try p.emitError(.expected_expression);
     _ = try p.expectClosing(.r_square);
 }
 
@@ -1121,17 +1283,18 @@ fn parseIfExpr(p: *Parser) std.mem.Allocator.Error!void {
     try p.startNode(.if_expr);
     try p.emitLeadingTrivia(false);
     try p.bump(); // if
+    var paren_closed = false;
     if (try p.expect(.l_paren)) {
         _ = try parseExprWithRestrictions(p, .{
-            .allow_trailing_closure = false,
             .allow_range_colon = true,
             .allow_let_condition = true,
         });
-        _ = try p.expectClosing(.r_paren);
+        paren_closed = try p.expectClosing(.r_paren);
     }
     if (p.at(.l_curl)) {
         try parseBlock(p);
-    } else {
+    } else if (paren_closed) {
+        // 已报告缺失闭合 `)` 时不再叠加“缺少函数体”
         try p.emitError(.expected_block);
     }
     if (try p.eat(.kw_else)) {
@@ -1156,11 +1319,12 @@ fn parseMatchExpr(p: *Parser) std.mem.Allocator.Error!void {
     if (p.at(.l_paren)) {
         has_selector = true;
         try p.bump(); // (
-        _ = try parseExprWithRestrictions(p, .{ .allow_trailing_closure = false });
+        _ = try parseExprWithRestrictions(p, .{});
         _ = try p.expectClosing(.r_paren);
     }
 
     if (try p.expect(.l_curl)) {
+        var case_count: usize = 0;
         while (!p.isAtEof() and !p.at(.r_curl)) {
             _ = try p.eatSemicolons();
             if (p.at(.r_curl) or p.isAtEof()) break;
@@ -1171,11 +1335,13 @@ fn parseMatchExpr(p: *Parser) std.mem.Allocator.Error!void {
                 } else {
                     try parseMatchCaseOther(p);
                 }
+                case_count += 1;
             } else {
                 try p.bumpErrorToken(.expected_token);
             }
             if (p.cursor == before) try p.bumpErrorToken(.expected_token);
         }
+        if (case_count == 0) try p.emitError(.expected_item);
         _ = try p.expectClosing(.r_curl);
     }
 
@@ -1194,8 +1360,9 @@ fn parseMatchCase(p: *Parser) std.mem.Allocator.Error!void {
     if (p.at(.kw_where)) {
         try parsePatternGuard(p);
     }
-    _ = try p.expect(.double_arrow);
-    _ = try parseStmtList(p, .r_curl, true);
+    const has_arrow = try p.expect(.double_arrow);
+    const body_count = try parseStmtList(p, .r_curl, true);
+    if (has_arrow and body_count == 0) try p.emitError(.expected_expression);
     try p.finishNode();
 }
 
@@ -1207,10 +1374,11 @@ fn parseMatchCaseOther(p: *Parser) std.mem.Allocator.Error!void {
     if (p.at(.wildcard) and p.peekNth(1) == .double_arrow) {
         try pattern.parseWildcardPattern(p);
     } else {
-        _ = try parseExprWithRestrictions(p, .{ .allow_trailing_closure = false });
+        _ = try parseExprWithRestrictions(p, .{});
     }
-    _ = try p.expect(.double_arrow);
-    _ = try parseStmtList(p, .r_curl, true);
+    const has_arrow = try p.expect(.double_arrow);
+    const body_count = try parseStmtList(p, .r_curl, true);
+    if (has_arrow and body_count == 0) try p.emitError(.expected_expression);
     try p.finishNode();
 }
 
@@ -1219,7 +1387,7 @@ fn parsePatternGuard(p: *Parser) std.mem.Allocator.Error!void {
     try p.startNode(.pattern_guard);
     try p.emitLeadingTrivia(false);
     try p.bump(); // where
-    _ = try parseExprWithRestrictions(p, .{ .allow_trailing_closure = false });
+    _ = try parseExprWithRestrictions(p, .{});
     try p.finishNode();
 }
 
@@ -1230,7 +1398,6 @@ fn parseWhileExpr(p: *Parser) std.mem.Allocator.Error!void {
     try p.bump(); // while
     if (try p.expect(.l_paren)) {
         _ = try parseExprWithRestrictions(p, .{
-            .allow_trailing_closure = false,
             .allow_range_colon = true,
             .allow_let_condition = true,
         });
@@ -1256,7 +1423,7 @@ fn parseDoWhileExpr(p: *Parser) std.mem.Allocator.Error!void {
     }
     if (try p.expect(.kw_while)) {
         if (try p.expect(.l_paren)) {
-            _ = try parseExprWithRestrictions(p, .{ .allow_trailing_closure = false });
+            _ = try parseExprWithRestrictions(p, .{});
             _ = try p.expectClosing(.r_paren);
         }
     }
@@ -1269,9 +1436,9 @@ fn parseForInExpr(p: *Parser) std.mem.Allocator.Error!void {
     try p.emitLeadingTrivia(false);
     try p.bump(); // for
     if (try p.expect(.l_paren)) {
-        try pattern.parsePattern(p, false);
+        try pattern.parseMaybeIrrefutablePattern(p, false);
         if (try p.expect(.kw_in)) {
-            _ = try parseExprWithRestrictions(p, .{ .allow_trailing_closure = false });
+            _ = try parseExprWithRestrictions(p, .{});
         }
         if (p.at(.kw_where)) {
             try parsePatternGuard(p);
@@ -1292,11 +1459,15 @@ fn parseTryExpr(p: *Parser) std.mem.Allocator.Error!void {
     try p.emitLeadingTrivia(false);
     try p.bump(); // try
 
+    var resource_form = false;
     if (p.at(.l_paren)) {
+        resource_form = true;
+        var resource_count: usize = 0;
         try p.bump(); // (
         while (!p.shouldStopList(.paren_expr_list)) {
             const before = p.cursor;
             try parseResourceSpec(p);
+            resource_count += 1;
             if (try p.eat(.comma)) {
                 if (p.shouldStopList(.paren_expr_list)) break;
             } else if (p.peek().isIdentLike() and !p.shouldStopList(.paren_expr_list)) {
@@ -1306,6 +1477,7 @@ fn parseTryExpr(p: *Parser) std.mem.Allocator.Error!void {
             }
             if (p.cursor == before) try p.bumpErrorToken(.expected_identifier);
         }
+        if (resource_count == 0) try p.emitError(.expected_identifier);
         _ = try p.expectClosing(.r_paren);
     }
 
@@ -1315,12 +1487,14 @@ fn parseTryExpr(p: *Parser) std.mem.Allocator.Error!void {
         try p.emitError(.expected_block);
     }
 
+    var has_handler = false;
     while (p.at(.kw_catch) or p.at(.kw_handle)) {
         if (p.at(.kw_catch)) {
             try parseCatchClause(p);
         } else {
             try parseHandleClause(p);
         }
+        has_handler = true;
     }
 
     if (p.at(.kw_finally)) {
@@ -1333,7 +1507,11 @@ fn parseTryExpr(p: *Parser) std.mem.Allocator.Error!void {
             try p.emitError(.expected_block);
         }
         try p.finishNode();
+        has_handler = true;
     }
+
+    // 非资源形式的 try 至少需要一个 catch/handle 或 finally
+    if (!resource_form and !has_handler) try p.emitError(.expected_token);
 
     try p.finishNode();
 }
@@ -1400,8 +1578,11 @@ fn parseReturnExpr(p: *Parser) std.mem.Allocator.Error!void {
     try p.startNode(.return_expr);
     try p.emitLeadingTrivia(false);
     try p.bump(); // return
-    const next_no_nl = p.peekNoNl();
-    if (!p.atStmtTerminator() and next_no_nl != .comma and next_no_nl != .kw_case) {
+    // 按最长匹配原则，`return` 后可跨换行接表达式；声明起点、分号、闭定界符与 `case` 仍终止
+    const next = p.peek();
+    if (!p.isNewlineDeclBoundary() and next != .semi and next != .r_curl and
+        next != .r_paren and next != .r_square and next != .end and next != .comma and next != .kw_case)
+    {
         try parseExpr(p);
     }
     try p.finishNode();
@@ -1443,7 +1624,7 @@ fn parseSpawnExpr(p: *Parser) std.mem.Allocator.Error!void {
     try p.bump(); // spawn
     if (p.at(.l_paren)) {
         try p.bump();
-        _ = try parseExprWithRestrictions(p, .{ .allow_trailing_closure = false });
+        _ = try parseExprWithRestrictions(p, .{});
         _ = try p.expectClosing(.r_paren);
     }
     if (p.at(.l_curl)) {
@@ -1460,7 +1641,7 @@ fn parseSynchronizedExpr(p: *Parser) std.mem.Allocator.Error!void {
     try p.emitLeadingTrivia(false);
     try p.bump(); // synchronized
     if (try p.expect(.l_paren)) {
-        _ = try parseExprWithRestrictions(p, .{ .allow_trailing_closure = false });
+        _ = try parseExprWithRestrictions(p, .{});
         _ = try p.expectClosing(.r_paren);
     }
     if (p.at(.l_curl)) {
@@ -1563,7 +1744,7 @@ fn parseLambdaExpr(p: *Parser, allow_omitted_arrow: bool, has_leading_annotation
             try p.emitLeadingTrivia(false);
             while (!p.isAtEof() and !p.at(.double_arrow) and !p.at(.r_curl) and !p.isNewlineDeclBoundary()) {
                 const before = p.cursor;
-                try decl.parseFuncParam(p, false);
+                try decl.parseFuncParam(p, .lambda);
                 if (try p.eat(.comma)) {
                     if (p.at(.double_arrow) or p.at(.r_curl)) break;
                 } else if ((p.peek().isIdentLike() or p.at(.wildcard)) and !p.isNewlineDeclBoundary()) {
@@ -2019,7 +2200,8 @@ fn parseInterpolationTokens(
     p.setCursor(0);
 
     try p.startNode(.block);
-    _ = try parseStmtList(p, .end, false);
+    const stmt_count = try parseStmtList(p, .end, false);
+    if (stmt_count == 0) try p.emitError(.expected_expression);
     try p.finishNode();
     try p.emitTrivia(true, false);
     try p.emitTrailingWhitespace();

@@ -114,6 +114,8 @@ pub fn parsePathType(p: *Parser) std.mem.Allocator.Error!void {
     try p.bumpAs(.identifier);
     if (p.at(.less)) {
         try parseTypeArgumentList(p);
+        // 类型实参只能附在路径末段
+        if (p.at(.dot)) try p.emitError(.expected_token);
     }
     try p.finishNode();
     while (p.at(.dot)) {
@@ -133,6 +135,8 @@ fn parseTypePathSegment(p: *Parser) std.mem.Allocator.Error!void {
         _ = try p.expectIdent();
         if (p.at(.less)) {
             try parseTypeArgumentList(p);
+            // 类型实参只能附在路径末段
+            if (p.at(.dot)) try p.emitError(.expected_token);
         }
     }
     try p.finishNode();
@@ -151,6 +155,11 @@ pub fn parseTypeArgumentList(p: *Parser) std.mem.Allocator.Error!void {
     while (!p.shouldStopList(.type_arg_list)) {
         if (count > 0) {
             if (try p.eat(.comma)) {
+                if (p.at(.greater)) {
+                    // 类型实参表不允许尾随逗号
+                    try p.emitError(.expected_type);
+                    break;
+                }
                 if (p.shouldStopList(.type_arg_list)) break;
             } else if (canStartType(p)) {
                 // 列表内漏敲逗号：报告一次缺失分隔符并继续解析下一类型实参
@@ -259,9 +268,18 @@ fn parseParenTupleOrFuncType(p: *Parser) std.mem.Allocator.Error!void {
     try p.bump(); // (
 
     if (!p.at(.r_paren)) {
+        var count: usize = 0;
+        var first_labeled: ?bool = null;
         while (!p.shouldStopList(.paren_type_list)) {
             const before = p.cursor;
-            try parseOptionalLabeledType(p);
+            const labeled = try parseOptionalLabeledType(p);
+            if (first_labeled) |first| {
+                // 同一类型内的标签必须全有或全无
+                if (first != labeled) try p.emitError(.expected_token);
+            } else {
+                first_labeled = labeled;
+            }
+            count += 1;
             if (try p.eat(.comma)) {
                 continue;
             } else if (p.shouldStopList(.paren_type_list)) {
@@ -274,6 +292,10 @@ fn parseParenTupleOrFuncType(p: *Parser) std.mem.Allocator.Error!void {
             if (p.cursor == before) {
                 try p.bumpErrorToken(.expected_type);
             }
+        }
+        // 命名元组至少需要两个元素
+        if (node_kind == .tuple_type and count < 2 and first_labeled == true) {
+            try p.emitError(.expected_type);
         }
     } else if (node_kind == .tuple_type) {
         try p.emitError(.expected_type);
@@ -288,13 +310,15 @@ fn parseParenTupleOrFuncType(p: *Parser) std.mem.Allocator.Error!void {
     try p.finishNode();
 }
 
-/// 解析可选带参数名标签的类型元素（`ident : Type` 或 `Type`）。
-fn parseOptionalLabeledType(p: *Parser) std.mem.Allocator.Error!void {
-    if (p.peek().isIdentLike() and p.peekNth(1) == .colon) {
+/// 解析可选带参数名标签的类型元素（`ident : Type` 或 `Type`），返回是否带标签。
+fn parseOptionalLabeledType(p: *Parser) std.mem.Allocator.Error!bool {
+    const labeled = p.peek().isIdentLike() and p.peekNth(1) == .colon;
+    if (labeled) {
         try p.bumpAs(.identifier);
         try p.bump(); // :
     }
     try parseType(p);
+    return labeled;
 }
 
 /// 零分配只读快速预检：判断当前同行 `<` 起是否可能构成无错误的表达式泛型实参列表，

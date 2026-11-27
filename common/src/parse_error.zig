@@ -35,6 +35,7 @@ pub const ParseErrorCode = enum(u8) {
     unexpected_token,
     invalid_interpolation,
     dangling_doc_comment,
+    invalid_declaration_position,
 };
 
 /// 语法分析错误，携带错误码与源码字节区间。
@@ -149,6 +150,10 @@ pub fn parseErrorToDiagnostic(
             try std.fmt.allocPrint(allocator, "unexpected token `{s}`", .{s})
         else
             "unexpected token",
+        .invalid_declaration_position => if (extractSnippet(source, err.range)) |s|
+            try std.fmt.allocPrint(allocator, "declaration is not allowed in this position near `{s}`", .{s})
+        else
+            "declaration is not allowed in this position",
     };
 
     return .{
@@ -198,6 +203,7 @@ test "ParseError.toDiagnostic 无效区间退化为静态消息" {
         .expected_block,
         .illegal_token,
         .unexpected_token,
+        .invalid_declaration_position,
     };
     const invalid_ranges = [_]TextRange{
         .{ .start = 0, .end = 0 },
@@ -228,6 +234,7 @@ test "ParseError.toDiagnostic 源码片段按 UTF-8 码点边界截断" {
         .expected_block,
         .illegal_token,
         .unexpected_token,
+        .invalid_declaration_position,
     };
 
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);

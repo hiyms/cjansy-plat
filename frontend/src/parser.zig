@@ -4,7 +4,8 @@
 
 //! 仓颉源码的语法解析器。
 //!
-//! 以事件流（`Event`）形式产出 Lossless CST 构建指令，交由下游 `GreenBuilder` 构造只读绿树。
+//! 非流式设计：`parse` 一次性完成整份输入的解析，完整事件流写入 `events` 成员，交由下游
+//! `GreenBuilder` 构造只读绿树；调用者是直接从 `events.items` 读取事件，无需逐个拉取。
 //! 表达式部分使用 Pratt 解析，其余部分使用递归下降，并严格遵循三项核心不变式：
 //! 1. 只读前瞻：所有 `peek*` 方法只读取游标，不向事件流发射任何词法单元。
 //! 2. 完全的前导 Trivia 发射：所有空白（`whitespace`）、换行（`newline`）与注释均作为后续语法节点或
@@ -41,16 +42,12 @@ pub const TokenEvent = common.TokenEvent;
 
 /// 解析事件，定义于 `common.event`。
 ///
-/// Parser 只产生事件而把 Green CST 构建交给 GreenBuilder，以保证绿树的只读性。
+/// Parser 解析完整份输入后从 `events.items` 暴露完整事件流，把 Green CST 构建交给 GreenBuilder，
+/// 以保证绿树的只读性。
 pub const Event = common.Event;
 
-/// 内部紧凑事件存储，定义于 `common.event`。
-const CompactEvent = common.CompactEvent;
-
-/// 解析上下文限制标志，控制尾随闭包、区间步长、半开切片与 `if`/`while` 的 `let` 解构条件。
+/// 解析上下文限制标志，控制区间步长、半开切片与 `if`/`while` 的 `let` 解构条件。
 pub const Restrictions = packed struct {
-    /// 是否允许表达式后紧跟尾随 lambda（在 `if`、`while`、`match` 条件与 `for-in` 迭代源中关闭）。
-    allow_trailing_closure: bool = true,
     /// 是否允许 `range_expr` 解析 `: step` 步长部分。
     allow_range_colon: bool = true,
     /// 是否允许 `range_expr` 省略右端点（用于下标切片 `arr[1..]`）。
@@ -118,20 +115,18 @@ pub const Parser = struct {
     sig_tag: TokenTag = .end,
     /// 相对于 `source` 已发射到事件流的字节位置，用于合成 `SyntaxKind.whitespace`。
     emitted_pos: u32 = 0,
-    /// 内部紧凑事件缓冲区，由 `allocator` 分配并在 `deinit` 时释放。
-    events: std.ArrayList(CompactEvent) = .empty,
+    /// 解析后的事件流，由 `allocator` 分配并在 `deinit` 时释放。
+    ///
+    /// `parse` 成功后 `events.items` 即为整份输入的完整事件流；解析期间作为可增长缓冲区使用。
+    events: std.ArrayList(Event) = .empty,
     /// 解析过程中产生的全部 `ParseError`，由 `allocator` 分配并在 `deinit` 时释放。
     errors: std.ArrayList(ParseError) = .empty,
-    /// 下一次 `gen` 将要返回的事件下标。
-    read_index: usize = 0,
-    /// 是否已完成整份输入的解析。
-    parsed: bool = false,
     /// 当前递归嵌套深度。
     depth: u32 = 0,
     /// 当前语法上下文限制标志。
     restrictions: Restrictions = .{},
 
-    /// 创建语法解析器。
+    /// 创建语法解析器，此时尚未解析。
     ///
     /// `source` 与 `tokens` 均借用自调用者，本结构体不复制也不负责释放它们的内存；
     /// 使用结束后调用者须调用 `deinit` 释放内部事件与错误缓冲区。
@@ -198,43 +193,34 @@ pub const Parser = struct {
         self.syncLookahead();
     }
 
-    /// 首次调用 `gen` 时执行的整文件解析冷路径：按词法单元数量一次性预分配事件缓冲，
-    /// 若期间发生内存不足则清空半成品数据并复位全部状态。
-    fn parseOnce(self: *Parser) std.mem.Allocator.Error!void {
-        @branchHint(.cold);
-        errdefer {
-            self.events.clearRetainingCapacity();
-            self.errors.clearRetainingCapacity();
-            self.setCursor(0);
-            self.emitted_pos = 0;
-            self.read_index = 0;
-            self.depth = 0;
-            self.restrictions = .{};
-            self.parsed = false;
-        }
+    /// 复位解析状态与事件/诊断缓冲，保留已分配容量供重复解析复用。
+    fn resetParseState(self: *Parser) void {
+        self.events.clearRetainingCapacity();
+        self.errors.clearRetainingCapacity();
+        self.setCursor(0);
+        self.emitted_pos = 0;
+        self.depth = 0;
+        self.restrictions = .{};
+    }
+
+    /// 一次性解析整份输入，把完整事件流写入 `events`、语法诊断写入 `errors`。
+    ///
+    /// 每次调用先复位状态并清理上一轮事件，因此可重复调用；已分配的事件缓冲容量会保留。
+    /// 按词法单元数量预先分配事件缓冲；若期间发生内存不足，会清空半成品数据并复位
+    /// 解析状态，使同一个解析器可以重新调用 `parse`。
+    pub fn parse(self: *Parser) std.mem.Allocator.Error!void {
+        self.resetParseState();
+        errdefer self.resetParseState();
         if (self.events.capacity == 0) {
+            // 事件数量约为词法单元数量的 2.5 到 3.4 倍（叶子事件与节点开闭事件叠加）。
+            // 按 3.5 倍预留可让常规文件一次分配完成，避开解析末段的扩容拷贝。
             const est_cap: usize = if (self.tokens.len == 0)
                 8
             else
-                (self.tokens.len *| 3) +| (self.tokens.len >> 1) +| 32;
+                (self.tokens.len *| 3) +| (self.tokens.len >> 1) +| 64;
             try self.events.ensureTotalCapacityPrecise(self.allocator, est_cap);
         }
         try decl.parseSourceFile(self);
-        self.parsed = true;
-    }
-
-    /// 产出下一个解析事件；全部事件消费完毕后返回 `null`。
-    ///
-    /// 首次调用时执行整份源文件的完整语法解析并将事件写入 `events`、错误写入 `errors`；
-    /// 若期间发生内存不足，会清空半成品数据并复位全部状态，避免后续读取到残缺状态。
-    pub inline fn gen(self: *Parser) std.mem.Allocator.Error!?Event {
-        if (!self.parsed) {
-            try self.parseOnce();
-        }
-        if (self.read_index >= self.events.items.len) return null;
-        const ev = self.events.items[self.read_index].toEvent();
-        self.read_index += 1;
-        return ev;
     }
 
     /// 将当前切片内的局部字节位置通过饱和加法映射为全局文件字节位置，防止 `u32` 溢出。
@@ -434,8 +420,8 @@ pub const Parser = struct {
         try self.events.ensureUnusedCapacity(self.allocator, additional);
     }
 
-    /// 向内部事件缓冲区追加单个紧凑事件。
-    inline fn appendEvent(self: *Parser, ev: CompactEvent) std.mem.Allocator.Error!void {
+    /// 向内部事件缓冲区追加单个事件。
+    inline fn appendEvent(self: *Parser, ev: Event) std.mem.Allocator.Error!void {
         if (self.events.items.len == self.events.capacity) {
             try self.growEvents(1);
         }
@@ -444,24 +430,53 @@ pub const Parser = struct {
 
     /// 发射一个 `start_node` 事件。
     pub inline fn startNode(self: *Parser, kind: SyntaxKind) std.mem.Allocator.Error!void {
-        try self.appendEvent(CompactEvent.startNode(kind));
+        try self.appendEvent(.{ .start_node = kind });
     }
 
     /// 原地修改指定事件下标处的 `start_node` 节点标签（用于单趟消除括号表达式与元组的前瞻扫描）。
     pub inline fn setNodeKindAt(self: *Parser, event_idx: usize, kind: SyntaxKind) void {
         std.debug.assert(event_idx < self.events.items.len);
-        std.debug.assert(self.events.items[event_idx].tag == .start_node);
-        self.events.items[event_idx].payload = @backingInt(kind);
+        std.debug.assert(std.meta.activeTag(self.events.items[event_idx]) == .start_node);
+        self.events.items[event_idx] = .{ .start_node = kind };
+    }
+
+    /// 返回最后一个已完整发射节点的起始事件下标；事件流末尾不是完整节点时返回 `null`。
+    pub fn lastNodeStart(self: *const Parser) ?usize {
+        var idx = self.events.items.len;
+        var depth: usize = 0;
+        while (idx > 0) {
+            idx -= 1;
+            switch (self.events.items[idx]) {
+                .finish_node => depth += 1,
+                .start_node, .wrap_node => {
+                    if (depth == 0) return null;
+                    depth -= 1;
+                    if (depth == 0) return idx;
+                },
+                else => {},
+            }
+        }
+        return null;
+    }
+
+    /// 返回指定事件下标处的节点标签；该事件不是节点起始时返回 `null`。
+    pub fn nodeKindAt(self: *const Parser, event_idx: usize) ?SyntaxKind {
+        if (event_idx >= self.events.items.len) return null;
+        return switch (self.events.items[event_idx]) {
+            .start_node => |kind| kind,
+            .wrap_node => |kind| kind,
+            else => null,
+        };
     }
 
     /// 发射一个 `wrap_node` 事件，包裹当前父节点最后一项已完成子节点。
     pub inline fn wrapNode(self: *Parser, kind: SyntaxKind) std.mem.Allocator.Error!void {
-        try self.appendEvent(CompactEvent.wrapNode(kind));
+        try self.appendEvent(.{ .wrap_node = kind });
     }
 
     /// 发射一个 `finish_node` 事件。
     pub inline fn finishNode(self: *Parser) std.mem.Allocator.Error!void {
-        try self.appendEvent(CompactEvent.finishNode());
+        try self.appendEvent(.finish_node);
     }
 
     /// 在当前有效词法单元位置记录一条语法错误诊断。
@@ -476,7 +491,7 @@ pub const Parser = struct {
         const err_item: ParseError = .{ .code = code, .range = range };
         try self.errors.append(self.allocator, err_item);
         errdefer _ = self.errors.pop();
-        try self.appendEvent(CompactEvent.parseError(err_item));
+        try self.appendEvent(.{ .parse_error = err_item });
     }
 
     /// 发射单个 CST 叶子事件，自动补发前导水平空白并钳制区间维持单调不回退与无重复字节。
@@ -488,19 +503,28 @@ pub const Parser = struct {
             if (self.events.capacity - self.events.items.len < 2) {
                 try self.growEvents(2);
             }
-            self.events.appendAssumeCapacity(CompactEvent.token(.whitespace, .{
-                .start = self.globalPos(self.emitted_pos),
-                .end = self.globalPos(clamped_start),
-            }));
-            self.events.appendAssumeCapacity(CompactEvent.token(kind, .{
-                .start = self.globalPos(clamped_start),
-                .end = self.globalPos(clamped_end),
-            }));
+            self.events.appendAssumeCapacity(.{ .token = .{
+                .kind = .whitespace,
+                .range = .{
+                    .start = self.globalPos(self.emitted_pos),
+                    .end = self.globalPos(clamped_start),
+                },
+            } });
+            self.events.appendAssumeCapacity(.{ .token = .{
+                .kind = kind,
+                .range = .{
+                    .start = self.globalPos(clamped_start),
+                    .end = self.globalPos(clamped_end),
+                },
+            } });
         } else {
-            try self.appendEvent(CompactEvent.token(kind, .{
-                .start = self.globalPos(clamped_start),
-                .end = self.globalPos(clamped_end),
-            }));
+            try self.appendEvent(.{ .token = .{
+                .kind = kind,
+                .range = .{
+                    .start = self.globalPos(clamped_start),
+                    .end = self.globalPos(clamped_end),
+                },
+            } });
         }
         self.emitted_pos = clamped_end;
     }
@@ -508,10 +532,13 @@ pub const Parser = struct {
     /// 补发 `emitted_pos` 至 `source_len` 之间的尾部水平空白（用于文件末尾与插值片段末尾）。
     pub fn emitTrailingWhitespace(self: *Parser) std.mem.Allocator.Error!void {
         if (self.emitted_pos < self.source_len) {
-            try self.appendEvent(CompactEvent.token(.whitespace, .{
-                .start = self.globalPos(self.emitted_pos),
-                .end = self.globalPos(self.source_len),
-            }));
+            try self.appendEvent(.{ .token = .{
+                .kind = .whitespace,
+                .range = .{
+                    .start = self.globalPos(self.emitted_pos),
+                    .end = self.globalPos(self.source_len),
+                },
+            } });
             self.emitted_pos = self.source_len;
         }
     }
@@ -523,10 +550,13 @@ pub const Parser = struct {
         if (tok.tag == .end) return;
         const range = self.safeRange(tok.span);
         if (self.emitted_pos < range.start) {
-            try self.appendEvent(CompactEvent.token(.whitespace, .{
-                .start = self.globalPos(self.emitted_pos),
-                .end = self.globalPos(range.start),
-            }));
+            try self.appendEvent(.{ .token = .{
+                .kind = .whitespace,
+                .range = .{
+                    .start = self.globalPos(self.emitted_pos),
+                    .end = self.globalPos(range.start),
+                },
+            } });
             self.emitted_pos = range.start;
         }
     }
@@ -1006,10 +1036,13 @@ pub const Parser = struct {
             try self.bumpErrorToken(.unexpected_token);
         }
         try self.emitTrailingWhitespace();
-        try self.appendEvent(CompactEvent.token(.eof, .{
-            .start = self.globalPos(self.emitted_pos),
-            .end = self.globalPos(self.emitted_pos),
-        }));
+        try self.appendEvent(.{ .token = .{
+            .kind = .eof,
+            .range = .{
+                .start = self.globalPos(self.emitted_pos),
+                .end = self.globalPos(self.emitted_pos),
+            },
+        } });
     }
 };
 
@@ -1148,7 +1181,7 @@ const ParseTestResult = struct {
     }
 };
 
-/// 词法分析并运行 `Parser.gen()`，模拟 `GreenBuilder` 消费全部事件，强制校验：
+/// 词法分析并运行 `Parser.parse()`，模拟 `GreenBuilder` 消费全部事件，强制校验：
 /// 1. `start_node`/`wrap_node` 与 `finish_node` 严格成对平衡；
 /// 2. 全部叶子区间单调不重叠且无损还原原源码文本。
 fn parseAndVerify(allocator: std.mem.Allocator, source: []const u8) !ParseTestResult {
@@ -1165,7 +1198,7 @@ fn parseAndVerify(allocator: std.mem.Allocator, source: []const u8) !ParseTestRe
     return parseTokensAndVerify(allocator, source, tok_list.items, true);
 }
 
-/// 使用外部提供的词法切片驱动 `Parser.gen()` 并验证事件流平衡、叶子区间单调性与无损还原。
+/// 使用外部提供的词法切片运行 `Parser.parse()` 并验证事件流平衡、叶子区间单调性与无损还原。
 fn parseTokensAndVerify(
     allocator: std.mem.Allocator,
     source: []const u8,
@@ -1174,6 +1207,7 @@ fn parseTokensAndVerify(
 ) !ParseTestResult {
     var parser = Parser.new(allocator, source, tokens);
     defer parser.deinit();
+    try parser.parse();
 
     var frames: std.ArrayList(TestNode) = .empty;
     defer {
@@ -1189,7 +1223,7 @@ fn parseTokensAndVerify(
 
     var prev_end: u32 = 0;
 
-    while (try parser.gen()) |ev| {
+    for (parser.events.items) |ev| {
         switch (ev) {
             .start_node => |kind| {
                 try frames.append(allocator, .{ .kind = kind });
@@ -1672,9 +1706,9 @@ test "声明消歧：上下文关键字主构造器、const 消歧、块内上�
     try std.testing.expectEqual(@as(usize, 0), res.errors.items.len);
     try std.testing.expectEqual(@as(usize, 2), res.root.countKind(.primary_ctor_decl));
 
-    // 面向分析平台宽松允许带前置修饰符的 foreign/main/~init，以及块内嵌套声明，不触发自递归或误报
+    // 非法位置：修饰符与声明类别不相容、局部类型声明、声明项之后的导入
     {
-        const relaxed =
+        const misplaced =
             \\public foreign func foo(): Unit
             \\public main() {
             \\    class LocalClass {
@@ -1688,13 +1722,20 @@ test "声明消歧：上下文关键字主构造器、const 消歧、块内上�
             \\import std.{}
             \\
         ;
-        var r = try parseAndVerify(gpa, relaxed);
+        var r = try parseAndVerify(gpa, misplaced);
         defer r.deinit(gpa);
-        try std.testing.expectEqual(@as(usize, 0), r.errors.items.len);
+        try std.testing.expectEqual(@as(usize, 9), r.errors.items.len);
+        var position_errors: usize = 0;
+        for (r.errors.items) |e| {
+            if (e.code == ParseErrorCode.invalid_declaration_position) position_errors += 1;
+        }
+        try std.testing.expectEqual(@as(usize, 5), position_errors);
+        try std.testing.expectEqual(@as(usize, 5), r.root.countKind(.error_node));
         try std.testing.expect(r.root.hasKind(.foreign_decl));
         try std.testing.expect(r.root.hasKind(.class_decl));
         try std.testing.expect(r.root.hasKind(.match_expr));
         try std.testing.expect(r.root.hasKind(.try_expr));
+        try std.testing.expectEqual(@as(usize, 2), r.root.countKind(.import_spec));
     }
 }
 
@@ -1809,7 +1850,7 @@ test "wrap_node 安全性、极端递归、畸形 span、base_offset 饱和与 O
         var p = Parser.new(gpa, raw, tok_list.items);
         defer p.deinit();
         p.base_offset = std.math.maxInt(u32);
-        while (try p.gen()) |_| {}
+        try p.parse();
     }
 
     // 超深括号 + 尾随闭包、超长前缀负号、超长 else if 均安全触发 recursive_depth_limit 且不无限循环
@@ -1857,11 +1898,11 @@ test "wrap_node 安全性、极端递归、畸形 span、base_offset 饱和与 O
             if (tok.tag == .end) break;
         }
         try std.testing.checkAllAllocationFailures(gpa, struct {
-            /// 在受限分配器下完整运行一次 `Parser.gen()`。
+            /// 在受限分配器下完整运行一次 `Parser.parse()`。
             fn run(alloc: std.mem.Allocator, src: []const u8, toks: []const common.Token) !void {
                 var p = Parser.new(alloc, src, toks);
                 defer p.deinit();
-                while (try p.gen()) |_| {}
+                try p.parse();
             }
         }.run, .{ raw, tok_list.items });
     }
@@ -1963,10 +2004,13 @@ test "禁止跨行连接的表达式、新行一元负号、带注解 lambda 与
         var res = try parseAndVerify(gpa, src);
         defer res.deinit(gpa);
         try std.testing.expectEqual(@as(usize, 0), res.errors.items.len);
-        try std.testing.expectEqual(@as(usize, 8), res.root.countKind(.expression_statement));
+        // 换行在可延长表达式时按最长匹配连接：`doSomething()` 与 `-1`、`return` 与 `42` 各成一条语句
+        try std.testing.expectEqual(@as(usize, 6), res.root.countKind(.expression_statement));
         try std.testing.expectEqual(@as(usize, 2), res.root.countKind(.call_expr));
         try std.testing.expectEqual(@as(usize, 0), res.root.countKind(.subscript_expr));
-        try std.testing.expectEqual(@as(usize, 1), res.root.countKind(.unary_expr));
+        try std.testing.expectEqual(@as(usize, 0), res.root.countKind(.unary_expr));
+        try std.testing.expectEqual(@as(usize, 1), res.root.countKind(.binary_expr));
+        try std.testing.expectEqual(@as(usize, 1), res.root.countKind(.return_expr));
     }
 
     // 一元负号后换行报错
@@ -2005,7 +2049,6 @@ test "禁止跨行连接的表达式、新行一元负号、带注解 lambda 与
             \\    let fn1 = @OverflowWrapping { x => x + 1 }
             \\    let fn2 = foo @OverflowWrapping { x => x + 1 }
             \\    let g = (c < d, e > (f))
-            \\    unsafe func inner() {}
             \\    unsafe { inner() }
             \\    _ = sealed
             \\    _ = fn1
@@ -2249,7 +2292,7 @@ test "Parser.errors 保留非结合比较错误并转换为 Diagnostic" {
 
     var parser = Parser.new(gpa, src, tok_list.items);
     defer parser.deinit();
-    while (try parser.gen()) |_| {}
+    try parser.parse();
 
     try std.testing.expectEqual(@as(usize, 1), parser.errors.items.len);
     try std.testing.expectEqual(ParseErrorCode.non_associative_comparison, parser.errors.items[0].code);
@@ -2475,5 +2518,293 @@ test "括号与元组原地改写、漏逗号元组恢复与超长/嵌套字符�
         try std.testing.expectEqual(@as(usize, 0), r.errors.items.len);
         try std.testing.expectEqual(@as(usize, 2), r.root.countKind(.str_interpolation_expr));
         try std.testing.expectEqual(@as(usize, 3), r.root.countKind(.interpolation_expr));
+    }
+}
+
+test "非法位置的声明包裹在 error_node 内且内部节点正常解析" {
+    const gpa = std.testing.allocator;
+    const src =
+        \\package p
+        \\import a.b
+        \\func f() {}
+        \\import c.d
+        \\package q
+        \\features { x.y }
+        \\static let bad = 1
+        \\prop bad: Int64 { get() { 1 } }
+        \\class C {
+        \\    static let ok: Int64 = 1
+        \\    func m() {
+        \\        class Local {}
+        \\        public let x = 1
+        \\        unsafe func inner() {}
+        \\        func nested() {}
+        \\        const c = 1
+        \\        import e.f
+        \\    }
+        \\}
+        \\interface I { let x: Int64 = 1 }
+        \\struct S { ~init() {} }
+        \\enum E { | A
+        \\    init() {}
+        \\}
+        \\extend Int64 { const y = 1 }
+        \\main() {}
+        \\
+    ;
+    var res = try parseAndVerify(gpa, src);
+    defer res.deinit(gpa);
+
+    try std.testing.expectEqual(@as(usize, 13), res.errors.items.len);
+    for (res.errors.items) |e| {
+        try std.testing.expectEqual(ParseErrorCode.invalid_declaration_position, e.code);
+    }
+    try std.testing.expectEqual(@as(usize, 13), res.root.countKind(.error_node));
+
+    // 第一个非法位置是声明项之后的 `import c.d`，错误节点内层仍是正常的 `import_spec`
+    const first_error = res.root.findFirst(.error_node).?;
+    const wrapped_import = first_error.nthChildNode(0).?;
+    try std.testing.expectEqual(SyntaxKind.import_spec, wrapped_import.kind);
+    try std.testing.expect(wrapped_import.findFirst(.import_content) != null);
+    try std.testing.expectEqual(@as(usize, 3), res.root.countKind(.import_spec));
+
+    try std.testing.expect(res.root.hasKind(.package_header));
+    try std.testing.expect(res.root.hasKind(.features_directive));
+    try std.testing.expect(res.root.hasKind(.prop_decl));
+    try std.testing.expect(res.root.hasKind(.class_decl));
+    try std.testing.expect(res.root.hasKind(.init_decl));
+    try std.testing.expect(res.root.hasKind(.finalizer_decl));
+    try std.testing.expect(res.root.hasKind(.var_decl));
+    try std.testing.expect(res.root.hasKind(.func_decl));
+}
+
+test "嵌套函数与局部 const 变量符合规范，不产生错误节点" {
+    const gpa = std.testing.allocator;
+    const src =
+        \\func outer() {
+        \\    const c: Int64 = 1
+        \\    func inner() {
+        \\        const d = 2
+        \\        let e = 3
+        \\    }
+        \\}
+        \\
+    ;
+    var res = try parseAndVerify(gpa, src);
+    defer res.deinit(gpa);
+
+    try std.testing.expectEqual(@as(usize, 0), res.errors.items.len);
+    try std.testing.expectEqual(@as(usize, 0), res.root.countKind(.error_node));
+    try std.testing.expectEqual(@as(usize, 2), res.root.countKind(.func_decl));
+    try std.testing.expectEqual(@as(usize, 3), res.root.countKind(.var_decl));
+
+    // 局部大写标识符加括号是调用表达式，不当作主构造器
+    var call = try parseAndVerify(gpa, "func f() { Foo(1) }\n");
+    defer call.deinit(gpa);
+    try std.testing.expectEqual(@as(usize, 0), call.errors.items.len);
+    try std.testing.expectEqual(@as(usize, 1), call.root.countKind(.call_expr));
+}
+
+test "类型体内不允许的成员声明包裹在 error_node 内" {
+    const gpa = std.testing.allocator;
+    const src =
+        \\class A {
+        \\    private func ok() {}
+        \\    class B {}
+        \\    struct C {}
+        \\    interface D {}
+        \\    enum E {}
+        \\    type T = Int64
+        \\    extend Int64 {}
+        \\    foreign {}
+        \\    main() {}
+        \\    macro M() {}
+        \\}
+        \\
+    ;
+    var res = try parseAndVerify(gpa, src);
+    defer res.deinit(gpa);
+
+    try std.testing.expectEqual(@as(usize, 10), res.errors.items.len);
+    try std.testing.expectEqual(@as(usize, 9), res.root.countKind(.error_node));
+    // 错误节点内部保留正常解析得到的声明节点
+    try std.testing.expectEqual(@as(usize, 2), res.root.countKind(.class_decl));
+    try std.testing.expect(res.root.hasKind(.struct_decl));
+    try std.testing.expect(res.root.hasKind(.interface_decl));
+    try std.testing.expect(res.root.hasKind(.enum_decl));
+    try std.testing.expect(res.root.hasKind(.type_alias_decl));
+    try std.testing.expect(res.root.hasKind(.extend_decl));
+    try std.testing.expect(res.root.hasKind(.foreign_decl));
+    try std.testing.expect(res.root.hasKind(.main_decl));
+    try std.testing.expect(res.root.hasKind(.macro_decl));
+}
+
+test "构造器部分之后的枚举构造器包裹在 error_node 内" {
+    const gpa = std.testing.allocator;
+    const src =
+        \\enum E {
+        \\    | A
+        \\    | B(Int64)
+        \\    func f() {}
+        \\    | C
+        \\}
+        \\
+    ;
+    var res = try parseAndVerify(gpa, src);
+    defer res.deinit(gpa);
+
+    try std.testing.expectEqual(@as(usize, 1), res.errors.items.len);
+    try std.testing.expectEqual(@as(usize, 1), res.root.countKind(.error_node));
+    try std.testing.expectEqual(@as(usize, 3), res.root.countKind(.enum_constructor));
+    const error_node = res.root.findFirst(.error_node).?;
+    try std.testing.expectEqual(SyntaxKind.enum_constructor, error_node.nthChildNode(0).?.kind);
+}
+
+test "重复 parse 清理上一轮事件并保留缓冲容量" {
+    const gpa = std.testing.allocator;
+    const src = "func f() { let x = 1 }\n";
+
+    var tok_list: std.ArrayList(common.Token) = .empty;
+    defer tok_list.deinit(gpa);
+    var lex = try lexer.Lexer.new(src);
+    while (true) {
+        const tok = try lex.gen();
+        try tok_list.append(gpa, tok);
+        if (tok.tag == .end) break;
+    }
+
+    var parser = Parser.new(gpa, src, tok_list.items);
+    defer parser.deinit();
+
+    try parser.parse();
+    const first_len = parser.events.items.len;
+    const first_capacity = parser.events.capacity;
+    try std.testing.expect(first_len > 0);
+
+    try parser.parse();
+    try std.testing.expectEqual(first_len, parser.events.items.len);
+    try std.testing.expectEqual(first_capacity, parser.events.capacity);
+}
+
+test "规范允许的 features 注解、条件尾随闭包与最长匹配换行" {
+    const gpa = std.testing.allocator;
+
+    var features = try parseAndVerify(gpa, "@NonProduct\nfeatures { os.linux }\nfunc f() {}\n");
+    defer features.deinit(gpa);
+    try std.testing.expectEqual(@as(usize, 0), features.errors.items.len);
+    try std.testing.expectEqual(@as(usize, 1), features.root.countKind(.features_directive));
+    try std.testing.expectEqual(@as(usize, 1), features.root.countKind(.annotation));
+
+    var trailing = try parseAndVerify(gpa, "func isOk(fn: () -> Bool): Bool { fn() }\nfunc f() { if (isOk { true }) { } }\n");
+    defer trailing.deinit(gpa);
+    try std.testing.expectEqual(@as(usize, 0), trailing.errors.items.len);
+    try std.testing.expectEqual(@as(usize, 1), trailing.root.countKind(.trailing_closure_expr));
+
+    var newline = try parseAndVerify(gpa, "func f(): Int64 {\n    let x = 1\n    - 2\n    return\n    x\n}\n");
+    defer newline.deinit(gpa);
+    try std.testing.expectEqual(@as(usize, 0), newline.errors.items.len);
+    try std.testing.expectEqual(@as(usize, 1), newline.root.countKind(.binary_expr));
+    try std.testing.expectEqual(@as(usize, 1), newline.root.countKind(.return_expr));
+    try std.testing.expectEqual(@as(usize, 0), newline.root.countKind(.unary_expr));
+}
+
+test "赋值左值、同一行语句分隔符与仅限函数名的尾随闭包" {
+    const gpa = std.testing.allocator;
+
+    var bad = try parseAndVerify(gpa,
+        \\func f() {
+        \\    1 = 2
+        \\    a + b = 0
+        \\    _ += 1
+        \\    (1, 2) = x
+        \\}
+        \\
+    );
+    defer bad.deinit(gpa);
+    try std.testing.expectEqual(@as(usize, 4), bad.errors.items.len);
+    for (bad.errors.items) |e| try std.testing.expectEqual(ParseErrorCode.invalid_assignment_target, e.code);
+
+    var good = try parseAndVerify(gpa,
+        \\func f() {
+        \\    a = 1
+        \\    a.b = 1
+        \\    g().b = 1
+        \\    arr[0] = 1
+        \\    (a, b) = x
+        \\    (a, _) = x
+        \\    a?.b = 1
+        \\    a?[0] = 1
+        \\    this.x = 1
+        \\    _ = 1
+        \\}
+        \\
+    );
+    defer good.deinit(gpa);
+    try std.testing.expectEqual(@as(usize, 0), good.errors.items.len);
+
+    var separators = try parseAndVerify(gpa, "func f() {\n    let a = 1 let b = 2\n    a b\n}\n");
+    defer separators.deinit(gpa);
+    try std.testing.expectEqual(@as(usize, 2), separators.errors.items.len);
+
+    var paren = try parseAndVerify(gpa, "func g(): Unit {}\nfunc f() { (g) {} }\n");
+    defer paren.deinit(gpa);
+    try std.testing.expect(paren.errors.items.len >= 1);
+}
+
+test "数量与形态约束：枚举、导入分组、模式、类型、扩展与 lambda 参数" {
+    const gpa = std.testing.allocator;
+    const cases = [_]struct { src: []const u8, errors: usize }{
+        .{ .src = "enum E {}\n", .errors = 1 },
+        .{ .src = "import std.{}\n", .errors = 1 },
+        .{ .src = "import std.{ a.{b} }\n", .errors = 1 },
+        .{ .src = "func f(x: Int64) { match (x) { case (1) => 0 case _ => 1 } }\n", .errors = 1 },
+        .{ .src = "func f(x: Int64) { match (x) { case Some() => 0 case _ => 1 } }\n", .errors = 1 },
+        .{ .src = "func f() { let 1 = 2 }\n", .errors = 1 },
+        .{ .src = "func f() { for (1 in xs) {} }\n", .errors = 1 },
+        .{ .src = "func f() { let () = g() }\n", .errors = 1 },
+        .{ .src = "let a: (x: Int64) = (1)\n", .errors = 1 },
+        .{ .src = "let a: (x: Int64, String) = (1, \"s\")\n", .errors = 1 },
+        .{ .src = "let a: Array<Int64,> = []\n", .errors = 1 },
+        .{ .src = "let a: Foo<Int64>.Bar = x\n", .errors = 1 },
+        .{ .src = "extend (Int64, Int64) {}\n", .errors = 1 },
+        .{ .src = "extend ?Int64 {}\n", .errors = 1 },
+        .{ .src = "extend VArray<Int64, $2> {}\n", .errors = 1 },
+        .{ .src = "extend This {}\n", .errors = 1 },
+        .{ .src = "func f() { let g = { x!: Int64 => x } }\n", .errors = 1 },
+        .{ .src = "func f() { let g = { x = 1 => x } }\n", .errors = 1 },
+        .{ .src = "func f(x: Int64) { match (x) { } }\n", .errors = 1 },
+        .{ .src = "func f(x: Int64) { match (x) { case 1 => } }\n", .errors = 1 },
+        .{ .src = "func f() { try { } }\n", .errors = 1 },
+        .{ .src = "func f() { try () { } }\n", .errors = 1 },
+        .{ .src = "func f() { a[] }\n", .errors = 1 },
+        .{ .src = "func f() { let t = (1,) }\n", .errors = 1 },
+        .{ .src = "func f() { let s = \"${}\" }\n", .errors = 1 },
+        .{ .src = "func f(a: Array<Int64>) { a[1..=] }\n", .errors = 1 },
+        .{ .src = "func f(x: Option<Int64>) { match (x) { case Some<Int64>(v) => v case _ => 0 } }\n", .errors = 1 },
+        .{ .src = "foreign var a: Int32 = 0\n", .errors = 1 },
+        .{ .src = "foreign { var a: Int32 }\n", .errors = 1 },
+        .{ .src = "foreign { class C {} }\n", .errors = 1 },
+    };
+    for (cases) |case| {
+        var res = try parseAndVerify(gpa, case.src);
+        defer res.deinit(gpa);
+        try std.testing.expectEqual(case.errors, res.errors.items.len);
+    }
+
+    const legal = [_][]const u8{
+        "class C {\n    public let x: Int64 = 1\n    private func f() {}\n}\n",
+        "interface I {\n    func f(): Unit\n    mut prop p: Int64 { get() { 1 } }\n}\n",
+        "extend Int64 <: I {\n    public func f() {}\n    mut prop p: Int64 { get() { 1 } }\n}\n",
+        "foreign func f(): Unit\nforeign { @C func g(): Unit }\n",
+        "foreign { func f(): Unit }\n",
+        "let a: (x: Int64, y: Int64) = (1, 2)\nlet b: (Int64) = 1\nlet c: Foo.Bar<Int64> = x\n",
+        "func f(x: Option<Int64>) { match (x) { case Option<Int64>.Some(v) => v case _ => 0 } }\n",
+        "func f() { try (r = R()) { } }\nfunc g() { try { } finally { } }\n",
+        "func f(a: Array<Int64>) { a[1..]\n a[..5]\n a[..] }\n",
+    };
+    for (legal) |src| {
+        var res = try parseAndVerify(gpa, src);
+        defer res.deinit(gpa);
+        try std.testing.expectEqual(@as(usize, 0), res.errors.items.len);
     }
 }

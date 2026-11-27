@@ -325,15 +325,12 @@ test "解析器事件流构建无损绿树" {
 
     var parser_instance = parser.Parser.new(gpa, source, tokens.items);
     defer parser_instance.deinit();
-
-    var events: std.ArrayList(Event) = .empty;
-    defer events.deinit(gpa);
-    while (try parser_instance.gen()) |ev| try events.append(gpa, ev);
+    try parser_instance.parse();
 
     var arena = std.heap.ArenaAllocator.init(gpa);
     defer arena.deinit();
 
-    const tree = try treeBuild(gpa, arena.allocator(), source, events.items);
+    const tree = try treeBuild(gpa, arena.allocator(), source, parser_instance.events.items);
     try std.testing.expectEqual(@as(u32, @intCast(source.len)), tree.textLen());
 
     var rebuilt: std.ArrayList(u8) = .empty;

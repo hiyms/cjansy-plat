@@ -31,7 +31,6 @@ pub const ParseError = parse_error.ParseError;
 
 pub const TokenEvent = event.TokenEvent;
 pub const Event = event.Event;
-pub const CompactEvent = event.CompactEvent;
 
 pub const isBuiltinAnnotationName = annotation.isBuiltinAnnotationName;
 

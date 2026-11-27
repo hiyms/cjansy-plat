@@ -58,10 +58,32 @@ pub const Error = error{
 
 | 成员 / 签名 | 说明 |
 | :--- | :--- |
-| `errors: std.ArrayList(ParseError)` | 存放解析过程中产出的全部 `ParseError`（已完成回溯清理并合并字符串插值子解析错误），首次调用 `gen` 完成解析后可读取 `parser.errors.items`；内存由 `deinit` 统一释放。 |
-| `pub fn new(allocator: std.mem.Allocator, source: []const u8, tokens: []const common.Token) Parser` | 创建语法解析器。`source` 与 `tokens` 借用自调用方，使用期间须保持有效且不由此结构体释放；结束使用后须调用 `deinit` 释放内部事件与错误缓冲区。 |
+| `events: std.ArrayList(Event)` | 解析后的事件流。`parse` 成功后 `parser.events.items` 为整份输入的完整事件流，可直接交给 `frontend.treeBuild` 或逐个写出；内存由 `deinit` 统一释放。 |
+| `errors: std.ArrayList(ParseError)` | 存放解析产出的全部 `ParseError`（已完成回溯清理并合并字符串插值子解析错误），`parse` 完成后可读取 `parser.errors.items`；内存由 `deinit` 统一释放。 |
+| `pub fn new(allocator: std.mem.Allocator, source: []const u8, tokens: []const common.Token) Parser` | 创建语法解析器，此时尚未解析。`source` 与 `tokens` 借用自调用方，使用期间须保持有效且不由此结构体释放；结束使用后须调用 `deinit` 释放内部事件与错误缓冲区。 |
 | `pub fn deinit(self: *Parser) void` | 释放解析器内部事件缓冲区与 `errors` 列表内存，不释放借用的 `source` 与 `tokens`。 |
-| `pub fn gen(self: *Parser) std.mem.Allocator.Error!?Event` | 产出下一个 `Event`，全部事件消费完毕返回 `null`。首次调用时执行整份输入解析并缓存事件流与 `errors`；若期间发生内存不足，会自动清空半成品数据并复位状态。 |
+| `pub fn parse(self: *Parser) std.mem.Allocator.Error!void` | 一次性解析整份输入，把完整事件流写入 `events`、语法诊断写入 `errors`。按词法单元数量预先分配事件缓冲；若期间发生内存不足，自动清空半成品数据并复位解析状态，使同一个解析器可以重新调用 `parse`。 |
+
+### 声明位置与 `error_node`
+
+声明类别是否允许出现在当前位置，依据 `cangjie_spec` 中各声明体的成员列表判定，覆盖顶层、`class`/`struct`/`interface`/`enum`/`extend` 体、`foreign` 块、语句块与文件头部。文件头部顺序为 `features`、`package`、`import`；三者出现在其它位置时同样属于非法位置。
+
+非法位置会记录 `ParseErrorCode.invalid_declaration_position`，并把正常解析得到的声明节点包在 `error_node` 内。内层节点与在合法位置解析得到的结构一致，例如语句块中的 `import` 产生 `error_node { import_spec }`，`class` 体内嵌套的 `struct` 产生 `error_node { struct_decl }`。修饰符与声明类别不相容时同样按非法位置处理，例如顶层 `static let`、带访问修饰符的局部变量与 `public foreign func`。
+
+局部函数与局部 `const` 变量符合语言规范，不会产生 `error_node`。
+
+### 语法约束
+
+- 文件头部的 `features` 指令可带内置注解（如 `@NonProduct`）。
+- 尾随闭包只允许挂在函数名或变量名调用之后；条件、迭代源与模式守卫中的尾随闭包与普通表达式一样允许。
+- 赋值左值限定为标识符、字段访问、下标访问、可选链左值与元组左值；`=` 左侧允许 `_`，复合赋值不允许。
+- 同一行内的表达式与声明之间必须有 `;` 或换行分隔。
+- 类型实参不允许尾随逗号，类型实参只能附在路径末段；元组与函数类型的标签必须全有或全无，命名元组至少两个元素。
+- `extend` 的被扩展类型只能是点分标识符或基础类型；lambda 形参只能写名称或 `_` 加可选类型。
+- `foreign` 只接受函数声明，块内不得出现变量、类型、属性或构造函数；函数本身不能附加其它修饰符。
+- 元组模式至少两个元素，枚举构造器模式参数至少一个；`let`、`var`、`const` 与 `for-in` 只接受 irrefutable 模式。
+- 枚举至少一个构造器；导入分组不得为空且不得嵌套；`match` 至少一个分支，`try` 必须有 catch、handle 或 finally，下标、元组与插值不得为空，闭区间不可省略右端点。
+- 换行按 `Chapter_01_Lexical_Structure.md` 的最长匹配规则处理：`return` 后换行可接表达式，行首一元 `-` 在可延长上一行表达式时作为二元减法。
 
 ### `parseErrorToDiagnostic` 的内存约定
 
@@ -141,19 +163,15 @@ while (true) {
     if (tok.tag == .end) break;
 }
 
-// 2. 语法解析并收集事件流
+// 2. 语法解析，事件流通过 `events` 成员读取
 var parser = frontend.parser.Parser.new(gpa, source_text, tokens.items);
 defer parser.deinit();
-var events: std.ArrayList(common.Event) = .empty;
-defer events.deinit(gpa);
-while (try parser.gen()) |ev| {
-    try events.append(gpa, ev);
-}
+try parser.parse();
 
 // 3. 构建绿树。arena 通常使用 File.allocator()，须比绿树活得久
 var tree_arena = std.heap.ArenaAllocator.init(gpa);
 defer tree_arena.deinit();
-const tree = try frontend.treeBuild(gpa, tree_arena.allocator(), source_text, events.items);
+const tree = try frontend.treeBuild(gpa, tree_arena.allocator(), source_text, parser.events.items);
 
 // 4. 将 ParseError 批量转换为 common.Diagnostic（使用 Arena 统一管理消息生命周期）
 var diag_arena = std.heap.ArenaAllocator.init(gpa);
