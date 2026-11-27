@@ -139,7 +139,7 @@ pub const SyntaxTree = struct {
 
     /// 判定树相对于给定文件与文件版本是否过期。
     pub inline fn isOutdated(self: SyntaxTree, file: FileId, current_version: u32) bool {
-        return self.version != current_version or !std.meta.eql(self.file, file);
+        return source_mod.isOutdated(self.file, self.version, file, current_version);
     }
 
     /// 转发：获取树覆盖总长度。

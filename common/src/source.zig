@@ -42,7 +42,17 @@ pub const FileId = struct {
 
     /// 占位值，不属于任何槽位。
     pub const invalid: FileId = .{ .index = std.math.maxInt(u32), .generation = 0 };
+
+    /// 判定两个文件标识是否指向同一槽位且代次相同。
+    pub inline fn eql(a: FileId, b: FileId) bool {
+        return a.index == b.index and a.generation == b.generation;
+    }
 };
+
+/// 判定给定文件标识与版本号相对于当前文件标识与版本号是否过期。
+pub inline fn isOutdated(target: FileId, version: u32, current: FileId, current_version: u32) bool {
+    return version != current_version or !FileId.eql(target, current);
+}
 
 /// `Source` 的错误集合。每个错误对应一个明确的失败点，没有尽力而为的分支。
 pub const Error = std.mem.Allocator.Error || error{

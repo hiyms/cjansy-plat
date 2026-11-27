@@ -1,6 +1,6 @@
 # `common` 外部 API
 
-入口模块为 `common`（对应 `common/src/root.zig`），对外导出通用基础类型、词法与 CST 标签、语法错误与解析事件、内置注解名称、源文件管理、诊断结构、UTF-8 解码能力及语法树结构。
+入口模块为 `common`（对应 `common/src/root.zig`），对外导出通用基础类型、词法与 CST 标签、语法错误与解析事件、内置注解名称、源文件管理、诊断结构、UTF-8 解码能力、语法树结构及高层中间表示。
 
 ## 模块导出
 
@@ -14,6 +14,7 @@
 - `common.diagnostic`：统一诊断数据结构。
 - `common.utf8`：UTF-8 解码与 Unicode 码点判定。
 - `common.tree`：不可变语法树结构。
+- `common.hir`：高层中间表示（HIR）数据结构与运算符映射。
 
 ---
 
@@ -385,10 +386,14 @@ pub const FileId = struct {
     generation: u32,
 
     pub const invalid: FileId = .{ .index = std.math.maxInt(u32), .generation = 0 };
+
+    pub inline fn eql(a: FileId, b: FileId) bool
 };
+
+pub inline fn isOutdated(target: FileId, version: u32, current: FileId, current_version: u32) bool;
 ```
 
-带代次校验的 8 字节文件句柄。文件删除并复用槽位后旧句柄自动失效。顶层可通过 `common.FileId` 访问。
+带代次校验的 8 字节文件句柄。文件删除并复用槽位后旧句柄自动失效。`FileId.eql` 判定两个句柄是否指向同一槽位且代次相同；模块级 `isOutdated` 判定给定文件与版本号相对于当前文件与版本号是否过期，供 `common.SyntaxTree` 与 `common.HirFile` 复用。顶层可通过 `common.FileId` 访问。
 
 ### `TextRange` 与 `Edit`
 
@@ -565,3 +570,695 @@ pub const Codepoint = struct {
 | `pub fn isSurrogate(cp: u21) bool` | 判断码点是否位于 UTF-16 代理项区间（`U+D800..=U+DFFF`）。 |
 | `pub fn decode(bytes: []const u8) ?Codepoint` | 从切片开头解码单个合法 UTF-8 码点，空切片、非法字节或截断序列返回 `null`。 |
 | `pub fn decodeAt(bytes: []const u8, index: usize) ?Codepoint` | 从切片 `index` 处解码单个合法 UTF-8 码点，越界或非法返回 `null`。 |
+
+---
+
+## 高层中间表示（`common.hir`）
+
+由 `GreenTree` 经由 lower 阶段生成，去除源码中的空白、注释与纯语法标点，保留语义分析、名称解析、类型检查与静态检查所需的抽象语法结构。顶层可通过 `common.hir` 访问模块，各节点类型同时以 `common.` 前缀直接导出。
+
+### 约定
+
+- 命名约定：`Hir` 前缀用于跨声明项共用的节点类型（`HirType`、`HirExpr`、`HirStmt`、`HirPattern`、`HirItem`、`HirCondition`、`HirParam`、`HirCallArg`、`HirTypeElement`、`HirFile`），其余载荷结构体、字面量与运算符枚举按语言术语命名。
+- 每个节点都带 `range: TextRange`（左闭右开字节区间）。名字位置另带 `Name` 中的独立区间，便于把诊断定位到具体标识符。
+- 每个 parser 产生的 CST 标签都在测试 `每个 CST 标签都有 HIR 对应或明确的折叠规则` 中登记为 trivia、lexeme、value、wrapper、node 或 error_node；`SyntaxKind` 新增标签会让该测试编译失败，迫使补齐对应关系。
+- 括号表达式与括号类型在 HIR 中折叠，`range` 取内层表达式或内层类型的区间。
+- 所有节点、切片与子指针由所属 `arena` 分配（如 `File.allocator()`），随 `arena` 统一释放，调用者不得单独释放其中任何指针或切片。
+- 列表字段与可选字段按声明是否带默认值区分：带默认值的列表为 `&.{}`，可选字段为 `null`；没有默认值的字段构造时必须显式给出。绑定类别、运算符、目标类型、字符串书写形式、字节字面量标记与名字的原始形式标记没有默认值，漏填会在编译期报错。
+- `HirExpr`、`HirType`、`HirPattern`、`HirItem`、`HirStmt` 提供 `range(self: *const T) TextRange`，统一取得节点覆盖区间，指针仅作只读借用。
+
+### 名字、修饰符与注解
+
+```zig
+pub const Name = struct {
+    text: []const u8,                   // 已去掉包围原始标识符与包名的反引号
+    is_raw: bool,                       // 是否由反引号包围
+    range: TextRange,
+};
+
+pub const Modifier = enum(u8) {
+    public, private, protected, internal,
+    static, open, sealed, abstract, override, redef,
+    unsafe, mut, operator, const_, common, specific, late,
+};
+
+pub const Annotation = struct {
+    path: []const Name,
+    args: []const HirCallArg = &.{},
+    range: TextRange,
+};
+```
+
+`Modifier.const_` 表示 `const func` 与 `const init` 上的上下文关键字；绑定类别使用 `BindingKind`（`let_`、`var_`、`const_`）。`Name.text` 保留去掉反引号的文本，`Name.is_raw` 记录反引号包围的原始形式，因此关键字与同名原始标识符可以区分。
+
+### 运算符
+
+- `BinaryOp`：`add`、`sub`、`mul`、`div`、`mod`、`exp`、`eq`、`ne`、`lt`、`le`、`gt`、`ge`、`logical_and`、`logical_or`、`bit_and`、`bit_or`、`bit_xor`、`lshift`、`rshift`、`coalescing`、`pipeline`、`composition`。
+- `AssignOp`：`assign` 与全部复合赋值运算符。
+- `UnaryOp`：`neg`（`-`）与 `not`（`!`，逻辑取反与按位取反共用）。
+- `IncDecOp`：`incr`、`decr`。
+- `JumpOp`：`break_`、`continue_`。
+- `IntSuffix`：`i8` 至 `i64`、`u8` 至 `u64`；`FloatSuffix`：`f16`、`f32`、`f64`。
+
+`BinaryOp` 与 `AssignOp` 使用编译期查找表，`UnaryOp`、`IncDecOp`、`JumpOp` 使用 `switch`，均提供 `fromSyntaxKind(kind: SyntaxKind) ?T`，把 CST 运算符或关键字标签转换为 HIR 标签，非对应标签返回 `null`。区间表达式、`is`、`as` 使用独立的表达式变体，不出现在这些映射表中。
+
+### 类型
+
+```zig
+pub const HirType = union(enum) {
+    path: PathType,
+    option: OptionalType,
+    tuple: TupleType,
+    func: FuncType,
+    varray: VArrayType,
+    this: ThisType,
+};
+
+pub const PathType = struct {
+    segments: []const TypePathSegment,   // 每段带 name 与可选 type_args
+    range: TextRange,
+};
+
+pub const HirTypeElement = struct {
+    label: ?Name = null,                 // (x: Int64, y: Int64) 中的 x
+    ty: *const HirType,
+    range: TextRange,
+};
+
+pub const OptionalType = struct { inner: *const HirType, range: TextRange };
+pub const TupleType = struct { elements: []const HirTypeElement, range: TextRange };
+pub const FuncType = struct {
+    params: []const HirTypeElement = &.{},
+    ret: *const HirType,
+    range: TextRange,
+};
+pub const VArrayType = struct {
+    elem: *const HirType,
+    size: []const u8,                   // VArray<T, $4> 中 $4 的文本 4
+    range: TextRange,
+};
+pub const ThisType = struct { range: TextRange };
+```
+
+类型实参挂在路径的各个段上，`a<T>.b` 与 `a.b<T>` 均可表达。元组类型与函数类型的元素可带可读性标签，`label` 为 `null` 表示无标签。`path` 同时承载内置类型名（`Int64`、`Bool`、`Unit` 等）。`VArrayType.size` 保存长度字面量的源码文本，不对长度预设数值范围。
+
+### 字面量
+
+```zig
+pub const IntLit = struct { text: []const u8, suffix: ?IntSuffix = null, range: TextRange };
+pub const FloatLit = struct { text: []const u8, suffix: ?FloatSuffix = null, range: TextRange };
+pub const RuneLit = struct { value: u21, is_byte: bool, range: TextRange };
+pub const StringLit = struct { text: []const u8, kind: StrKind, range: TextRange };
+pub const BoolLit = struct { value: bool, range: TextRange };
+pub const Bare = struct { range: TextRange };    // ()、_ 等无载荷节点
+```
+
+`StrKind` 区分 `single`、`multiline` 与 `raw_multiline`。负数字面量由外层 `HirExpr.unary` 表达。
+
+整数字面量与浮点数字面量只保存完整源码文本与显式后缀，不保存解析后的数值。字面量在宏实参等非表达式位置可以超出所有数值类型的范围，需要数值的阶段按文本解析并做类型范围检查。
+
+带插值的字符串使用 `StrInterp`：
+
+```zig
+pub const StrKind = enum(u8) { single, multiline, raw_multiline };
+pub const StrText = struct { text: []const u8, range: TextRange };
+pub const StrInterpolation = struct { body: *const BlockExpr, range: TextRange };
+pub const StrPart = union(enum) { text: StrText, interpolation: StrInterpolation };
+pub const StrInterp = struct {
+    parts: []const StrPart,
+    kind: StrKind,
+    range: TextRange,
+};
+```
+
+`parts` 按源码顺序交替保存纯文本与插值片段，插值内容是 `.block` 表达式。
+
+### 表达式
+
+```zig
+pub const HirExpr = union(enum) {
+    int_lit: IntLit,
+    float_lit: FloatLit,
+    rune_lit: RuneLit,
+    string_lit: StringLit,
+    str_interp: StrInterp,
+    bool_lit: BoolLit,
+    unit_lit: Bare,
+    wildcard: Bare,
+    path: PathExpr,
+    field: FieldExpr,
+    optional: OptionalExpr,
+    call: CallExpr,
+    index: IndexExpr,
+    inc_dec: IncDecExpr,
+    unary: UnaryExpr,
+    binary: BinaryExpr,
+    assign: AssignExpr,
+    range_expr: RangeExpr,
+    is_expr: IsExpr,
+    as_expr: AsExpr,
+    type_conv: TypeConvExpr,
+    varray: VArrayExpr,
+    tuple_lit: TupleLit,
+    array_lit: ArrayLit,
+    block: BlockExpr,
+    if_expr: IfExpr,
+    match_expr: MatchExpr,
+    while_expr: WhileExpr,
+    do_while_expr: DoWhileExpr,
+    for_in_expr: ForInExpr,
+    try_expr: TryExpr,
+    throw_expr: ThrowExpr,
+    return_expr: ReturnExpr,
+    jump: JumpExpr,
+    lambda: LambdaExpr,
+    spawn: SpawnExpr,
+    synchronized: SynchronizedExpr,
+    unsafe: UnsafeExpr,
+    quote: QuoteExpr,
+    macro_call: MacroCallExpr,
+    if_available: IfAvailableExpr,
+    perform: PerformExpr,
+    resume_expr: ResumeExpr,
+};
+```
+
+后缀链与访问：
+
+```zig
+pub const ExprPathSegment = struct {
+    name: Name,                          // this、super、This 与内置类型名同样作为段名
+    type_args: []const HirType = &.{},
+};
+pub const PathExpr = struct { segments: []const ExprPathSegment, range: TextRange };
+pub const FieldExpr = struct {
+    base: *const HirExpr,
+    name: Name,
+    type_args: []const HirType = &.{},
+    range: TextRange,
+};
+pub const OptionalExpr = struct { operand: *const HirExpr, range: TextRange };
+pub const HirCallArg = struct {
+    name: ?Name = null,                  // 命名实参 name: expr
+    is_inout: bool = false,              // C 互操作中的 inout 引用传值
+    value: *const HirExpr,
+    range: TextRange,
+};
+pub const CallExpr = struct {
+    callee: *const HirExpr,
+    args: []const HirCallArg = &.{},
+    trailing_lambda: ?*const HirExpr = null,
+    range: TextRange,
+};
+pub const IndexExpr = struct { base: *const HirExpr, indices: []const HirExpr, range: TextRange };
+```
+
+`a?.b`、`c?(d)`、`e?[f]` 中的 `?` 统一表示为 `OptionalExpr`，字段访问、调用与下标以它作为接收者，因此可选链的类型信息不会丢失。`arr[1..5]`、`arr[..5]`、`arr[0..]` 使用 `range_expr` 变体作为下标表达式。尾随闭包 `f { ... }` 表示为带 `trailing_lambda` 的调用。
+
+运算与转换：
+
+```zig
+pub const IncDecExpr = struct { op: IncDecOp, operand: *const HirExpr, range: TextRange };
+pub const UnaryExpr = struct { op: UnaryOp, operand: *const HirExpr, range: TextRange };
+pub const BinaryExpr = struct { op: BinaryOp, lhs: *const HirExpr, rhs: *const HirExpr, range: TextRange };
+pub const AssignExpr = struct { op: AssignOp, lhs: *const HirExpr, rhs: *const HirExpr, range: TextRange };
+pub const RangeExpr = struct {
+    start: ?*const HirExpr = null,       // 下标位置的 ..b 为 null
+    end: ?*const HirExpr = null,         // 下标位置的 a.. 为 null
+    inclusive: bool,                     // ..= 为 true
+    step: ?*const HirExpr = null,        // a..=b:step
+    range: TextRange,
+};
+pub const IsExpr = struct { operand: *const HirExpr, ty: *const HirType, range: TextRange };
+pub const AsExpr = struct { operand: *const HirExpr, ty: *const HirType, range: TextRange };
+pub const TypeConvExpr = struct { ty: *const HirType, value: *const HirExpr, range: TextRange };
+pub const VArrayExpr = struct {
+    ty: *const HirType,
+    args: []const HirCallArg = &.{},
+    trailing_lambda: ?*const HirExpr = null,
+    range: TextRange,
+};
+pub const TupleLit = struct { elements: []const HirExpr, range: TextRange };
+pub const ArrayElement = struct { spread: bool = false, value: *const HirExpr, range: TextRange };
+pub const ArrayLit = struct { elements: []const ArrayElement, range: TextRange };
+```
+
+语句块与条件：
+
+```zig
+pub const BlockExpr = struct {
+    stmts: []const HirStmt = &.{},
+    tail: ?*const HirExpr = null,        // 作为块值的尾表达式
+    range: TextRange,                    // match 分支体对应不带花括号的 stmt_list
+};
+pub const LetDestructor = struct {
+    patterns: []const HirPattern,        // let p1 | p2 <- expr
+    value: *const HirExpr,
+    range: TextRange,
+};
+pub const HirCondition = union(enum) {
+    expr: *const HirExpr,
+    let_destructor: LetDestructor,
+};
+pub const IfExpr = struct {
+    condition: HirCondition,
+    then_branch: *const BlockExpr,
+    else_branch: ?*const HirExpr = null,
+    range: TextRange,
+};
+```
+
+`if` 与 `while` 的条件使用 `HirCondition`，因此 `if (let Some(x) <- value)` 与普通条件表达式都能表达。
+
+分支与循环：
+
+```zig
+pub const PatternCase = struct {
+    patterns: []const HirPattern,        // case p1 | p2
+    guard: ?*const HirExpr = null,       // where cond
+    body: *const BlockExpr,
+    range: TextRange,
+};
+pub const ExprCase = struct {
+    value: *const HirExpr,               // 无选择器 match 的分支表达式，case _ 为 .wildcard
+    body: *const BlockExpr,
+    range: TextRange,
+};
+pub const MatchCase = union(enum) { pattern: PatternCase, expr: ExprCase };
+pub const MatchExpr = struct {
+    selector: ?*const HirExpr = null,
+    cases: []const MatchCase = &.{},
+    range: TextRange,
+};
+
+pub const WhileExpr = struct { condition: HirCondition, body: *const BlockExpr, range: TextRange };
+pub const DoWhileExpr = struct { body: *const BlockExpr, condition: *const HirExpr, range: TextRange };
+pub const ForInExpr = struct {
+    pattern: *const HirPattern,
+    iterable: *const HirExpr,
+    guard: ?*const HirExpr = null,
+    body: *const BlockExpr,
+    range: TextRange,
+};
+```
+
+异常与跳转：
+
+```zig
+pub const Resource = struct { name: Name, ty: ?*const HirType = null, init: ?*const HirExpr = null, range: TextRange };
+pub const CatchClause = struct { pattern: *const HirPattern, body: *const BlockExpr, range: TextRange };
+pub const HandleClause = struct { pattern: *const HirPattern, body: *const BlockExpr, range: TextRange };
+pub const TryClause = union(enum) { catch_: CatchClause, handle: HandleClause };
+pub const TryExpr = struct {
+    resources: []const Resource = &.{},
+    body: *const BlockExpr,
+    clauses: []const TryClause = &.{},
+    finally: ?*const BlockExpr = null,
+    range: TextRange,
+};
+pub const ThrowExpr = struct { value: *const HirExpr, range: TextRange };
+pub const ReturnExpr = struct { value: ?*const HirExpr = null, range: TextRange };
+pub const JumpExpr = struct { op: JumpOp, range: TextRange };
+```
+
+`catch` 与 `handle` 子句保持在同一个 `clauses` 列表中，源码顺序不会丢失。
+
+并发、效应与宏：
+
+```zig
+pub const LambdaExpr = struct {
+    annotations: []const Annotation = &.{},
+    params: []const Param = &.{},
+    is_variadic: bool = false,
+    body: *const BlockExpr,
+    range: TextRange,
+};
+pub const SpawnExpr = struct { context: ?*const HirExpr = null, task: *const HirExpr, range: TextRange };
+pub const SynchronizedExpr = struct { mutex: *const HirExpr, body: *const BlockExpr, range: TextRange };
+pub const UnsafeExpr = struct { body: *const BlockExpr, range: TextRange };
+pub const QuotePart = union(enum) {
+    token: TextRange,                   // 未插值的词法单元，按区间取源文本
+    interpolation: *const HirExpr,      // $(expr)；$name 表示为单段路径
+};
+pub const QuoteExpr = struct { parts: []const QuotePart = &.{}, range: TextRange };
+
+pub const MacroCall = struct {
+    path: []const Name,
+    has_bang: bool = false,
+    attributes: ?TextRange = null,      // [..] 宏属性区间
+    input: ?TextRange = null,           // 括号输入区间
+};
+pub const MacroCallExpr = struct { call: MacroCall, inner: ?*const HirExpr = null, range: TextRange };
+pub const IfAvailableExpr = struct { args: []const HirCallArg, range: TextRange };
+pub const PerformExpr = struct { value: *const HirExpr, range: TextRange };
+pub const ResumeModifier = enum(u8) { with, throwing };
+pub const ResumeExpr = struct {
+    value: ?*const HirExpr = null,
+    modifier: ?ResumeModifier = null,
+    modifier_value: ?*const HirExpr = null,
+    range: TextRange,
+};
+```
+
+宏属性与括号输入以 `MacroCall.attributes`、`MacroCall.input` 区间保存，`quote` 的未插值词法单元以 `QuotePart.token` 区间保存；文本通过源文件与区间取得，HIR 不保存原始词法单元序列。
+
+### 模式
+
+```zig
+pub const HirPattern = union(enum) {
+    wildcard: WildcardPattern,           // _
+    binding: BindingPattern,             // x
+    const_: ConstPattern,                // -1、() 等字面量
+    tuple: TuplePattern,                 // (a, b)
+    enum_: EnumPattern,                  // Some(x)、Color.Red
+    typed: TypePattern,                  // x: Int64、_: Int64
+    except_type: ClausePattern,          // catch 中的 e: A | B
+    command_type: ClausePattern,         // handle 中的 e: A | B
+};
+
+pub const BindingPattern = struct { name: Name, range: TextRange };
+pub const ConstPattern = struct { value: *const HirExpr, range: TextRange };
+pub const TuplePattern = struct { elements: []const HirPattern, range: TextRange };
+pub const EnumPattern = struct {
+    path: PathType,
+    args: []const HirPattern = &.{},
+    range: TextRange,
+};
+pub const TypePattern = struct { name: ?Name = null, ty: *const HirType, range: TextRange };
+pub const ClausePattern = struct { name: ?Name = null, types: []const HirType, range: TextRange };
+```
+
+上述模式用于 `let` 绑定、`for (x in xs)` 与 `case` 分支：`let (a, b) = ...` 使用 `.tuple`，`let _ = ...` 使用 `.wildcard`，普通变量绑定使用 `.binding`。
+
+### 语句与绑定
+
+```zig
+pub const Binding = struct {
+    modifiers: []const Modifier = &.{},
+    annotations: []const Annotation = &.{},
+    kind: BindingKind,
+    pattern: *const HirPattern,
+    ty: ?*const HirType = null,
+    init: ?*const HirExpr = null,
+    range: TextRange,
+};
+pub const ExprStmt = struct { value: *const HirExpr, has_semi: bool = false, range: TextRange };
+pub const HirStmt = union(enum) {
+    binding: Binding,
+    expr: ExprStmt,
+    item: HirItem,                       // 块内允许出现的局部声明
+};
+```
+
+`Binding` 同时用于语句、顶层常量与结构体字段，`kind` 没有默认值。
+
+### 参数、泛型约束与函数名
+
+```zig
+pub const HirParam = struct {
+    modifiers: []const Modifier = &.{},
+    annotations: []const Annotation = &.{},
+    binding: ?BindingKind = null,        // 主构造器成员参数的 let / var
+    name: ?Name = null,                  // _ 参数为 null
+    is_named: bool = false,              // a!: T
+    ty: ?*const HirType = null,
+    default_value: ?*const HirExpr = null,
+    range: TextRange,
+};
+pub const ParamMacro = struct {
+    annotations: []const Annotation = &.{},
+    call: MacroCall,
+    param: ?*const Param = null,         // 被宏修饰的参数；链式参数宏在此嵌套
+    range: TextRange,
+};
+pub const Param = union(enum) { param: HirParam, macro_call: ParamMacro };
+
+pub const FuncName = union(enum) {
+    ident: Name,
+    operator: Name,                      // text 为运算符源码文本，如 +、()、[]
+};
+pub const GenericConstraint = struct {
+    subject: *const HirType,
+    bounds: []const HirType,
+    range: TextRange,
+};
+pub const WhereClause = struct { constraints: []const GenericConstraint, range: TextRange };
+```
+
+参数位置的宏调用（`func f(@M x: Int64)`）使用 `Param.macro_call`，`param` 字段指向被修饰的 `Param`，因此链式参数宏 `@M @N x: Int64` 可以嵌套表达。
+
+### 声明项
+
+```zig
+pub const HirItem = union(enum) {
+    func: FuncItem,
+    main: MainItem,
+    class: ClassItem,
+    struct_: StructItem,
+    enum_: EnumItem,
+    interface: InterfaceItem,
+    extend_: ExtendItem,
+    prop: PropItem,
+    type_alias: TypeAliasItem,
+    init: InitItem,
+    finalizer: FinalizerItem,
+    primary_ctor: PrimaryCtorItem,
+    binding: Binding,
+    foreign: ForeignItem,
+    macro_: MacroItem,
+    macro_expand: MacroExpandItem,
+};
+```
+
+函数、入口与宏：
+
+```zig
+pub const FuncItem = struct {
+    modifiers: []const Modifier = &.{},
+    annotations: []const Annotation = &.{},
+    name: FuncName,
+    type_params: []const Name = &.{},
+    params: []const Param = &.{},
+    is_variadic: bool = false,
+    ret_type: ?*const HirType = null,
+    where_clause: ?*const WhereClause = null,
+    body: ?*const BlockExpr = null,      // 无函数体的声明为 null
+    range: TextRange,
+};
+pub const MainItem = struct {
+    modifiers: []const Modifier = &.{},
+    annotations: []const Annotation = &.{},
+    params: []const Param = &.{},
+    is_variadic: bool = false,
+    ret_type: ?*const HirType = null,
+    body: *const BlockExpr,
+    range: TextRange,
+};
+pub const MacroItem = struct {
+    modifiers: []const Modifier = &.{},
+    annotations: []const Annotation = &.{},
+    name: Name,
+    params: []const Param = &.{},
+    is_variadic: bool = false,
+    ret_type: ?*const HirType = null,
+    body: *const HirExpr,                // = expr 或 .block
+    range: TextRange,
+};
+pub const MacroExpandItem = struct {
+    annotations: []const Annotation = &.{},
+    call: MacroCall,
+    wrapped: ?*const HirItem = null,     // 宏自行生成声明时为 null
+    range: TextRange,
+};
+```
+
+类型声明：
+
+```zig
+pub const ClassItem = struct {
+    modifiers: []const Modifier = &.{},
+    annotations: []const Annotation = &.{},
+    name: Name,
+    type_params: []const Name = &.{},
+    supertypes: []const HirType = &.{},  // 第一个为父类，其余为接口
+    where_clause: ?*const WhereClause = null,
+    members: []const HirItem = &.{},
+    range: TextRange,
+};
+pub const StructItem = struct {
+    modifiers: []const Modifier = &.{},
+    annotations: []const Annotation = &.{},
+    name: Name,
+    type_params: []const Name = &.{},
+    interfaces: []const HirType = &.{},
+    where_clause: ?*const WhereClause = null,
+    members: []const HirItem = &.{},     // 字段以 .binding 出现
+    range: TextRange,
+};
+pub const EnumPayloadType = struct {
+    annotations: []const Annotation = &.{},
+    ty: *const HirType,
+    range: TextRange,
+};
+pub const EnumPayloadElement = union(enum) { ty: EnumPayloadType, macro_call: ParamMacro };
+
+pub const EnumConstructor = struct {
+    annotations: []const Annotation = &.{},
+    name: Name,
+    payload: []const EnumPayloadElement = &.{},
+    range: TextRange,
+};
+pub const VariantMacro = struct {
+    annotations: []const Annotation = &.{},
+    call: MacroCall,
+    constructor: ?*const EnumVariant = null,  // 被宏修饰的构造器；链式构造器宏在此嵌套
+    range: TextRange,
+};
+pub const EnumVariant = union(enum) { constructor: EnumConstructor, macro_call: VariantMacro };
+pub const EnumItem = struct {
+    modifiers: []const Modifier = &.{},
+    annotations: []const Annotation = &.{},
+    name: Name,
+    type_params: []const Name = &.{},
+    interfaces: []const HirType = &.{},
+    where_clause: ?*const WhereClause = null,
+    variants: []const EnumVariant = &.{},
+    is_non_exhaustive: bool = false,     // 带 ... 标记
+    members: []const HirItem = &.{},
+    range: TextRange,
+};
+pub const InterfaceItem = struct {
+    modifiers: []const Modifier = &.{},
+    annotations: []const Annotation = &.{},
+    name: Name,
+    type_params: []const Name = &.{},
+    interfaces: []const HirType = &.{},  // 父接口
+    where_clause: ?*const WhereClause = null,
+    members: []const HirItem = &.{},
+    range: TextRange,
+};
+pub const ExtendItem = struct {
+    modifiers: []const Modifier = &.{},
+    annotations: []const Annotation = &.{},
+    type_params: []const Name = &.{},
+    target: *const HirType,
+    interfaces: []const HirType = &.{},
+    where_clause: ?*const WhereClause = null,
+    members: []const HirItem = &.{},
+    range: TextRange,
+};
+```
+
+`InterfaceItem` 的字段为 `modifiers`、`annotations`、`name`、`type_params`、`interfaces`、`where_clause`、`members` 与 `range`。
+
+成员与其他声明：
+
+```zig
+pub const Binding = struct {
+    modifiers: []const Modifier = &.{},
+    annotations: []const Annotation = &.{},
+    kind: BindingKind,
+    pattern: *const HirPattern,
+    ty: ?*const HirType = null,
+    init: ?*const HirExpr = null,
+    range: TextRange,
+};
+pub const PropAccessor = struct {
+    name: Name,                          // get 或 set
+    params: []const Param = &.{},
+    body: *const BlockExpr,
+    range: TextRange,
+};
+pub const PropItem = struct {
+    modifiers: []const Modifier = &.{},
+    annotations: []const Annotation = &.{},
+    name: Name,
+    ty: *const HirType,
+    accessors: []const PropAccessor = &.{},
+    range: TextRange,
+};
+pub const TypeAliasItem = struct {
+    modifiers: []const Modifier = &.{},
+    annotations: []const Annotation = &.{},
+    name: Name,
+    type_params: []const Name = &.{},
+    target: *const HirType,
+    range: TextRange,
+};
+pub const InitItem = struct {
+    modifiers: []const Modifier = &.{},
+    annotations: []const Annotation = &.{},
+    params: []const Param = &.{},
+    is_variadic: bool = false,
+    body: *const BlockExpr,
+    range: TextRange,
+};
+pub const FinalizerItem = struct {
+    modifiers: []const Modifier = &.{},
+    annotations: []const Annotation = &.{},
+    params: []const Param = &.{},
+    is_variadic: bool = false,
+    body: *const BlockExpr,
+    range: TextRange,
+};
+pub const PrimaryCtorItem = struct {
+    modifiers: []const Modifier = &.{},
+    annotations: []const Annotation = &.{},
+    name: Name,                         // 与所属类型同名
+    params: []const Param = &.{},
+    is_variadic: bool = false,
+    body: *const BlockExpr,
+    range: TextRange,
+};
+pub const ForeignItem = struct {
+    modifiers: []const Modifier = &.{},
+    annotations: []const Annotation = &.{},
+    members: []const HirItem = &.{},
+    range: TextRange,
+};
+```
+
+`FinalizerItem` 与 `PrimaryCtorItem` 的字段分别对应类终结器 `~init() { ... }` 与主构造器 `Point(let x: Int64) { ... }`。
+
+### 包、特性、导入与文件根节点
+
+```zig
+pub const PackageHeader = struct {
+    modifier: ?Modifier = null,
+    is_macro: bool = false,
+    org: ?Name = null,                   // org::a.b 中的 org
+    name: []const Name,
+    range: TextRange,
+};
+pub const FeatureId = struct { segments: []const Name, range: TextRange };
+pub const FeaturesDirective = struct { features: []const FeatureId, range: TextRange };
+
+pub const ImportAlias = struct { name: Name, alias: Name };
+pub const ImportKind = union(enum) {
+    single: Name,
+    alias: ImportAlias,
+    glob: void,                          // *
+    group: []const ImportItem,           // { b, c as d, e.* }
+};
+pub const ImportItem = struct {
+    modifier: ?Modifier = null,
+    annotations: []const Annotation = &.{},
+    org: ?Name = null,
+    prefix: []const Name = &.{},
+    kind: ImportKind,
+    range: TextRange,
+};
+
+pub const HirFile = struct {
+    file: FileId,
+    version: u32,
+    package: ?PackageHeader = null,
+    features: ?FeaturesDirective = null,
+    imports: []const ImportItem = &.{},
+    items: []const HirItem = &.{},
+
+    pub inline fn isOutdated(self: HirFile, file: FileId, current_version: u32) bool
+};
+```
+
+`ImportItem` 覆盖 `importSingle`、`importAlias`、`importAll` 与 `importMulti` 四种形态。分组导入的每个元素同样是 `ImportItem`，其 `prefix` 为元素自身的点分路径（可为空切片），完整包路径由外层 `prefix` 与元素 `prefix` 拼接；例如 `e.*` 元素为 `prefix = [e]`、`kind = .glob`。`HirFile.imports` 收集文件中的全部导入声明；parser 在声明项之后接受的导入同样收入此列表，与声明项的相对位置不保留。`HirFile.isOutdated` 与 `common.SyntaxTree.isOutdated` 使用同一判定，复用 `common.source.isOutdated`。
