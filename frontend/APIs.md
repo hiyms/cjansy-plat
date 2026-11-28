@@ -1,6 +1,6 @@
 # `frontend` 外部 API
 
-入口模块为 `frontend`（对应 `frontend/src/root.zig`），对外导出词法分析器模块 `frontend.lexer`、语法解析器模块 `frontend.parser` 与绿树构建模块 `frontend.tree`。顶层同时导出 `frontend.GreenBuilder` 与 `frontend.treeBuild`。
+入口模块为 `frontend`（对应 `frontend/src/root.zig`），对外导出词法分析器模块 `frontend.lexer`、语法解析器模块 `frontend.parser`、绿树构建模块 `frontend.tree` 与 CST→HIR 降低器模块 `frontend.lower`。顶层同时导出 `frontend.GreenBuilder`、`frontend.treeBuild`、`frontend.Lowerer`、`frontend.LoweredItem`、`frontend.LoweredFile`、`frontend.lowerItem` 与 `frontend.lowerFile`。
 
 ---
 
@@ -143,6 +143,96 @@ pub fn treeBuild(
 ```
 
 一次性消费全部事件并返回绿树。`source` 是事件区间对应的完整源码，只在构建期间借用；`gpa` 只用于临时内存；`arena` 持有最终节点与叶子文本，必须比返回的绿树活得久，通常传入 `File.allocator()`。`parse_error` 事件会被忽略，诊断由调用方从解析器读取。构建期间发生内存分配错误时返回 `std.mem.Allocator.Error`。
+
+---
+
+## CST→HIR 降低器（`frontend.lower`）
+
+将 Lossless Green CST 转换为高层中间表示（`common.hir`），在项内从 `0` 顺序分配 `HirId` 并可选填充 `common.GreenToHirMap`。
+
+- 内部不依赖 `RedNode` 或 `QueryContext`，通过 `GreenNode` 树的 `text_len` 现场累加计算每个节点的源码字节区间（自动剥离节点内部前导与尾随 Trivia）。
+- 遵循容错纪律：遇到缺损语法树、`error_node` 或非法字面量（如残缺进制字面量 `0x`、非法字符字面量）时，记录 `source = .parser` 的 `Diagnostic` 并生成占位 HIR 节点继续降低，仅在内存不足时返回 `std.mem.Allocator.Error`。
+- 平铺的 `path_expr` 在首段为普通名称且全链不含 `?.` 时保留为单个 `HirExpr.path`；若首段包裹了非名称表达式（如 `g().b.c`）或链中含 `?.`（如 `a?.b.c`），自动按左结合转换为接收者表达式、`HirExpr.optional` 与链式 `HirExpr.field`，并将每个 `path_segment` 映射到对应层级的 `HirId`。
+- 折叠或合并的包装节点（`paren_expr`、`paren_type`、`trailing_closure_expr`、`quote_interpolation`、`ret_type`、`pattern_guard`、`finally_clause`、被提取为块尾表达式的末尾无分号 `expression_statement`、包裹了声明的 `error_node`）均穿透映射到内层目标节点的 `HirId`。
+
+### `LoweredItem`
+
+```zig
+pub const LoweredItem = struct {
+    id: common.ItemId,
+    item: *const common.HirItem,
+    hir_id_start: common.HirId,
+    hir_id_end: common.HirId,
+    nodes: []const common.HirNode,
+    exprs: []const *const common.HirExpr,
+    diagnostics: []const common.Diagnostic,
+
+    pub inline fn node(self: LoweredItem, id: common.HirId) ?common.HirNode
+    pub inline fn expr(self: LoweredItem, id: common.HirId) ?*const common.HirExpr
+};
+```
+
+单个顶层或独立声明项的 lowering 产物。恒满足 `hir_id_start == .fromIndex(0)`、`hir_id_end == .fromIndex(@intCast(nodes.len))` 且对任意 `0 <= i < nodes.len` 有 `nodes[i].id().index() == i`。`item`、`nodes`、`exprs`、`diagnostics` 及其内部所有指针均由 `arena` 分配，随 `arena` 统一释放，调用者不得单独释放。
+
+### `LoweredFile`
+
+```zig
+pub const LoweredFile = struct {
+    hir_file: common.HirFile,
+    lowered_items: []const LoweredItem,
+    diagnostics: []const common.Diagnostic,
+
+    pub inline fn node(self: LoweredFile, key: common.HirKey) ?common.HirNode
+    pub inline fn hirRange(self: LoweredFile, key: common.HirKey) ?common.TextRange
+};
+```
+
+整份 `source_file` 的 lowering 产物。`lowered_items` 与 `hir_file.items` 一一对应，下标即为 `ItemId.index()`。所有指针与切片均由 `arena` 分配，随 `arena` 统一释放，调用者不得单独释放。
+
+### `Lowerer`、`lowerItem` 与 `lowerFile`
+
+```zig
+pub const Lowerer = struct {
+    pub fn init(
+        gpa: std.mem.Allocator,
+        arena: std.mem.Allocator,
+        file: common.FileId,
+        version: u32,
+        green_to_hir: ?*common.GreenToHirMap,
+    ) Lowerer
+    pub fn deinit(self: *Lowerer) void
+    pub fn lowerItem(
+        self: *Lowerer,
+        item_id: common.ItemId,
+        item_green: *const common.GreenNode,
+        item_start_offset: u32,
+    ) std.mem.Allocator.Error!LoweredItem
+    pub fn lowerFile(
+        self: *Lowerer,
+        root: *const common.GreenNode,
+    ) std.mem.Allocator.Error!LoweredFile
+};
+
+pub fn lowerItem(
+    gpa: std.mem.Allocator,
+    arena: std.mem.Allocator,
+    file: common.FileId,
+    item_id: common.ItemId,
+    item_green: *const common.GreenNode,
+    item_start_offset: u32,
+    green_to_hir: ?*common.GreenToHirMap,
+) std.mem.Allocator.Error!LoweredItem
+
+pub fn lowerFile(
+    gpa: std.mem.Allocator,
+    arena: std.mem.Allocator,
+    syntax_tree: common.SyntaxTree,
+    green_to_hir: ?*common.GreenToHirMap,
+) std.mem.Allocator.Error!LoweredFile
+```
+
+- `gpa` 仅用于 lowering 期间的临时可变工作缓冲（由 `Lowerer.deinit` 释放）。
+- `arena` 用于分配所有产出的 HIR 节点指针、切片、诊断消息以及 `green_to_hir` 的哈希桶内存（通常传入 `File.allocator()`），随 `arena` 统一释放。
 
 ---
 

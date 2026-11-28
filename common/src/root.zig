@@ -68,6 +68,12 @@ pub const UnaryOp = hir.UnaryOp;
 pub const IncDecOp = hir.IncDecOp;
 pub const JumpOp = hir.JumpOp;
 
+pub const ItemId = hir.ItemId;
+pub const HirId = hir.HirId;
+pub const HirKey = hir.HirKey;
+pub const HirNode = hir.HirNode;
+pub const GreenToHirMap = hir.GreenToHirMap;
+
 pub const Name = hir.Name;
 pub const Modifier = hir.Modifier;
 pub const Annotation = hir.Annotation;

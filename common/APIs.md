@@ -54,7 +54,7 @@ pub const LocatedGreen = struct {
 };
 ```
 
-携带绝对起始字节偏移的绿树节点定位结果。顶层可通过 `common.LocatedGreen` 访问。
+携带绝对起始字节位置的绿树节点定位结果。顶层可通过 `common.LocatedGreen` 访问。
 
 ### `GreenTree`
 
@@ -67,7 +67,7 @@ pub const GreenTree = struct {
 对根 `GreenNode` 节点的封装。顶层可通过 `common.GreenTree` 访问。
 
 - `pub inline fn textLen(self: GreenTree) u32`：返回整棵树覆盖的文本长度。
-- `pub fn nodeAt(self: GreenTree, offset: u32) ?LocatedGreen`：定位包含给定字节位置的叶子节点及其绝对起始偏移，返回结果中的 `green` 指针借用自所属 `arena`。
+- `pub fn nodeAt(self: GreenTree, offset: u32) ?LocatedGreen`：定位包含给定字节位置的叶子节点及其绝对起始位置，返回结果中的 `green` 指针借用自所属 `arena`。
 - `pub inline fn traversal(self: GreenTree, gpa: std.mem.Allocator) GreenTraversal`：创建前向遍历当前绿树的迭代器，结束后须调用 `GreenTraversal.deinit` 释放。
 
 ### `SyntaxTree`
@@ -105,7 +105,7 @@ pub const RedNode = struct {
 };
 ```
 
-绑定了父节点指针与绝对文件偏移的语法树视图节点，由 `QueryContext` 托管生命周期（预期短于底层 `GreenNode`）。顶层可通过 `common.RedNode` 访问。
+绑定了父节点指针与绝对文件字节位置的语法树视图节点，由 `QueryContext` 托管生命周期（预期短于底层 `GreenNode`）。顶层可通过 `common.RedNode` 访问。
 
 提供以下方法（返回的节点指针与切片均借用自对应的 `QueryContext` 或绿树 `arena`，调用者不得单独释放）：
 - `pub inline fn kind(self: *const RedNode) SyntaxKind`
@@ -132,7 +132,7 @@ pub const RedNode = struct {
 对 `GreenTree` 执行非递归深度优先前向遍历的迭代器，无需分配 `RedNode`，事件类型为 `GreenTraversal.Event = union(enum) { enter: LocatedGreen, leave: LocatedGreen }`。顶层可通过 `common.GreenTraversal` 访问。
 
 - `pub inline fn init(gpa: std.mem.Allocator, tree: GreenTree) GreenTraversal`：从绿树根节点初始化遍历器。
-- `pub fn initFromNode(gpa: std.mem.Allocator, node: *const GreenNode, start_offset: u32) GreenTraversal`：从指定节点与起始偏移初始化遍历器。
+- `pub fn initFromNode(gpa: std.mem.Allocator, node: *const GreenNode, start_offset: u32) GreenTraversal`：从指定节点与起始字节位置初始化遍历器。
 - `pub fn deinit(self: *GreenTraversal) void`：释放遍历器内部的临时缓冲。
 - `pub fn next(self: *GreenTraversal) std.mem.Allocator.Error!?Event`：产出下一个 `.enter` 或 `.leave` 事件，结束时返回 `null`。
 - `pub fn skipChildren(self: *GreenTraversal) void`：跳过当前活动帧的剩余子节点（`.enter` 后调用跳过当前节点的子节点，`.leave` 后调用跳过其父节点的剩余子节点，未进入或结束后调用无效果）。
@@ -168,7 +168,7 @@ pub const TokenTag = enum { ... };
 
 | 方法 | 说明 |
 | :--- | :--- |
-| `pub inline fn isContextKeyword(self: TokenTag) bool` | 是否为上下文关键字（`public`、`open` 等可在标识符位置复用的软关键字）。 |
+| `pub inline fn isContextKeyword(self: TokenTag) bool` | 是否为上下文关键字（`public`、`open` 等可在标识符位置复用的关键字）。 |
 | `pub inline fn isIdentLike(self: TokenTag) bool` | 是否可作为标识符使用（普通标识符与上下文关键字）。 |
 | `pub inline fn isPackageIdentLike(self: TokenTag) bool` | 是否可作为包名段使用（标识符、上下文关键字与反引号包名）。 |
 | `pub inline fn isPrimitiveType(self: TokenTag) bool` | 是否为内建基础类型关键字（不含 `This` 与 `VArray`）。 |
@@ -566,7 +566,82 @@ pub const Codepoint = struct {
 - 括号表达式与括号类型在 HIR 中折叠，`range` 取内层表达式或内层类型的区间。
 - 所有节点、切片与子指针由所属 `arena` 分配（如 `File.allocator()`），随 `arena` 统一释放，调用者不得单独释放其中任何指针或切片。
 - 列表字段与可选字段按声明是否带默认值区分：带默认值的列表为 `&.{}`，可选字段为 `null`；没有默认值的字段构造时必须显式给出。绑定类别、运算符、目标类型、字符串书写形式、字节字面量标记与名字的原始形式标记没有默认值，漏填会在编译期报错。
-- `HirExpr`、`HirType`、`HirPattern`、`HirItem`、`HirStmt` 提供 `range(self: *const T) TextRange`，统一取得节点覆盖区间，指针仅作只读借用。
+- `HirExpr`、`HirType`、`HirPattern`、`HirItem`、`HirStmt`、`Param`、`EnumVariant`、`BlockExpr`、`PropAccessor`、`Resource` 的全部载荷结构体均携带 `id: HirId = .fromIndex(0)` 字段，并提供 `id(self: *const T) HirId` 与 `range(self: *const T) TextRange` 方法，统一取得项内 `HirId` 与节点覆盖区间，指针仅作只读借用。
+
+### 句柄、节点视图与 CST→HIR 映射（`ItemId`、`HirId`、`HirKey`、`HirNode`、`GreenToHirMap`）
+
+```zig
+pub const ItemId = enum(u32) {
+    _,
+    pub inline fn fromIndex(idx: u32) ItemId
+    pub inline fn index(self: ItemId) u32
+};
+
+pub const HirId = enum(u32) {
+    _,
+    pub inline fn fromIndex(idx: u32) HirId
+    pub inline fn index(self: HirId) u32
+};
+
+pub const HirKey = struct {
+    item: ItemId,
+    hir: HirId,
+    pub inline fn eql(a: HirKey, b: HirKey) bool
+};
+
+pub const HirNode = union(enum) {
+    item: *const HirItem,
+    stmt: *const HirStmt,
+    expr: *const HirExpr,
+    block: *const BlockExpr,
+    pattern: *const HirPattern,
+    ty: *const HirType,
+    param: *const Param,
+    variant: *const EnumVariant,
+    prop_accessor: *const PropAccessor,
+    resource: *const Resource,
+
+    pub inline fn range(self: HirNode) TextRange
+    pub inline fn id(self: HirNode) HirId
+};
+
+pub const GreenToHirMap = struct {
+    by_green: std.AutoHashMapUnmanaged(usize, HirKey) = .empty,
+    pub const empty: GreenToHirMap = .{};
+
+    pub fn deinit(self: *GreenToHirMap, allocator: std.mem.Allocator) void
+    pub inline fn clearRetainingCapacity(self: *GreenToHirMap) void
+    pub inline fn count(self: *const GreenToHirMap) usize
+    pub fn put(
+        self: *GreenToHirMap,
+        allocator: std.mem.Allocator,
+        green: *const GreenNode,
+        item: ItemId,
+        hir: HirId,
+    ) std.mem.Allocator.Error!void
+    pub inline fn get(self: *const GreenToHirMap, green: *const GreenNode) ?HirKey
+    pub fn resolveNearest(self: *const GreenToHirMap, red: *const RedNode) ?HirKey
+    pub fn resolveNearestGreen(
+        self: *const GreenToHirMap,
+        root: *const GreenNode,
+        target: *const GreenNode,
+    ) ?HirKey
+    pub fn resolveNearestAtOffset(
+        self: *const GreenToHirMap,
+        root: *const GreenNode,
+        root_offset: u32,
+        offset: u32,
+    ) ?HirKey
+};
+```
+
+- `ItemId` 与 `HirId` 采用 4 字节强类型枚举句柄。每个顶层声明项内部的 `HirId` 从 `0` 独立顺序分配，使某项内部的修改不会导致同文件其他顶层项的 `HirId` 漂移。
+- `HirKey` 为 `(ItemId, HirId)` 复合定位键，可在文件范围内无歧义定位任意 HIR 节点。
+- `HirNode` 统一包装所有可由 `GreenToHirMap` 寻址的 HIR 节点类别（含独立语句块 `BlockExpr`、形参 `Param`、枚举构造器 `EnumVariant`、属性访问器 `PropAccessor` 与 `try` 资源声明 `Resource`），其内部指针均借用自所属 `arena`。
+- `GreenToHirMap` 以 `@intFromPtr(green)` 为键保存 `*const GreenNode -> HirKey` 映射：
+  - `put` 在 `allocator`（通常为文件级 `arena`）中分配哈希桶，若 `allocator` 为 `ArenaAllocator` 则无需单独调用 `deinit`。
+  - `resolveNearest` 从给定 `RedNode` 沿父链上溯查找最近具有 HIR 映射的节点；`resolveNearestGreen` 与 `resolveNearestAtOffset` 无需构造 `RedNode`，直接基于 `GreenNode` 子树或目标字节位置完成零分配上溯查询（当光标位于关键字、标点或空白/注释 Trivia 上时自动回退到最近的语义父节点）。
+- 顶层可通过 `common.ItemId`、`common.HirId`、`common.HirKey`、`common.HirNode`、`common.GreenToHirMap` 访问。
 
 ### 名字、修饰符与注解
 

@@ -21,10 +21,62 @@
 const std = @import("std");
 const source_mod = @import("source.zig");
 const syntax_mod = @import("syntax.zig");
+const tree_mod = @import("tree.zig");
 
 const FileId = source_mod.FileId;
 const TextRange = source_mod.TextRange;
 const SyntaxKind = syntax_mod.SyntaxKind;
+const GreenNode = tree_mod.GreenNode;
+const RedNode = tree_mod.RedNode;
+
+/// 顶层或独立降低的声明项句柄。
+///
+/// 在文件级 `lowerFile` 中按顶层声明项顺序从 0 分配（对应 `LoweredFile.lowered_items` 的下标）；
+/// 在下次同文件编辑重新 lowering 后旧值失效。
+pub const ItemId = enum(u32) {
+    _,
+
+    /// 由 0-based 整数序号构造 `ItemId`。
+    pub inline fn fromIndex(idx: u32) ItemId {
+        return @fromBackingInt(@intCast(idx));
+    }
+
+    /// 获取底层 0-based 整数序号。
+    pub inline fn index(self: ItemId) u32 {
+        return @backingInt(self);
+    }
+};
+
+/// 项内顺序分配的 HIR 节点句柄。
+///
+/// 仅在所属 `LoweredItem` 实例内有效（每个 `LoweredItem` 内部从 0 开始顺序分配，
+/// 直接对应 `LoweredItem.nodes` 的数组下标）；跨项索引必须使用 `HirKey`。
+pub const HirId = enum(u32) {
+    _,
+
+    /// 由项内 0-based 整数序号构造 `HirId`。
+    pub inline fn fromIndex(idx: u32) HirId {
+        return @fromBackingInt(@intCast(idx));
+    }
+
+    /// 获取底层项内 0-based 整数序号。
+    pub inline fn index(self: HirId) u32 {
+        return @backingInt(self);
+    }
+};
+
+/// HIR 节点的跨项全局身份标识。
+pub const HirKey = struct {
+    /// 所属声明项句柄。
+    item: ItemId,
+    /// 项内 HIR 节点句柄。
+    hir: HirId,
+
+    /// 判定两个 `HirKey` 是否相等。
+    pub inline fn eql(a: HirKey, b: HirKey) bool {
+        return a.item == b.item and a.hir == b.hir;
+    }
+};
 
 /// 源码中的一个名字及其字节区间。
 pub const Name = struct {
@@ -277,6 +329,8 @@ pub const TypePathSegment = struct {
 
 /// 类型位置的点分路径载荷，例如 `Int64`、`a.b.List<Int64>`。
 pub const PathType = struct {
+    /// 项内 HIR 节点句柄。
+    id: HirId = .fromIndex(0),
     /// 点分路径的各个段。
     segments: []const TypePathSegment,
     /// 节点在源文件中的左闭右开字节区间。
@@ -295,6 +349,8 @@ pub const HirTypeElement = struct {
 
 /// 可空类型载荷，例如 `?T`。
 pub const OptionalType = struct {
+    /// 项内 HIR 节点句柄。
+    id: HirId = .fromIndex(0),
     /// 被包裹的内层类型。
     inner: *const HirType,
     /// 节点在源文件中的左闭右开字节区间。
@@ -303,6 +359,8 @@ pub const OptionalType = struct {
 
 /// 元组类型载荷，例如 `(Int64, String)` 或 `(x: Int64, y: Int64)`。
 pub const TupleType = struct {
+    /// 项内 HIR 节点句柄。
+    id: HirId = .fromIndex(0),
     /// 元组各元素类型。
     elements: []const HirTypeElement,
     /// 节点在源文件中的左闭右开字节区间。
@@ -311,6 +369,8 @@ pub const TupleType = struct {
 
 /// 函数类型载荷，例如 `(Int64) -> Bool` 或 `(x: Int64) -> Bool`。
 pub const FuncType = struct {
+    /// 项内 HIR 节点句柄。
+    id: HirId = .fromIndex(0),
     /// 参数类型列表。
     params: []const HirTypeElement = &.{},
     /// 返回类型。
@@ -321,6 +381,8 @@ pub const FuncType = struct {
 
 /// 值数组类型载荷，例如 `VArray<Int64, $4>`。
 pub const VArrayType = struct {
+    /// 项内 HIR 节点句柄。
+    id: HirId = .fromIndex(0),
     /// 元素类型。
     elem: *const HirType,
     /// 长度字面量的源码文本（`$4` 中的 `4`），不保存为定宽数值。
@@ -331,6 +393,8 @@ pub const VArrayType = struct {
 
 /// `This` 类型载荷。
 pub const ThisType = struct {
+    /// 项内 HIR 节点句柄。
+    id: HirId = .fromIndex(0),
     /// 节点在源文件中的左闭右开字节区间。
     range: TextRange,
 };
@@ -352,6 +416,15 @@ pub const HirType = union(enum) {
             inline else => |*payload| payload.range,
         };
     }
+
+    /// 统一获取当前类型节点的项内 `HirId`。
+    ///
+    /// 指针内存约定：`self` 仅作只读借用，不转移所有权。
+    pub inline fn id(self: *const HirType) HirId {
+        return switch (self.*) {
+            inline else => |*payload| payload.id,
+        };
+    }
 };
 
 /// 整数字面量表达式载荷。
@@ -359,6 +432,8 @@ pub const HirType = union(enum) {
 /// 字面量在宏实参等非表达式位置可以超出所有整数类型的范围，因此这里不保存解析后的数值，
 /// 只保留完整源码文本。需要数值的阶段按 `text` 解析并做类型范围检查。
 pub const IntLit = struct {
+    /// 项内 HIR 节点句柄。
+    id: HirId = .fromIndex(0),
     /// 字面量源码文本，包含进制前缀、下划线分隔符与类型后缀。
     text: []const u8,
     /// 可选显式类型后缀（如 `i32`、`u64`）；未显式指定后缀时为 null。
@@ -371,6 +446,8 @@ pub const IntLit = struct {
 ///
 /// 与 `IntLit` 相同，不保存解析后的数值，避免对字面量大小做任何预设。
 pub const FloatLit = struct {
+    /// 项内 HIR 节点句柄。
+    id: HirId = .fromIndex(0),
     /// 字面量源码文本，包含小数点、指数、下划线分隔符与类型后缀。
     text: []const u8,
     /// 可选显式类型后缀（如 `f32`、`f64`）；未显式指定后缀时为 null。
@@ -381,6 +458,8 @@ pub const FloatLit = struct {
 
 /// 字符字面量表达式载荷。
 pub const RuneLit = struct {
+    /// 项内 HIR 节点句柄。
+    id: HirId = .fromIndex(0),
     /// 解码后的码点值；`b'x'` 形式的字节字面量取 `0` 到 `255`。
     value: u21,
     /// 是否为 `b'x'` 字节字面量。
@@ -391,6 +470,8 @@ pub const RuneLit = struct {
 
 /// 字符串字面量表达式载荷。
 pub const StringLit = struct {
+    /// 项内 HIR 节点句柄。
+    id: HirId = .fromIndex(0),
     /// 字符串字面量的源码文本内容，不含插值。
     text: []const u8,
     /// 书写形式。
@@ -423,6 +504,8 @@ pub const StrPart = union(enum) {
 
 /// 带插值的字符串字面量表达式载荷。
 pub const StrInterp = struct {
+    /// 项内 HIR 节点句柄。
+    id: HirId = .fromIndex(0),
     /// 按源码顺序交替排列的文本片段与插值片段。
     parts: []const StrPart,
     /// 书写形式。
@@ -433,6 +516,8 @@ pub const StrInterp = struct {
 
 /// 布尔字面量表达式载荷。
 pub const BoolLit = struct {
+    /// 项内 HIR 节点句柄。
+    id: HirId = .fromIndex(0),
     /// 布尔值（`true` 或 `false`）。
     value: bool,
     /// 节点在源文件中的左闭右开字节区间。
@@ -441,6 +526,8 @@ pub const BoolLit = struct {
 
 /// 无载荷节点的字节区间，用于 `()`、`_`、`break` 等不含子结构的节点。
 pub const Bare = struct {
+    /// 项内 HIR 节点句柄。
+    id: HirId = .fromIndex(0),
     /// 节点在源文件中的左闭右开字节区间。
     range: TextRange,
 };
@@ -455,6 +542,8 @@ pub const ExprPathSegment = struct {
 
 /// 路径表达式载荷，例如 `x`、`std.io.println`、`this.x`、`Int64.Max`。
 pub const PathExpr = struct {
+    /// 项内 HIR 节点句柄。
+    id: HirId = .fromIndex(0),
     /// 点分路径的各个段，至少一段。
     segments: []const ExprPathSegment,
     /// 节点在源文件中的左闭右开字节区间。
@@ -463,6 +552,8 @@ pub const PathExpr = struct {
 
 /// 字段访问表达式载荷，例如 `obj.field` 与带显式类型实参的成员引用 `obj.method<Int64>`。
 pub const FieldExpr = struct {
+    /// 项内 HIR 节点句柄。
+    id: HirId = .fromIndex(0),
     /// 接收者表达式。
     base: *const HirExpr,
     /// 字段或成员名称。
@@ -475,6 +566,8 @@ pub const FieldExpr = struct {
 
 /// 后缀可选标记载荷，例如 `a?.b`、`c?(d)`、`e?[f]` 中的 `?`。
 pub const OptionalExpr = struct {
+    /// 项内 HIR 节点句柄。
+    id: HirId = .fromIndex(0),
     /// 被施加 `?` 的操作数。
     operand: *const HirExpr,
     /// 节点在源文件中的左闭右开字节区间。
@@ -495,6 +588,8 @@ pub const HirCallArg = struct {
 
 /// 函数或方法调用表达式载荷。
 pub const CallExpr = struct {
+    /// 项内 HIR 节点句柄。
+    id: HirId = .fromIndex(0),
     /// 被调用的目标表达式。
     callee: *const HirExpr,
     /// 圆括号内的实参列表。
@@ -507,6 +602,8 @@ pub const CallExpr = struct {
 
 /// 下标索引表达式载荷，例如 `arr[i]`、多维索引 `matrix[i, j]` 与切片下标 `arr[1..5]`。
 pub const IndexExpr = struct {
+    /// 项内 HIR 节点句柄。
+    id: HirId = .fromIndex(0),
     /// 被索引的容器表达式。
     base: *const HirExpr,
     /// 索引表达式列表，区间表达式与开区间下标使用 `HirExpr.range`。
@@ -517,6 +614,8 @@ pub const IndexExpr = struct {
 
 /// 后缀自增自减表达式载荷。
 pub const IncDecExpr = struct {
+    /// 项内 HIR 节点句柄。
+    id: HirId = .fromIndex(0),
     /// 自增自减运算符。
     op: IncDecOp,
     /// 操作数表达式。
@@ -527,6 +626,8 @@ pub const IncDecExpr = struct {
 
 /// 前缀一元运算表达式载荷。
 pub const UnaryExpr = struct {
+    /// 项内 HIR 节点句柄。
+    id: HirId = .fromIndex(0),
     /// 前缀一元运算符。
     op: UnaryOp,
     /// 操作数表达式。
@@ -537,6 +638,8 @@ pub const UnaryExpr = struct {
 
 /// 二元运算表达式载荷。
 pub const BinaryExpr = struct {
+    /// 项内 HIR 节点句柄。
+    id: HirId = .fromIndex(0),
     /// 二元运算符。
     op: BinaryOp,
     /// 左操作数表达式。
@@ -549,6 +652,8 @@ pub const BinaryExpr = struct {
 
 /// 赋值与复合赋值表达式载荷。
 pub const AssignExpr = struct {
+    /// 项内 HIR 节点句柄。
+    id: HirId = .fromIndex(0),
     /// 赋值运算符。
     op: AssignOp,
     /// 赋值目标表达式。
@@ -561,6 +666,8 @@ pub const AssignExpr = struct {
 
 /// 区间表达式载荷，例如 `a..b`、`a..=b`、`a..=b:step`，以及下标位置的 `..b`、`a..`。
 pub const RangeExpr = struct {
+    /// 项内 HIR 节点句柄。
+    id: HirId = .fromIndex(0),
     /// 可选起始端点；下标位置的 `..b` 为 null。
     start: ?*const HirExpr = null,
     /// 可选结束端点；下标位置的 `a..` 为 null。
@@ -575,6 +682,8 @@ pub const RangeExpr = struct {
 
 /// `is` 类型判定表达式载荷。
 pub const IsExpr = struct {
+    /// 项内 HIR 节点句柄。
+    id: HirId = .fromIndex(0),
     /// 被判定类型的操作数。
     operand: *const HirExpr,
     /// 判定目标类型。
@@ -585,6 +694,8 @@ pub const IsExpr = struct {
 
 /// `as` 类型转换表达式载荷。
 pub const AsExpr = struct {
+    /// 项内 HIR 节点句柄。
+    id: HirId = .fromIndex(0),
     /// 被转换的操作数。
     operand: *const HirExpr,
     /// 转换目标类型。
@@ -595,6 +706,8 @@ pub const AsExpr = struct {
 
 /// 内置类型转换表达式载荷，例如 `Int64(x)`、`Rune(65)`。
 pub const TypeConvExpr = struct {
+    /// 项内 HIR 节点句柄。
+    id: HirId = .fromIndex(0),
     /// 目标内置类型。
     ty: *const HirType,
     /// 被转换的表达式。
@@ -605,6 +718,8 @@ pub const TypeConvExpr = struct {
 
 /// `VArray<T, $N>(...)` 构造表达式载荷。
 pub const VArrayExpr = struct {
+    /// 项内 HIR 节点句柄。
+    id: HirId = .fromIndex(0),
     /// 值数组类型。
     ty: *const HirType,
     /// 圆括号内的实参。
@@ -617,6 +732,8 @@ pub const VArrayExpr = struct {
 
 /// 元组字面量载荷，例如 `(1, 2)`。
 pub const TupleLit = struct {
+    /// 项内 HIR 节点句柄。
+    id: HirId = .fromIndex(0),
     /// 按源码顺序排列的元素表达式。
     elements: []const HirExpr,
     /// 节点在源文件中的左闭右开字节区间。
@@ -635,6 +752,8 @@ pub const ArrayElement = struct {
 
 /// 数组字面量载荷，例如 `[a, b]`。
 pub const ArrayLit = struct {
+    /// 项内 HIR 节点句柄。
+    id: HirId = .fromIndex(0),
     /// 按源码顺序排列的元素。
     elements: []const ArrayElement,
     /// 节点在源文件中的左闭右开字节区间。
@@ -643,6 +762,8 @@ pub const ArrayLit = struct {
 
 /// 语句块载荷，例如 `{ let x = 1; x + 2 }`。
 pub const BlockExpr = struct {
+    /// 项内 HIR 节点句柄。
+    id: HirId = .fromIndex(0),
     /// 块内除尾表达式之外的语句序列。
     stmts: []const HirStmt = &.{},
     /// 可选尾表达式，作为语句块的求值结果。
@@ -669,6 +790,8 @@ pub const HirCondition = union(enum) {
 
 /// 条件分支表达式载荷，例如 `if (cond) { ... } else { ... }`。
 pub const IfExpr = struct {
+    /// 项内 HIR 节点句柄。
+    id: HirId = .fromIndex(0),
     /// 条件。
     condition: HirCondition,
     /// 条件成立时执行的语句块。
@@ -709,6 +832,8 @@ pub const MatchCase = union(enum) {
 
 /// `match` 表达式载荷。
 pub const MatchExpr = struct {
+    /// 项内 HIR 节点句柄。
+    id: HirId = .fromIndex(0),
     /// 可选选择器；无选择器 `match` 的各分支使用表达式分支。
     selector: ?*const HirExpr = null,
     /// 分支列表。
@@ -719,6 +844,8 @@ pub const MatchExpr = struct {
 
 /// 循环表达式载荷，例如 `while (cond) { ... }`。
 pub const WhileExpr = struct {
+    /// 项内 HIR 节点句柄。
+    id: HirId = .fromIndex(0),
     /// 循环条件。
     condition: HirCondition,
     /// 循环体语句块。
@@ -729,6 +856,8 @@ pub const WhileExpr = struct {
 
 /// `do { ... } while (cond)` 表达式载荷。
 pub const DoWhileExpr = struct {
+    /// 项内 HIR 节点句柄。
+    id: HirId = .fromIndex(0),
     /// 循环体语句块。
     body: *const BlockExpr,
     /// 循环条件。
@@ -739,6 +868,8 @@ pub const DoWhileExpr = struct {
 
 /// `for (pattern in iterable) { ... }` 表达式载荷。
 pub const ForInExpr = struct {
+    /// 项内 HIR 节点句柄。
+    id: HirId = .fromIndex(0),
     /// 迭代变量模式。
     pattern: *const HirPattern,
     /// 被迭代的表达式。
@@ -753,6 +884,8 @@ pub const ForInExpr = struct {
 
 /// `try` 语句的单个资源声明，例如 `try (f: File = open()) { ... }` 中的 `f: File = open()`。
 pub const Resource = struct {
+    /// 项内 HIR 节点句柄。
+    id: HirId = .fromIndex(0),
     /// 资源名称。
     name: Name,
     /// 可选类型标注。
@@ -791,6 +924,8 @@ pub const TryClause = union(enum) {
 
 /// `try` 表达式载荷，例如 `try { ... } catch (e) { ... } finally { ... }`。
 pub const TryExpr = struct {
+    /// 项内 HIR 节点句柄。
+    id: HirId = .fromIndex(0),
     /// 资源声明列表；无资源时为切片为空。
     resources: []const Resource = &.{},
     /// 受保护语句块。
@@ -805,6 +940,8 @@ pub const TryExpr = struct {
 
 /// `throw expr` 表达式载荷。
 pub const ThrowExpr = struct {
+    /// 项内 HIR 节点句柄。
+    id: HirId = .fromIndex(0),
     /// 抛出的表达式。
     value: *const HirExpr,
     /// 节点在源文件中的左闭右开字节区间。
@@ -813,6 +950,8 @@ pub const ThrowExpr = struct {
 
 /// `return` 表达式载荷。
 pub const ReturnExpr = struct {
+    /// 项内 HIR 节点句柄。
+    id: HirId = .fromIndex(0),
     /// 可选返回值表达式。
     value: ?*const HirExpr = null,
     /// 节点在源文件中的左闭右开字节区间。
@@ -821,6 +960,8 @@ pub const ReturnExpr = struct {
 
 /// `break` 或 `continue` 表达式载荷。
 pub const JumpExpr = struct {
+    /// 项内 HIR 节点句柄。
+    id: HirId = .fromIndex(0),
     /// 跳转关键字。
     op: JumpOp,
     /// 节点在源文件中的左闭右开字节区间。
@@ -829,6 +970,8 @@ pub const JumpExpr = struct {
 
 /// lambda 表达式载荷，例如 `{ x => x + 1 }`。
 pub const LambdaExpr = struct {
+    /// 项内 HIR 节点句柄。
+    id: HirId = .fromIndex(0),
     /// 参数表之前的内置注解。
     annotations: []const Annotation = &.{},
     /// 参数列表；省略参数时为切片为空。
@@ -843,6 +986,8 @@ pub const LambdaExpr = struct {
 
 /// `spawn` 表达式载荷，例如 `spawn (ctx) { ... }`。
 pub const SpawnExpr = struct {
+    /// 项内 HIR 节点句柄。
+    id: HirId = .fromIndex(0),
     /// 可选上下文表达式。
     context: ?*const HirExpr = null,
     /// 任务表达式，通常为 `.lambda`。
@@ -853,6 +998,8 @@ pub const SpawnExpr = struct {
 
 /// `synchronized (mutex) { ... }` 表达式载荷。
 pub const SynchronizedExpr = struct {
+    /// 项内 HIR 节点句柄。
+    id: HirId = .fromIndex(0),
     /// 互斥量表达式。
     mutex: *const HirExpr,
     /// 受保护语句块。
@@ -863,6 +1010,8 @@ pub const SynchronizedExpr = struct {
 
 /// `unsafe { ... }` 表达式载荷。
 pub const UnsafeExpr = struct {
+    /// 项内 HIR 节点句柄。
+    id: HirId = .fromIndex(0),
     /// 语句块。
     body: *const BlockExpr,
     /// 节点在源文件中的左闭右开字节区间。
@@ -879,6 +1028,8 @@ pub const QuotePart = union(enum) {
 
 /// `quote(...)` 表达式载荷。
 pub const QuoteExpr = struct {
+    /// 项内 HIR 节点句柄。
+    id: HirId = .fromIndex(0),
     /// 按源码顺序排列的词法单元片段与插值片段。
     parts: []const QuotePart = &.{},
     /// 节点在源文件中的左闭右开字节区间。
@@ -899,6 +1050,8 @@ pub const MacroCall = struct {
 
 /// 表达式位置的宏调用载荷。宏的括号输入保留在 CST 中。
 pub const MacroCallExpr = struct {
+    /// 项内 HIR 节点句柄。
+    id: HirId = .fromIndex(0),
     /// 宏名与调用标记。
     call: MacroCall,
     /// 链式宏调用中内层宏调用表达式。
@@ -909,6 +1062,8 @@ pub const MacroCallExpr = struct {
 
 /// `@IfAvailable(...)` 表达式载荷。
 pub const IfAvailableExpr = struct {
+    /// 项内 HIR 节点句柄。
+    id: HirId = .fromIndex(0),
     /// 圆括号内的实参。
     args: []const HirCallArg,
     /// 节点在源文件中的左闭右开字节区间。
@@ -917,6 +1072,8 @@ pub const IfAvailableExpr = struct {
 
 /// `perform expr` 表达式载荷。
 pub const PerformExpr = struct {
+    /// 项内 HIR 节点句柄。
+    id: HirId = .fromIndex(0),
     /// 被执行的效应命令表达式。
     value: *const HirExpr,
     /// 节点在源文件中的左闭右开字节区间。
@@ -933,6 +1090,8 @@ pub const ResumeModifier = enum(u8) {
 
 /// `resume` 表达式载荷，例如 `resume value with expr throwing expr`。
 pub const ResumeExpr = struct {
+    /// 项内 HIR 节点句柄。
+    id: HirId = .fromIndex(0),
     /// 可选恢复值表达式。
     value: ?*const HirExpr = null,
     /// 可选附加关键字。
@@ -997,16 +1156,29 @@ pub const HirExpr = union(enum) {
             inline else => |*payload| payload.range,
         };
     }
+
+    /// 统一获取当前表达式节点的项内 `HirId`。
+    ///
+    /// 指针内存约定：`self` 仅作只读借用，不转移所有权。
+    pub inline fn id(self: *const HirExpr) HirId {
+        return switch (self.*) {
+            inline else => |*payload| payload.id,
+        };
+    }
 };
 
 /// 通配符模式载荷。
 pub const WildcardPattern = struct {
+    /// 项内 HIR 节点句柄。
+    id: HirId = .fromIndex(0),
     /// 节点在源文件中的左闭右开字节区间。
     range: TextRange,
 };
 
 /// 变量绑定模式载荷。
 pub const BindingPattern = struct {
+    /// 项内 HIR 节点句柄。
+    id: HirId = .fromIndex(0),
     /// 绑定变量名称。
     name: Name,
     /// 节点在源文件中的左闭右开字节区间。
@@ -1015,6 +1187,8 @@ pub const BindingPattern = struct {
 
 /// 字面量常量模式载荷。
 pub const ConstPattern = struct {
+    /// 项内 HIR 节点句柄。
+    id: HirId = .fromIndex(0),
     /// 字面量表达式，负数字面量的负号包含在值表达式内。
     value: *const HirExpr,
     /// 节点在源文件中的左闭右开字节区间。
@@ -1023,6 +1197,8 @@ pub const ConstPattern = struct {
 
 /// 元组模式载荷。
 pub const TuplePattern = struct {
+    /// 项内 HIR 节点句柄。
+    id: HirId = .fromIndex(0),
     /// 按源码顺序排列的元素模式。
     elements: []const HirPattern,
     /// 节点在源文件中的左闭右开字节区间。
@@ -1031,6 +1207,8 @@ pub const TuplePattern = struct {
 
 /// 枚举构造器模式载荷，例如 `Some(x)`、`Color.Red`。
 pub const EnumPattern = struct {
+    /// 项内 HIR 节点句柄。
+    id: HirId = .fromIndex(0),
     /// 构造器路径。
     path: PathType,
     /// 圆括号内的子模式列表；无子模式时为空切片。
@@ -1041,6 +1219,8 @@ pub const EnumPattern = struct {
 
 /// 类型模式载荷，例如 `x: Int64`、`_: Int64`。
 pub const TypePattern = struct {
+    /// 项内 HIR 节点句柄。
+    id: HirId = .fromIndex(0),
     /// 可选绑定名称；`_` 为 null。
     name: ?Name = null,
     /// 绑定的类型。
@@ -1051,6 +1231,8 @@ pub const TypePattern = struct {
 
 /// `catch` 与 `handle` 的类型模式载荷，例如 `e: Exception`、`e: A | B`。
 pub const ClausePattern = struct {
+    /// 项内 HIR 节点句柄。
+    id: HirId = .fromIndex(0),
     /// 可选绑定名称；`_` 为 null。
     name: ?Name = null,
     /// 类型列表，至少一项。
@@ -1078,10 +1260,21 @@ pub const HirPattern = union(enum) {
             inline else => |*payload| payload.range,
         };
     }
+
+    /// 统一获取当前模式节点的项内 `HirId`。
+    ///
+    /// 指针内存约定：`self` 仅作只读借用，不转移所有权。
+    pub inline fn id(self: *const HirPattern) HirId {
+        return switch (self.*) {
+            inline else => |*payload| payload.id,
+        };
+    }
 };
 
 /// 局部绑定语句或成员字段声明载荷（`let` / `var` / `const`）。
 pub const Binding = struct {
+    /// 项内 HIR 节点句柄。
+    id: HirId = .fromIndex(0),
     /// 声明修饰符，顶层与成员位置可为空切片。
     modifiers: []const Modifier = &.{},
     /// 声明上的注解。
@@ -1100,6 +1293,8 @@ pub const Binding = struct {
 
 /// 表达式语句载荷。
 pub const ExprStmt = struct {
+    /// 项内 HIR 节点句柄。
+    id: HirId = .fromIndex(0),
     /// 语句包含的表达式。
     value: *const HirExpr,
     /// 语句末尾是否带有显式分号。
@@ -1123,10 +1318,22 @@ pub const HirStmt = union(enum) {
             inline else => |*payload| payload.range,
         };
     }
+
+    /// 统一获取当前语句节点的项内 `HirId`。
+    ///
+    /// 指针内存约定：`self` 仅作只读借用，不转移所有权。
+    pub inline fn id(self: *const HirStmt) HirId {
+        return switch (self.*) {
+            .item => |*payload| payload.id(),
+            inline else => |*payload| payload.id,
+        };
+    }
 };
 
 /// 函数形参定义。
 pub const HirParam = struct {
+    /// 项内 HIR 节点句柄。
+    id: HirId = .fromIndex(0),
     /// 参数修饰符，例如主构造器成员参数上的访问修饰符。
     modifiers: []const Modifier = &.{},
     /// 参数上的注解。
@@ -1147,6 +1354,8 @@ pub const HirParam = struct {
 
 /// 参数位置的宏调用载荷。
 pub const ParamMacro = struct {
+    /// 项内 HIR 节点句柄。
+    id: HirId = .fromIndex(0),
     /// 宏之前的注解。
     annotations: []const Annotation = &.{},
     /// 宏名与调用标记。
@@ -1161,6 +1370,24 @@ pub const ParamMacro = struct {
 pub const Param = union(enum) {
     param: HirParam,
     macro_call: ParamMacro,
+
+    /// 统一获取当前参数节点覆盖的源文件字节区间。
+    ///
+    /// 指针内存约定：`self` 仅作只读借用，不转移所有权。
+    pub inline fn range(self: *const Param) TextRange {
+        return switch (self.*) {
+            inline else => |*payload| payload.range,
+        };
+    }
+
+    /// 统一获取当前参数节点的项内 `HirId`。
+    ///
+    /// 指针内存约定：`self` 仅作只读借用，不转移所有权。
+    pub inline fn id(self: *const Param) HirId {
+        return switch (self.*) {
+            inline else => |*payload| payload.id,
+        };
+    }
 };
 
 /// 函数名：普通标识符或可重载运算符。
@@ -1191,6 +1418,8 @@ pub const WhereClause = struct {
 
 /// 函数声明项载荷。
 pub const FuncItem = struct {
+    /// 项内 HIR 节点句柄。
+    id: HirId = .fromIndex(0),
     /// 声明修饰符。
     modifiers: []const Modifier = &.{},
     /// 声明上的注解。
@@ -1215,6 +1444,8 @@ pub const FuncItem = struct {
 
 /// 程序入口 `main` 声明项载荷。
 pub const MainItem = struct {
+    /// 项内 HIR 节点句柄。
+    id: HirId = .fromIndex(0),
     /// 声明修饰符。
     modifiers: []const Modifier = &.{},
     /// 声明上的注解。
@@ -1233,6 +1464,8 @@ pub const MainItem = struct {
 
 /// 类声明项载荷。
 pub const ClassItem = struct {
+    /// 项内 HIR 节点句柄。
+    id: HirId = .fromIndex(0),
     /// 声明修饰符。
     modifiers: []const Modifier = &.{},
     /// 声明上的注解。
@@ -1253,6 +1486,8 @@ pub const ClassItem = struct {
 
 /// 结构体声明项载荷。
 pub const StructItem = struct {
+    /// 项内 HIR 节点句柄。
+    id: HirId = .fromIndex(0),
     /// 声明修饰符。
     modifiers: []const Modifier = &.{},
     /// 声明上的注解。
@@ -1289,6 +1524,8 @@ pub const EnumPayloadElement = union(enum) {
 
 /// 枚举构造器定义。
 pub const EnumConstructor = struct {
+    /// 项内 HIR 节点句柄。
+    id: HirId = .fromIndex(0),
     /// 构造器上的注解。
     annotations: []const Annotation = &.{},
     /// 构造器名称。
@@ -1301,6 +1538,8 @@ pub const EnumConstructor = struct {
 
 /// 枚举构造器位置的宏调用载荷。
 pub const VariantMacro = struct {
+    /// 项内 HIR 节点句柄。
+    id: HirId = .fromIndex(0),
     /// 宏之前的注解。
     annotations: []const Annotation = &.{},
     /// 宏名与调用标记。
@@ -1315,10 +1554,30 @@ pub const VariantMacro = struct {
 pub const EnumVariant = union(enum) {
     constructor: EnumConstructor,
     macro_call: VariantMacro,
+
+    /// 统一获取当前枚举构造器元素覆盖的源文件字节区间。
+    ///
+    /// 指针内存约定：`self` 仅作只读借用，不转移所有权。
+    pub inline fn range(self: *const EnumVariant) TextRange {
+        return switch (self.*) {
+            inline else => |*payload| payload.range,
+        };
+    }
+
+    /// 统一获取当前枚举构造器元素的项内 `HirId`。
+    ///
+    /// 指针内存约定：`self` 仅作只读借用，不转移所有权。
+    pub inline fn id(self: *const EnumVariant) HirId {
+        return switch (self.*) {
+            inline else => |*payload| payload.id,
+        };
+    }
 };
 
 /// 枚举声明项载荷。
 pub const EnumItem = struct {
+    /// 项内 HIR 节点句柄。
+    id: HirId = .fromIndex(0),
     /// 声明修饰符。
     modifiers: []const Modifier = &.{},
     /// 声明上的注解。
@@ -1343,6 +1602,8 @@ pub const EnumItem = struct {
 
 /// 接口声明项载荷。
 pub const InterfaceItem = struct {
+    /// 项内 HIR 节点句柄。
+    id: HirId = .fromIndex(0),
     /// 声明修饰符。
     modifiers: []const Modifier = &.{},
     /// 声明上的注解。
@@ -1363,6 +1624,8 @@ pub const InterfaceItem = struct {
 
 /// 类型扩展与接口实现项载荷，对应 `extend` 声明。
 pub const ExtendItem = struct {
+    /// 项内 HIR 节点句柄。
+    id: HirId = .fromIndex(0),
     /// 声明修饰符。
     modifiers: []const Modifier = &.{},
     /// 声明上的注解。
@@ -1383,6 +1646,8 @@ pub const ExtendItem = struct {
 
 /// 属性访问器载荷，例如 `get() { ... }`、`set(value) { ... }`。
 pub const PropAccessor = struct {
+    /// 项内 HIR 节点句柄。
+    id: HirId = .fromIndex(0),
     /// 访问器名称（`get` 或 `set`）。
     name: Name,
     /// 访问器参数列表，`set` 的值参数由 CST 中的标识符叶子构造。
@@ -1395,6 +1660,8 @@ pub const PropAccessor = struct {
 
 /// 属性声明项载荷。
 pub const PropItem = struct {
+    /// 项内 HIR 节点句柄。
+    id: HirId = .fromIndex(0),
     /// 声明修饰符。
     modifiers: []const Modifier = &.{},
     /// 声明上的注解。
@@ -1411,6 +1678,8 @@ pub const PropItem = struct {
 
 /// 类型别名声明项载荷，例如 `type Alias<T> = Foo<T>`。
 pub const TypeAliasItem = struct {
+    /// 项内 HIR 节点句柄。
+    id: HirId = .fromIndex(0),
     /// 声明修饰符。
     modifiers: []const Modifier = &.{},
     /// 声明上的注解。
@@ -1427,6 +1696,8 @@ pub const TypeAliasItem = struct {
 
 /// 构造函数与静态初始化器载荷，对应 `init(...) { ... }`。
 pub const InitItem = struct {
+    /// 项内 HIR 节点句柄。
+    id: HirId = .fromIndex(0),
     /// 声明修饰符。
     modifiers: []const Modifier = &.{},
     /// 声明上的注解。
@@ -1443,6 +1714,8 @@ pub const InitItem = struct {
 
 /// 类终结器载荷，对应 `~init() { ... }`。
 pub const FinalizerItem = struct {
+    /// 项内 HIR 节点句柄。
+    id: HirId = .fromIndex(0),
     /// 声明修饰符。
     modifiers: []const Modifier = &.{},
     /// 声明上的注解。
@@ -1459,6 +1732,8 @@ pub const FinalizerItem = struct {
 
 /// 类或结构体主构造器载荷，例如 `Point(let x: Int64) { ... }`。
 pub const PrimaryCtorItem = struct {
+    /// 项内 HIR 节点句柄。
+    id: HirId = .fromIndex(0),
     /// 声明修饰符。
     modifiers: []const Modifier = &.{},
     /// 声明上的注解。
@@ -1477,6 +1752,8 @@ pub const PrimaryCtorItem = struct {
 
 /// 宏定义声明项载荷。
 pub const MacroItem = struct {
+    /// 项内 HIR 节点句柄。
+    id: HirId = .fromIndex(0),
     /// 声明修饰符。
     modifiers: []const Modifier = &.{},
     /// 声明上的注解。
@@ -1497,6 +1774,8 @@ pub const MacroItem = struct {
 
 /// 声明位置的宏调用载荷。宏的括号输入与属性保留在 CST 中。
 pub const MacroExpandItem = struct {
+    /// 项内 HIR 节点句柄。
+    id: HirId = .fromIndex(0),
     /// 宏之前的注解。
     annotations: []const Annotation = &.{},
     /// 宏名与调用标记。
@@ -1509,6 +1788,8 @@ pub const MacroExpandItem = struct {
 
 /// 外部声明载荷，对应 `foreign func ...` 与 `foreign { ... }`。
 pub const ForeignItem = struct {
+    /// 项内 HIR 节点句柄。
+    id: HirId = .fromIndex(0),
     /// 声明修饰符。
     modifiers: []const Modifier = &.{},
     /// 声明上的注解。
@@ -1612,7 +1893,237 @@ pub const HirItem = union(enum) {
             inline else => |*payload| payload.range,
         };
     }
+
+    /// 统一获取当前声明项节点的项内 `HirId`。
+    ///
+    /// 指针内存约定：`self` 仅作只读借用，不转移所有权。
+    pub inline fn id(self: *const HirItem) HirId {
+        return switch (self.*) {
+            inline else => |*payload| payload.id,
+        };
+    }
 };
+
+/// 项内 HIR 节点池中的统一只读节点视图。
+///
+/// 在 `LoweredItem.nodes` 中按 `HirId.index()` 顺序存放，满足 `nodes[i].id().index() == i`。
+/// 指针内存约定：内部持有的节点指针均借用自所属 `arena`，随 `arena` 统一释放，调用者不得单独释放。
+pub const HirNode = union(enum) {
+    item: *const HirItem,
+    stmt: *const HirStmt,
+    expr: *const HirExpr,
+    block: *const BlockExpr,
+    pattern: *const HirPattern,
+    ty: *const HirType,
+    param: *const Param,
+    variant: *const EnumVariant,
+    prop_accessor: *const PropAccessor,
+    resource: *const Resource,
+
+    /// 统一获取当前 HIR 节点覆盖的源文件字节区间。
+    ///
+    /// 指针内存约定：`self` 内部指针仅作只读借用，不转移所有权。
+    pub inline fn range(self: HirNode) TextRange {
+        return switch (self) {
+            .block => |b| b.range,
+            .prop_accessor => |a| a.range,
+            .resource => |r| r.range,
+            inline else => |ptr| ptr.range(),
+        };
+    }
+
+    /// 统一获取当前 HIR 节点的项内 `HirId`。
+    ///
+    /// 指针内存约定：`self` 内部指针仅作只读借用，不转移所有权。
+    pub inline fn id(self: HirNode) HirId {
+        return switch (self) {
+            .block => |b| b.id,
+            .prop_accessor => |a| a.id,
+            .resource => |r| r.id,
+            inline else => |ptr| ptr.id(),
+        };
+    }
+};
+
+/// 判定给定 CST 标签是否为空白、换行或普通非文档注释等前导 Trivia。
+inline fn isLeadingTriviaKind(kind: SyntaxKind) bool {
+    return switch (kind) {
+        .whitespace, .newline, .line_comment, .block_comment, .doc_comment => true,
+        else => false,
+    };
+}
+
+/// Green CST 节点到 HIR 节点全局标识（`HirKey`）的映射表。
+///
+/// 映射范围约定：
+/// - 建立映射的节点：声明项根（`HirItem`）、语句根（`HirStmt`）、表达式根（`HirExpr`，含字面量叶子）、
+///   语句块（`block` 与 `match` 分支体 `stmt_list`）、模式根（`HirPattern`）、类型根（`HirType`）、
+///   形参（`func_param`/`macro_expand_param`）、枚举构造器（`enum_constructor`）、属性访问器（`prop_getter`/`prop_setter`）、
+///   `try` 资源声明（`resource_spec`），以及穿透映射到内层节点的包装节点（`paren_expr`、`paren_type`、
+///   `trailing_closure_expr`、`quote_interpolation`、包裹了声明的 `error_node`）。
+/// - 不建立映射的节点：空白、换行、注释、关键字、纯标点符号（`{`、`}`、`(`、`)`、`;` 等），
+///   以及文件头部的 `package_header`、`features_directive`、`import_spec`。
+///
+/// 内存约定：哈希表桶内存由传入 `put` 的 `allocator` 分配；若传入 `arena` 则随 `arena` 统一释放，
+/// 若传入通用分配器则调用者结束后须使用同一 `allocator` 调用 `deinit` 释放。
+pub const GreenToHirMap = struct {
+    by_green: std.AutoHashMapUnmanaged(usize, HirKey) = .empty,
+
+    /// 空映射表常量。
+    pub const empty: GreenToHirMap = .{};
+
+    /// 释放映射表内部哈希桶内存。
+    pub fn deinit(self: *GreenToHirMap, allocator: std.mem.Allocator) void {
+        self.by_green.deinit(allocator);
+        self.* = undefined;
+    }
+
+    /// 清空全部映射记录并保留已分配的哈希桶容量。
+    pub inline fn clearRetainingCapacity(self: *GreenToHirMap) void {
+        self.by_green.clearRetainingCapacity();
+    }
+
+    /// 返回当前已登记的映射条目总数。
+    pub inline fn count(self: *const GreenToHirMap) usize {
+        return self.by_green.count();
+    }
+
+    /// 建立从 `green` 节点到 `{ item, hir }` 的映射。
+    ///
+    /// 指针内存约定：`green` 仅提取其指针地址（`@intFromPtr(green)`）作为键，不转移所有权，
+    /// 也不由本结构释放；内部桶扩容由 `allocator` 分配。
+    pub fn put(
+        self: *GreenToHirMap,
+        allocator: std.mem.Allocator,
+        green: *const GreenNode,
+        item: ItemId,
+        hir: HirId,
+    ) std.mem.Allocator.Error!void {
+        try self.by_green.put(allocator, @intFromPtr(green), .{
+            .item = item,
+            .hir = hir,
+        });
+    }
+
+    /// 查询 `green` 节点直接对应的 `HirKey`；无直接映射（如关键字、标点或 Trivia）时返回 `null`。
+    ///
+    /// 指针内存约定：`green` 仅作只读地址查询，不转移所有权。
+    pub inline fn get(self: *const GreenToHirMap, green: *const GreenNode) ?HirKey {
+        return self.by_green.get(@intFromPtr(green));
+    }
+
+    /// 从给定 `RedNode` 开始沿父节点链（`RedNode.ancestors()`）向上回溯，
+    /// 返回最近一个存在映射的节点的 `HirKey`；直至根节点仍无映射时返回 `null`。
+    ///
+    /// 指针内存约定：`red` 仅作只读借用，不转移所有权。
+    pub fn resolveNearest(self: *const GreenToHirMap, red: *const RedNode) ?HirKey {
+        var it = red.ancestors();
+        while (it.next()) |node| {
+            if (self.get(node.green)) |key| return key;
+        }
+        return null;
+    }
+
+    /// 在以 `root` 为根的绿树中，按目标节点指针 `target` 查找并返回 `target` 自身或其最近有映射祖先的 `HirKey`；
+    /// 未找到 `target` 或整条祖先链无映射时返回 `null`。
+    ///
+    /// 无需构造 `RedNode` 或分配堆内存。
+    /// 指针内存约定：`root` 与 `target` 仅作只读借用，不转移所有权。
+    pub fn resolveNearestGreen(
+        self: *const GreenToHirMap,
+        root: *const GreenNode,
+        target: *const GreenNode,
+    ) ?HirKey {
+        if (self.get(target)) |direct| return direct;
+        var found_target = false;
+        return self.findNearestGreenRec(root, target, null, &found_target);
+    }
+
+    /// 递归在 `current` 子树中检索 `target` 指针，同时沿路径向下传递最近的有映射祖先 `nearest_ancestor`。
+    ///
+    /// 指针内存约定：`current`、`target` 与 `found_target` 均仅作借用。
+    fn findNearestGreenRec(
+        self: *const GreenToHirMap,
+        current: *const GreenNode,
+        target: *const GreenNode,
+        nearest_ancestor: ?HirKey,
+        found_target: *bool,
+    ) ?HirKey {
+        const cur_nearest = self.get(current) orelse nearest_ancestor;
+        if (current == target) {
+            found_target.* = true;
+            return cur_nearest;
+        }
+        for (current.children()) |child| {
+            const res = self.findNearestGreenRec(child, target, cur_nearest, found_target);
+            if (found_target.*) return res;
+        }
+        return null;
+    }
+
+    /// 在以 `root` 为根、`root_offset` 为绝对起始字节位置的绿树中，定位覆盖字节位置 `offset` 的
+    /// 叶子路径，并返回该路径上最内层有映射节点的 `HirKey`。
+    ///
+    /// 若 `offset` 位于某个内部节点开头的前导空白/注释（leading trivia）上，不会误命中该尚未进入有效语法词法单元的内部节点，
+    /// 会保持外层容器节点（如外层 `block`）的映射。
+    /// 无需构造 `RedNode`，零堆分配，`O(depth)` 时间复杂度。
+    /// 指针内存约定：`root` 仅作只读借用，不转移所有权。
+    pub fn resolveNearestAtOffset(
+        self: *const GreenToHirMap,
+        root: *const GreenNode,
+        root_offset: u32,
+        offset: u32,
+    ) ?HirKey {
+        const root_end = root_offset +| root.text_len;
+        if (offset < root_offset or offset >= root_end) return null;
+
+        var current = root;
+        var current_start = root_offset;
+        var nearest: ?HirKey = if (!isOffsetInLeadingTrivia(current, current_start, offset))
+            self.get(current)
+        else
+            null;
+
+        while (!current.isLeaf()) {
+            var child_start = current_start;
+            var matched: ?*const GreenNode = null;
+            for (current.children()) |child| {
+                const child_end = child_start +| child.text_len;
+                if (offset >= child_start and offset < child_end) {
+                    matched = child;
+                    break;
+                }
+                child_start = child_end;
+            }
+            const next_node = matched orelse break;
+            current = next_node;
+            current_start = child_start;
+            if (!isOffsetInLeadingTrivia(current, current_start, offset)) {
+                if (self.get(current)) |key| {
+                    nearest = key;
+                }
+            }
+        }
+        return nearest;
+    }
+};
+
+/// 判定给定字节位置 `offset` 是否位于该内部节点 `node` 开头的前导 Trivia（空白、换行或注释）区域内。
+///
+/// 指针内存约定：`node` 仅作只读借用，不转移所有权。
+fn isOffsetInLeadingTrivia(node: *const GreenNode, node_start: u32, offset: u32) bool {
+    if (node.isLeaf()) return isLeadingTriviaKind(node.kind);
+    var cur = node_start;
+    for (node.children()) |child| {
+        if (isLeadingTriviaKind(child.kind)) {
+            cur +|= child.text_len;
+            if (offset < cur) return true;
+        } else {
+            return false;
+        }
+    }
+    return false;
+}
 
 /// 单个源文件对应的 HIR 模块根节点。
 ///
@@ -2596,4 +3107,232 @@ test "每个 CST 标签都有 HIR 对应或明确的折叠规则" {
 
     try std.testing.expect(node_count >= 70);
     try std.testing.expect(wrapper_count >= 20);
+}
+
+test "ItemId、HirId、HirKey 与 HirNode 统一访问器" {
+    const item_id = ItemId.fromIndex(3);
+    const hir_id = HirId.fromIndex(7);
+    const key: HirKey = .{ .item = item_id, .hir = hir_id };
+
+    try std.testing.expectEqual(@as(u32, 3), item_id.index());
+    try std.testing.expectEqual(@as(u32, 7), hir_id.index());
+    try std.testing.expect(HirKey.eql(key, .{ .item = .fromIndex(3), .hir = .fromIndex(7) }));
+    try std.testing.expect(!HirKey.eql(key, .{ .item = .fromIndex(4), .hir = .fromIndex(7) }));
+    try std.testing.expect(!HirKey.eql(key, .{ .item = .fromIndex(3), .hir = .fromIndex(8) }));
+
+    const expr_val: HirExpr = .{ .int_lit = .{
+        .id = .fromIndex(10),
+        .text = "42",
+        .range = rng(1, 3),
+    } };
+    const block_val: BlockExpr = .{
+        .id = .fromIndex(11),
+        .range = rng(4, 12),
+    };
+    const pat_val: HirPattern = .{ .wildcard = .{
+        .id = .fromIndex(12),
+        .range = rng(13, 14),
+    } };
+    const ty_val: HirType = .{ .this = .{
+        .id = .fromIndex(13),
+        .range = rng(15, 19),
+    } };
+    const stmt_val: HirStmt = .{ .expr = .{
+        .id = .fromIndex(14),
+        .value = &expr_val,
+        .range = rng(1, 4),
+    } };
+    const item_val: HirItem = .{ .type_alias = .{
+        .id = .fromIndex(15),
+        .name = nm("A", rng(20, 21)),
+        .target = &ty_val,
+        .range = rng(20, 25),
+    } };
+    const param_val: Param = .{ .param = .{
+        .id = .fromIndex(16),
+        .name = nm("p", rng(26, 27)),
+        .range = rng(26, 30),
+    } };
+    const variant_val: EnumVariant = .{ .constructor = .{
+        .id = .fromIndex(17),
+        .name = nm("V", rng(31, 32)),
+        .range = rng(31, 32),
+    } };
+    const accessor_val: PropAccessor = .{
+        .id = .fromIndex(18),
+        .name = nm("get", rng(33, 36)),
+        .body = &block_val,
+        .range = rng(33, 40),
+    };
+    const resource_val: Resource = .{
+        .id = .fromIndex(19),
+        .name = nm("r", rng(41, 42)),
+        .range = rng(41, 45),
+    };
+
+    const nodes = [_]HirNode{
+        .{ .expr = &expr_val },
+        .{ .block = &block_val },
+        .{ .pattern = &pat_val },
+        .{ .ty = &ty_val },
+        .{ .stmt = &stmt_val },
+        .{ .item = &item_val },
+        .{ .param = &param_val },
+        .{ .variant = &variant_val },
+        .{ .prop_accessor = &accessor_val },
+        .{ .resource = &resource_val },
+    };
+
+    for (nodes, 0..) |node, i| {
+        try std.testing.expectEqual(HirId.fromIndex(@intCast(10 + i)), node.id());
+        try std.testing.expect(node.range().end > node.range().start);
+    }
+}
+
+test "GreenToHirMap 直接查询、RedNode 上溯、Green 上溯与字节位置回溯" {
+    const gpa = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    // 构造模拟绿树 `func f{ 1+2; }`（总长 14 字节）
+    const kw_func = try alloc.create(GreenNode);
+    kw_func.* = .{ .kind = .kw_func, .text_len = 4, .payload = .{ .leaf = "func" } };
+    const ws1 = try alloc.create(GreenNode);
+    ws1.* = .{ .kind = .whitespace, .text_len = 1, .payload = .{ .leaf = " " } };
+    const ident_f = try alloc.create(GreenNode);
+    ident_f.* = .{ .kind = .identifier, .text_len = 1, .payload = .{ .leaf = "f" } };
+
+    const l_curl = try alloc.create(GreenNode);
+    l_curl.* = .{ .kind = .l_curl, .text_len = 1, .payload = .{ .leaf = "{" } };
+    const ws2 = try alloc.create(GreenNode);
+    ws2.* = .{ .kind = .whitespace, .text_len = 1, .payload = .{ .leaf = " " } };
+    const lit1 = try alloc.create(GreenNode);
+    lit1.* = .{ .kind = .integer_literal, .text_len = 1, .payload = .{ .leaf = "1" } };
+    const plus = try alloc.create(GreenNode);
+    plus.* = .{ .kind = .add, .text_len = 1, .payload = .{ .leaf = "+" } };
+    const lit2 = try alloc.create(GreenNode);
+    lit2.* = .{ .kind = .integer_literal, .text_len = 1, .payload = .{ .leaf = "2" } };
+    const semi = try alloc.create(GreenNode);
+    semi.* = .{ .kind = .semi, .text_len = 2, .payload = .{ .leaf = "; " } };
+    const r_curl = try alloc.create(GreenNode);
+    r_curl.* = .{ .kind = .r_curl, .text_len = 1, .payload = .{ .leaf = "}" } };
+
+    const bin_expr = try alloc.create(GreenNode);
+    bin_expr.* = .{
+        .kind = .binary_expr,
+        .text_len = 3,
+        .payload = .{ .tree = try alloc.dupe(*const GreenNode, &.{ lit1, plus, lit2 }) },
+    };
+
+    const expr_stmt = try alloc.create(GreenNode);
+    expr_stmt.* = .{
+        .kind = .expression_statement,
+        .text_len = 6,
+        .payload = .{ .tree = try alloc.dupe(*const GreenNode, &.{ ws2, bin_expr, semi }) },
+    };
+
+    const stmt_list = try alloc.create(GreenNode);
+    stmt_list.* = .{
+        .kind = .stmt_list,
+        .text_len = 6,
+        .payload = .{ .tree = try alloc.dupe(*const GreenNode, &.{expr_stmt}) },
+    };
+
+    const block = try alloc.create(GreenNode);
+    block.* = .{
+        .kind = .block,
+        .text_len = 8,
+        .payload = .{ .tree = try alloc.dupe(*const GreenNode, &.{ l_curl, stmt_list, r_curl }) },
+    };
+
+    const func_decl = try alloc.create(GreenNode);
+    func_decl.* = .{
+        .kind = .func_decl,
+        .text_len = 14,
+        .payload = .{ .tree = try alloc.dupe(*const GreenNode, &.{ kw_func, ws1, ident_f, block }) },
+    };
+
+    var map: GreenToHirMap = .empty;
+    defer map.deinit(gpa);
+
+    const item0 = ItemId.fromIndex(0);
+    try map.put(gpa, func_decl, item0, .fromIndex(0));
+    try map.put(gpa, block, item0, .fromIndex(1));
+    try map.put(gpa, expr_stmt, item0, .fromIndex(2));
+    try map.put(gpa, bin_expr, item0, .fromIndex(3));
+    try map.put(gpa, lit1, item0, .fromIndex(4));
+    try map.put(gpa, lit2, item0, .fromIndex(5));
+
+    try std.testing.expectEqual(@as(usize, 6), map.count());
+    try std.testing.expectEqual(HirKey{ .item = item0, .hir = .fromIndex(0) }, map.get(func_decl).?);
+    try std.testing.expect(map.get(kw_func) == null);
+    try std.testing.expect(map.get(l_curl) == null);
+    try std.testing.expect(map.get(stmt_list) == null);
+
+    // 1. resolveNearestGreen：光标在 `func` 关键字、`{`、`+` 上
+    try std.testing.expectEqual(
+        HirKey{ .item = item0, .hir = .fromIndex(0) },
+        map.resolveNearestGreen(func_decl, kw_func).?,
+    );
+    try std.testing.expectEqual(
+        HirKey{ .item = item0, .hir = .fromIndex(1) },
+        map.resolveNearestGreen(func_decl, l_curl).?,
+    );
+    try std.testing.expectEqual(
+        HirKey{ .item = item0, .hir = .fromIndex(1) },
+        map.resolveNearestGreen(func_decl, stmt_list).?,
+    );
+    try std.testing.expectEqual(
+        HirKey{ .item = item0, .hir = .fromIndex(3) },
+        map.resolveNearestGreen(func_decl, plus).?,
+    );
+
+    // 2. resolveNearest（RedNode）
+    var ctx = tree_mod.QueryContext.init(gpa);
+    defer ctx.deinit();
+    const root_red = try ctx.allocRed(func_decl, null, 0);
+    const kw_red = (try root_red.findTokenAt(&ctx, 1)).?;
+    try std.testing.expectEqual(HirKey{ .item = item0, .hir = .fromIndex(0) }, map.resolveNearest(kw_red).?);
+    const lcurl_red = (try root_red.findTokenAt(&ctx, 6)).?;
+    try std.testing.expectEqual(HirKey{ .item = item0, .hir = .fromIndex(1) }, map.resolveNearest(lcurl_red).?);
+    const plus_red = (try root_red.findTokenAt(&ctx, 9)).?;
+    try std.testing.expectEqual(HirKey{ .item = item0, .hir = .fromIndex(3) }, map.resolveNearest(plus_red).?);
+
+    // 3. resolveNearestAtOffset（含前导 Trivia 回退校验）
+    // offset 0..4 在 `func` 上 -> func_decl (hir 0)
+    try std.testing.expectEqual(
+        HirKey{ .item = item0, .hir = .fromIndex(0) },
+        map.resolveNearestAtOffset(func_decl, 0, 2).?,
+    );
+    // offset 6 在 `{` 上 -> block (hir 1)
+    try std.testing.expectEqual(
+        HirKey{ .item = item0, .hir = .fromIndex(1) },
+        map.resolveNearestAtOffset(func_decl, 0, 6).?,
+    );
+    // offset 7 在 `{` 之后的空格（属于 expression_statement 的前导 Trivia）-> 保持外层 block (hir 1)
+    try std.testing.expectEqual(
+        HirKey{ .item = item0, .hir = .fromIndex(1) },
+        map.resolveNearestAtOffset(func_decl, 0, 7).?,
+    );
+    // offset 8 在 `1` 上 -> lit1 (hir 4)
+    try std.testing.expectEqual(
+        HirKey{ .item = item0, .hir = .fromIndex(4) },
+        map.resolveNearestAtOffset(func_decl, 0, 8).?,
+    );
+    // offset 9 在 `+` 上 -> bin_expr (hir 3)
+    try std.testing.expectEqual(
+        HirKey{ .item = item0, .hir = .fromIndex(3) },
+        map.resolveNearestAtOffset(func_decl, 0, 9).?,
+    );
+    // offset 11 在 `;` 上 -> expr_stmt (hir 2)
+    try std.testing.expectEqual(
+        HirKey{ .item = item0, .hir = .fromIndex(2) },
+        map.resolveNearestAtOffset(func_decl, 0, 11).?,
+    );
+    // 越界 -> null
+    try std.testing.expect(map.resolveNearestAtOffset(func_decl, 0, 14) == null);
+
+    map.clearRetainingCapacity();
+    try std.testing.expectEqual(@as(usize, 0), map.count());
 }

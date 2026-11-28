@@ -7,12 +7,19 @@
 pub const lexer = @import("lexer.zig");
 pub const parser = @import("parser.zig");
 pub const tree = @import("tree.zig");
+pub const lower = @import("lower.zig");
 
 pub const GreenBuilder = tree.GreenBuilder;
 pub const treeBuild = tree.treeBuild;
+pub const Lowerer = lower.Lowerer;
+pub const LoweredItem = lower.LoweredItem;
+pub const LoweredFile = lower.LoweredFile;
+pub const lowerItem = lower.lowerItem;
+pub const lowerFile = lower.lowerFile;
 
 test {
     _ = @import("./lexer.zig");
     _ = @import("./parser.zig");
     _ = @import("./tree.zig");
+    _ = @import("./lower.zig");
 }
