@@ -504,6 +504,7 @@ pub const Source = union(enum) {
 
 ```zig
 pub const RelatedInfo = struct {
+    file: ?FileId = null,
     range: TextRange,
     message: []const u8,
 };

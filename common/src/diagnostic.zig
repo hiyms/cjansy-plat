@@ -40,6 +40,8 @@ pub const Source = union(enum) {
 
 /// 诊断附带的关联位置与说明。
 pub const RelatedInfo = struct {
+    /// 关联位置所属文件；为 `null` 时表示与主诊断位于同一文件。
+    file: ?FileId = null,
     range: TextRange,
     /// 遵循与 `Diagnostic.message` 相同的生命周期约定（静态字符串、Arena 托管或独立分配）。
     message: []const u8,
