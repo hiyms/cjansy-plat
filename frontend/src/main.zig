@@ -28,7 +28,7 @@ fn isSubCommandEnabled(comptime cmd: SubCommand) bool {
 fn subCommandDescription(comptime cmd: SubCommand) []const u8 {
     return switch (cmd) {
         .lexer => "Lex a Cangjie source file.",
-        .parser => "Parse Cangjie tokens or a source file into a syntax tree or events.",
+        .parser => "Parse Cangjie tokens or a source file into a syntax tree, events, or HIR.",
     };
 }
 
@@ -63,6 +63,7 @@ const OutputFormat = enum {
 const ParseOutputType = enum {
     event,
     tree,
+    hir,
 };
 
 const lexer_option_params = clap.parseParamsComptime(
@@ -86,7 +87,7 @@ const lexer_parsers = .{
 const parser_params = clap.parseParamsComptime(
     \\-h, --help                Display this help and exit.
     \\-f, --format <format>     Output format: plain or json.
-    \\-t <type>                 Output type: event or tree (default: tree).
+    \\-t <type>                 Output type: event, tree, or hir (default: tree).
     \\-s, --source-file <file>  Read and lex a Cangjie source file instead of reading JSON tokens from stdin.
     \\
 );
@@ -348,7 +349,7 @@ fn parseParserArgs(
     };
 }
 
-/// 执行 `parser` 子命令：默认从 `stdin` 逐行读取 JSON 序列化的 `Token` 并按 `-t` 输出语法树或事件流，
+/// 执行 `parser` 子命令：默认从 `stdin` 逐行读取 JSON 序列化的 `Token` 并按 `-t` 输出语法树、事件流或 HIR，
 /// 指定 `-s` / `--source-file` 时自动读取并词法扫描对应源文件后再解析。
 /// 成功返回 `0`，参数错误、读取错误、词法错误或输入 JSON 非法返回 `1`。
 fn parserMain(io: Io, gpa: std.mem.Allocator, iter: anytype) !u8 {
@@ -515,7 +516,7 @@ fn parseTokenJsonStream(
     return true;
 }
 
-/// 将词法单元切片送入语法解析器，按 `output_type` 与 `format` 输出事件流或绿树到 `out`。
+/// 将词法单元切片送入语法解析器，按 `output_type` 与 `format` 输出事件流、绿树或 HIR 到 `out`。
 fn parseTokens(
     gpa: std.mem.Allocator,
     source: []const u8,
@@ -539,6 +540,18 @@ fn parseTokens(
             defer arena.deinit();
             const tree = try frontend.treeBuild(gpa, arena.allocator(), source, parser.events.items);
             try writeTree(gpa, out, format, tree);
+        },
+        .hir => {
+            var arena = std.heap.ArenaAllocator.init(gpa);
+            defer arena.deinit();
+            const tree = try frontend.treeBuild(gpa, arena.allocator(), source, parser.events.items);
+            const syntax_tree: common.SyntaxTree = .{
+                .file = .invalid,
+                .version = 0,
+                .tree = tree,
+            };
+            const lowered = try frontend.lowerFile(gpa, arena.allocator(), syntax_tree, null);
+            try writeHir(gpa, out, format, lowered);
         },
     }
 }
@@ -606,6 +619,19 @@ fn writePlainLeafText(out: *Io.Writer, text: []const u8) !void {
     try out.writeByte('"');
 }
 
+/// 将当前树形框线前缀写入 `out`。
+/// `out` 与 `branch_continuations` 均借用自调用者，本函数不释放它们。
+fn writeTreeBranchPrefix(
+    out: *Io.Writer,
+    branch_continuations: *const std.ArrayList(bool),
+    is_last: bool,
+) Io.Writer.Error!void {
+    for (branch_continuations.items) |has_next| {
+        try out.writeAll(if (has_next) "│   " else "    ");
+    }
+    try out.writeAll(if (is_last) "└── " else "├── ");
+}
+
 /// 递归以类 `tree` 的框线格式将 `node` 的全部子节点写入 `out`。
 /// `node`、`out` 与 `branch_continuations` 均借用自调用者，本函数不释放它们。
 fn writeTreeChildrenPlain(
@@ -619,10 +645,7 @@ fn writeTreeChildrenPlain(
     var child_offset = start_offset;
     for (children, 0..) |child, idx| {
         const is_last = idx + 1 == children.len;
-        for (branch_continuations.items) |has_next| {
-            try out.writeAll(if (has_next) "│   " else "    ");
-        }
-        try out.writeAll(if (is_last) "└── " else "├── ");
+        try writeTreeBranchPrefix(out, branch_continuations, is_last);
         try writeTreeNodeLabelPlain(out, child, child_offset);
         try out.writeByte('\n');
 
@@ -656,6 +679,540 @@ fn writeTreeNodeJson(out: *Io.Writer, node: *const common.GreenNode) !void {
         },
     }
     try out.writeByte('}');
+}
+
+const HirPlainError = Io.Writer.Error || std.mem.Allocator.Error;
+
+/// 按 `format` 将降低后的 `LoweredFile` 写入 `out`：`plain` 采用类 `tree` 的框线树形文本，`json` 输出单个紧凑嵌套 JSON 对象。
+/// `lowered` 与 `out` 均借用自调用者，本函数不释放它们的内存。
+fn writeHir(
+    gpa: std.mem.Allocator,
+    out: *Io.Writer,
+    format: OutputFormat,
+    lowered: frontend.LoweredFile,
+) HirPlainError!void {
+    switch (format) {
+        .plain => try writeHirPlain(gpa, out, lowered),
+        .json => {
+            try writeHirJson(out, lowered);
+            try out.writeByte('\n');
+        },
+    }
+}
+
+/// 将 `LoweredFile` 以单个紧凑 JSON 对象写入 `out`（不含末尾换行）。
+/// 输出顶层包含 `package`、`features`、`imports`、`items` 与 `diagnostics`，直接流式写入以避免深度限制。
+/// `lowered` 与 `out` 均借用自调用者，本函数不释放它们的内存。
+fn writeHirJson(out: *Io.Writer, lowered: frontend.LoweredFile) Io.Writer.Error!void {
+    const hf = lowered.hir_file;
+    try out.writeAll("{\"package\":");
+    try writeHirJsonValue(out, hf.package);
+    try out.writeAll(",\"features\":");
+    try writeHirJsonValue(out, hf.features);
+    try out.writeAll(",\"imports\":");
+    try writeHirJsonValue(out, hf.imports);
+    try out.writeAll(",\"items\":");
+    try writeHirJsonValue(out, hf.items);
+    try out.writeAll(",\"diagnostics\":");
+    try writeHirJsonValue(out, lowered.diagnostics);
+    try out.writeByte('}');
+}
+
+/// 递归将任意 HIR 数据值以紧凑 JSON 格式流式写入 `out`。
+/// `out` 借用自调用者，本函数不释放其内存。
+fn writeHirJsonValue(out: *Io.Writer, value: anytype) Io.Writer.Error!void {
+    const T = @TypeOf(value);
+
+    if (T == common.HirId or T == common.ItemId) {
+        try out.print("{d}", .{value.index()});
+        return;
+    }
+    if (T == []const u8) {
+        try std.json.Stringify.value(value, .{}, out);
+        return;
+    }
+    if (T == common.Diagnostic) {
+        try out.writeAll("{\"range\":");
+        try writeHirJsonValue(out, value.range);
+        try out.writeAll(",\"severity\":");
+        try writeHirJsonValue(out, value.severity);
+        try out.writeAll(",\"source\":");
+        try writeHirJsonValue(out, value.source);
+        try out.writeAll(",\"message\":");
+        try writeHirJsonValue(out, value.message);
+        try out.writeAll(",\"related\":");
+        try writeHirJsonValue(out, value.related);
+        try out.writeByte('}');
+        return;
+    }
+    if (T == void) {
+        try out.writeAll("{}");
+        return;
+    }
+
+    switch (@typeInfo(T)) {
+        .bool => try out.writeAll(if (value) "true" else "false"),
+        .int => try out.print("{d}", .{value}),
+        .@"enum" => try std.json.Stringify.encodeJsonString(@tagName(value), .{}, out),
+        .optional => {
+            if (value) |inner| {
+                try writeHirJsonValue(out, inner);
+            } else {
+                try out.writeAll("null");
+            }
+        },
+        .pointer => |ptr| switch (ptr.size) {
+            .one => try writeHirJsonValue(out, value.*),
+            .slice => {
+                try out.writeByte('[');
+                for (value, 0..) |elem, idx| {
+                    if (idx != 0) try out.writeByte(',');
+                    try writeHirJsonValue(out, elem);
+                }
+                try out.writeByte(']');
+            },
+            else => @compileError("unsupported pointer kind in HIR JSON: " ++ @typeName(T)),
+        },
+        .@"struct" => |st| {
+            try out.writeByte('{');
+            inline for (st.field_names, 0..) |field_name, idx| {
+                if (idx != 0) try out.writeByte(',');
+                try std.json.Stringify.encodeJsonString(field_name, .{}, out);
+                try out.writeByte(':');
+                try writeHirJsonValue(out, @field(value, field_name));
+            }
+            try out.writeByte('}');
+        },
+        .@"union" => {
+            switch (value) {
+                inline else => |payload, tag| {
+                    try out.writeByte('{');
+                    try std.json.Stringify.encodeJsonString(@tagName(tag), .{}, out);
+                    try out.writeByte(':');
+                    try writeHirJsonValue(out, payload);
+                    try out.writeByte('}');
+                },
+            }
+        },
+        else => @compileError("unsupported HIR JSON type: " ++ @typeName(T)),
+    }
+}
+
+/// 将 `LoweredFile` 以类 `tree` 的框线树形文本写入 `out`。
+/// `lowered` 与 `out` 均借用自调用者，本函数不释放它们的内存。
+fn writeHirPlain(
+    gpa: std.mem.Allocator,
+    out: *Io.Writer,
+    lowered: frontend.LoweredFile,
+) HirPlainError!void {
+    const hf = lowered.hir_file;
+    try out.writeAll("hir_file\n");
+
+    const has_package = hf.package != null;
+    const has_features = hf.features != null;
+    const has_imports = hf.imports.len > 0;
+    const has_items = hf.items.len > 0;
+    const has_diags = lowered.diagnostics.len > 0;
+
+    const total_sections: usize =
+        @as(usize, @intFromBool(has_package)) +
+        @as(usize, @intFromBool(has_features)) +
+        @as(usize, @intFromBool(has_imports)) +
+        @as(usize, @intFromBool(has_items)) +
+        @as(usize, @intFromBool(has_diags));
+    if (total_sections == 0) return;
+
+    var branch_continuations: std.ArrayList(bool) = .empty;
+    defer branch_continuations.deinit(gpa);
+
+    var emitted: usize = 0;
+    if (hf.package) |pkg| {
+        emitted += 1;
+        try writeHirPlainStruct(gpa, out, null, "package", pkg, &branch_continuations, emitted == total_sections);
+    }
+    if (hf.features) |feats| {
+        emitted += 1;
+        try writeHirPlainStruct(gpa, out, null, "features", feats, &branch_continuations, emitted == total_sections);
+    }
+    if (has_imports) {
+        emitted += 1;
+        try writeHirPlainSlice(gpa, out, null, "imports", hf.imports, &branch_continuations, emitted == total_sections);
+    }
+    if (has_items) {
+        emitted += 1;
+        try writeHirPlainSlice(gpa, out, null, "items", hf.items, &branch_continuations, emitted == total_sections);
+    }
+    if (has_diags) {
+        emitted += 1;
+        try writeHirPlainSlice(gpa, out, null, "diagnostics", lowered.diagnostics, &branch_continuations, emitted == total_sections);
+    }
+}
+
+/// 判定给定 HIR 字段值类型是否应直接内联显示在父节点头部行中。
+fn isHirInlineValue(comptime T: type) bool {
+    if (T == common.HirId or T == common.ItemId) return false;
+    if (T == []const u8 or
+        T == common.TextRange or
+        T == common.Name or
+        T == common.FuncName or
+        T == common.ImportAlias or
+        T == common.DiagnosticSource or
+        T == []const common.Modifier or
+        T == []const common.Name)
+    {
+        return true;
+    }
+    return switch (@typeInfo(T)) {
+        .bool, .int, .@"enum" => true,
+        else => false,
+    };
+}
+
+/// 判定给定 HIR 结构体字段类型（含可选包装）是否应直接内联显示在父节点头部行中。
+fn isHirInlineField(comptime T: type) bool {
+    return switch (@typeInfo(T)) {
+        .optional => |opt| isHirInlineValue(opt.child),
+        else => isHirInlineValue(T),
+    };
+}
+
+/// 判定给定结构体字段的值在 `plain` 树形输出中是否为空值或默认值，可省略不打印。
+inline fn isHirFieldOmitted(
+    comptime FieldType: type,
+    comptime attrs: std.builtin.Type.Struct.FieldAttributes,
+    val: FieldType,
+) bool {
+    if (FieldType == []const u8) return false;
+    return switch (@typeInfo(FieldType)) {
+        .optional => val == null,
+        .pointer => |ptr| ptr.size == .slice and val.len == 0,
+        .bool => if (comptime attrs.defaultValue(FieldType)) |def| (!def and !val) else false,
+        else => false,
+    };
+}
+
+/// 返回非联合体直接出现的 HIR 结构体的简短展示名称。
+/// 返回编译期静态字符串切片，调用者无需释放。
+fn hirStructDisplayName(comptime T: type) []const u8 {
+    if (T == common.BlockExpr) return "block";
+    if (T == common.WhereClause) return "where_clause";
+    if (T == common.GenericConstraint) return "constraint";
+    if (T == common.HirCallArg) return "arg";
+    if (T == common.ArrayElement) return "element";
+    if (T == common.HirTypeElement) return "type_elem";
+    if (T == common.Annotation) return "annotation";
+    if (T == common.Resource) return "resource";
+    if (T == common.PropAccessor) return "accessor";
+    if (T == common.FeatureId) return "feature";
+    if (T == common.PackageHeader) return "package";
+    if (T == common.FeaturesDirective) return "features";
+    if (T == common.ImportItem) return "import";
+    if (T == common.MacroCall) return "macro_call";
+    if (T == common.TypePathSegment or T == common.ExprPathSegment) return "segment";
+    if (T == common.PathType or T == common.PathExpr) return "path";
+    if (T == common.RelatedInfo) return "related";
+    const full = @typeName(T);
+    if (std.mem.lastIndexOfScalar(u8, full, '.')) |dot| {
+        return full[dot + 1 ..];
+    }
+    return full;
+}
+
+/// 判定 `PathType` 或 `PathExpr` 的所有路径段是否均不含类型实参。
+inline fn isSimplePath(path: anytype) bool {
+    for (path.segments) |seg| {
+        if (seg.type_args.len > 0) return false;
+    }
+    return path.segments.len > 0;
+}
+
+/// 将内联 HIR 属性值（名字、字面量文本、修饰符列表、枚举等）以单行文本写入 `out`。
+/// `out` 借用自调用者，本函数不释放其内存。
+fn writeHirInlineValue(out: *Io.Writer, value: anytype) Io.Writer.Error!void {
+    const T = @TypeOf(value);
+    if (@typeInfo(T) == .optional) {
+        try writeHirInlineValue(out, value.?);
+        return;
+    }
+    if (T == []const u8) {
+        try writePlainLeafText(out, value);
+        return;
+    }
+    if (T == common.TextRange) {
+        try out.print("[{d}..{d}]", .{ value.start, value.end });
+        return;
+    }
+    if (T == common.Name) {
+        try writePlainLeafText(out, value.text);
+        if (value.is_raw) try out.writeAll(" (raw)");
+        try out.print(" [{d}..{d}]", .{ value.range.start, value.range.end });
+        return;
+    }
+    if (T == common.FuncName) {
+        switch (value) {
+            .ident => |nm| {
+                try out.writeAll("ident(");
+                try writeHirInlineValue(out, nm);
+                try out.writeByte(')');
+            },
+            .operator => |nm| {
+                try out.writeAll("operator(");
+                try writeHirInlineValue(out, nm);
+                try out.writeByte(')');
+            },
+        }
+        return;
+    }
+    if (T == common.ImportAlias) {
+        try writeHirInlineValue(out, value.name);
+        try out.writeAll(" as ");
+        try writeHirInlineValue(out, value.alias);
+        return;
+    }
+    if (T == common.DiagnosticSource) {
+        switch (value) {
+            .linter => |rule| {
+                try out.writeAll("linter(");
+                try writePlainLeafText(out, rule);
+                try out.writeByte(')');
+            },
+            else => try out.writeAll(@tagName(value)),
+        }
+        return;
+    }
+    if (T == []const common.Modifier) {
+        try out.writeByte('[');
+        for (value, 0..) |m, idx| {
+            if (idx != 0) try out.writeAll(", ");
+            try out.writeAll(@tagName(m));
+        }
+        try out.writeByte(']');
+        return;
+    }
+    if (T == []const common.Name) {
+        try out.writeByte('[');
+        for (value, 0..) |nm, idx| {
+            if (idx != 0) try out.writeAll(", ");
+            try writeHirInlineValue(out, nm);
+        }
+        try out.writeByte(']');
+        return;
+    }
+
+    switch (@typeInfo(T)) {
+        .bool => try out.writeAll(if (value) "true" else "false"),
+        .int => try out.print("{d}", .{value}),
+        .@"enum" => try out.writeAll(@tagName(value)),
+        else => @compileError("unsupported HIR inline value: " ++ @typeName(T)),
+    }
+}
+
+/// 以树形框线格式将带标题的 HIR 切片节点及其全部元素写入 `out`。
+/// `out` 与 `branch_continuations` 借用自调用者，本函数不释放它们。
+fn writeHirPlainSlice(
+    gpa: std.mem.Allocator,
+    out: *Io.Writer,
+    label_opt: ?[]const u8,
+    node_name: []const u8,
+    slice: anytype,
+    branch_continuations: *std.ArrayList(bool),
+    is_last: bool,
+) HirPlainError!void {
+    try writeTreeBranchPrefix(out, branch_continuations, is_last);
+    if (label_opt) |lbl| {
+        if (!std.mem.eql(u8, lbl, node_name)) {
+            try out.print("{s}: {s}\n", .{ lbl, node_name });
+        } else {
+            try out.print("{s}\n", .{node_name});
+        }
+    } else {
+        try out.print("{s}\n", .{node_name});
+    }
+
+    if (slice.len == 0) return;
+    try branch_continuations.append(gpa, !is_last);
+    defer _ = branch_continuations.pop();
+
+    for (slice, 0..) |elem, idx| {
+        try writeHirPlainNode(gpa, out, null, elem, branch_continuations, idx + 1 == slice.len);
+    }
+}
+
+/// 以树形框线格式将单个 HIR 结构体节点及其非空子字段写入 `out`。
+/// `out` 与 `branch_continuations` 借用自调用者，本函数不释放它们。
+fn writeHirPlainStruct(
+    gpa: std.mem.Allocator,
+    out: *Io.Writer,
+    label_opt: ?[]const u8,
+    node_name: []const u8,
+    value: anytype,
+    branch_continuations: *std.ArrayList(bool),
+    is_last: bool,
+) HirPlainError!void {
+    const T = @TypeOf(value);
+    const st = @typeInfo(T).@"struct";
+
+    try writeTreeBranchPrefix(out, branch_continuations, is_last);
+    if (label_opt) |lbl| {
+        if (!std.mem.eql(u8, lbl, node_name)) {
+            try out.print("{s}: {s}", .{ lbl, node_name });
+        } else {
+            try out.writeAll(node_name);
+        }
+    } else {
+        try out.writeAll(node_name);
+    }
+
+    if (comptime @hasField(T, "id")) {
+        if (@TypeOf(@field(value, "id")) == common.HirId) {
+            try out.print(" #{d}", .{value.id.index()});
+        }
+    }
+    if (comptime @hasField(T, "range")) {
+        if (@TypeOf(@field(value, "range")) == common.TextRange) {
+            try out.print(" [{d}..{d}]", .{ value.range.start, value.range.end });
+        }
+    }
+
+    // 不含类型实参的路径节点直接在头部行展示点分路径，减少冗余层级
+    if (T == common.PathType or T == common.PathExpr) {
+        if (isSimplePath(value)) {
+            try out.writeByte(' ');
+            for (value.segments, 0..) |seg, idx| {
+                if (idx != 0) try out.writeByte('.');
+                try writePlainLeafText(out, seg.name.text);
+                if (seg.name.is_raw) try out.writeAll(" (raw)");
+            }
+            try out.writeByte('\n');
+            return;
+        }
+    }
+
+    // 输出所有非空内联属性字段
+    inline for (st.field_names, st.field_types, st.field_attrs) |field_name, FieldType, field_attrs| {
+        const is_id = comptime std.mem.eql(u8, field_name, "id") and FieldType == common.HirId;
+        const is_range = comptime std.mem.eql(u8, field_name, "range") and FieldType == common.TextRange;
+        if (!is_id and !is_range and comptime isHirInlineField(FieldType)) {
+            const field_val = @field(value, field_name);
+            if (!isHirFieldOmitted(FieldType, field_attrs, field_val)) {
+                try out.print(" {s}=", .{field_name});
+                try writeHirInlineValue(out, field_val);
+            }
+        }
+    }
+    try out.writeByte('\n');
+
+    // 统计非空子结构字段数量以确定末项树枝形状
+    var child_count: usize = 0;
+    inline for (st.field_names, st.field_types, st.field_attrs) |field_name, FieldType, field_attrs| {
+        const is_id = comptime std.mem.eql(u8, field_name, "id") and FieldType == common.HirId;
+        const is_range = comptime std.mem.eql(u8, field_name, "range") and FieldType == common.TextRange;
+        if (!is_id and !is_range and comptime !isHirInlineField(FieldType)) {
+            if (!isHirFieldOmitted(FieldType, field_attrs, @field(value, field_name))) {
+                child_count += 1;
+            }
+        }
+    }
+    if (child_count == 0) return;
+
+    try branch_continuations.append(gpa, !is_last);
+    defer _ = branch_continuations.pop();
+
+    var emitted: usize = 0;
+    inline for (st.field_names, st.field_types, st.field_attrs) |field_name, FieldType, field_attrs| {
+        const is_id = comptime std.mem.eql(u8, field_name, "id") and FieldType == common.HirId;
+        const is_range = comptime std.mem.eql(u8, field_name, "range") and FieldType == common.TextRange;
+        if (!is_id and !is_range and comptime !isHirInlineField(FieldType)) {
+            const field_val = @field(value, field_name);
+            if (!isHirFieldOmitted(FieldType, field_attrs, field_val)) {
+                emitted += 1;
+                const child_is_last = emitted == child_count;
+                if (comptime @typeInfo(FieldType) == .optional) {
+                    try writeHirPlainNode(gpa, out, field_name, field_val.?, branch_continuations, child_is_last);
+                } else if (comptime @typeInfo(FieldType) == .pointer and @typeInfo(FieldType).pointer.size == .slice) {
+                    try writeHirPlainSlice(gpa, out, null, field_name, field_val, branch_continuations, child_is_last);
+                } else {
+                    try writeHirPlainNode(gpa, out, field_name, field_val, branch_continuations, child_is_last);
+                }
+            }
+        }
+    }
+}
+
+/// 递归以树形框线格式将任意 HIR 节点（联合体、结构体、指针或诊断）写入 `out`。
+/// `out` 与 `branch_continuations` 借用自调用者，本函数不释放它们。
+fn writeHirPlainNode(
+    gpa: std.mem.Allocator,
+    out: *Io.Writer,
+    label_opt: ?[]const u8,
+    value: anytype,
+    branch_continuations: *std.ArrayList(bool),
+    is_last: bool,
+) HirPlainError!void {
+    const T = @TypeOf(value);
+
+    if (T == common.Diagnostic) {
+        try writeTreeBranchPrefix(out, branch_continuations, is_last);
+        if (label_opt) |lbl| try out.print("{s}: ", .{lbl});
+        try out.print("{s} [{d}..{d}] (", .{ @tagName(value.severity), value.range.start, value.range.end });
+        try writeHirInlineValue(out, value.source);
+        try out.writeAll(") ");
+        try writePlainLeafText(out, value.message);
+        try out.writeByte('\n');
+
+        if (value.related.len > 0) {
+            try branch_continuations.append(gpa, !is_last);
+            defer _ = branch_continuations.pop();
+            try writeHirPlainSlice(gpa, out, null, "related", value.related, branch_continuations, true);
+        }
+        return;
+    }
+
+    switch (@typeInfo(T)) {
+        .pointer => |ptr| switch (ptr.size) {
+            .one => try writeHirPlainNode(gpa, out, label_opt, value.*, branch_continuations, is_last),
+            .slice => try writeHirPlainSlice(gpa, out, null, label_opt orelse "list", value, branch_continuations, is_last),
+            else => @compileError("unsupported HIR pointer type: " ++ @typeName(T)),
+        },
+        .optional => {
+            if (value) |inner| {
+                try writeHirPlainNode(gpa, out, label_opt, inner, branch_continuations, is_last);
+            }
+        },
+        .@"struct" => {
+            try writeHirPlainStruct(gpa, out, label_opt, comptime hirStructDisplayName(T), value, branch_continuations, is_last);
+        },
+        .@"union" => {
+            switch (value) {
+                inline else => |payload, tag| {
+                    const tag_name = @tagName(tag);
+                    const P = @TypeOf(payload);
+                    if (P == void) {
+                        try writeTreeBranchPrefix(out, branch_continuations, is_last);
+                        if (label_opt) |lbl| try out.print("{s}: ", .{lbl});
+                        try out.print("{s}\n", .{tag_name});
+                    } else if (comptime isHirInlineValue(P)) {
+                        try writeTreeBranchPrefix(out, branch_continuations, is_last);
+                        if (label_opt) |lbl| try out.print("{s}: ", .{lbl});
+                        try out.print("{s} ", .{tag_name});
+                        try writeHirInlineValue(out, payload);
+                        try out.writeByte('\n');
+                    } else if (comptime @typeInfo(P) == .@"struct") {
+                        try writeHirPlainStruct(gpa, out, label_opt, tag_name, payload, branch_continuations, is_last);
+                    } else if (comptime @typeInfo(P) == .pointer and @typeInfo(P).pointer.size == .one) {
+                        try writeHirPlainNode(gpa, out, label_opt orelse tag_name, payload.*, branch_continuations, is_last);
+                    } else if (comptime @typeInfo(P) == .pointer and @typeInfo(P).pointer.size == .slice) {
+                        try writeHirPlainSlice(gpa, out, label_opt, tag_name, payload, branch_continuations, is_last);
+                    } else if (comptime @typeInfo(P) == .@"union") {
+                        try writeHirPlainNode(gpa, out, label_opt, payload, branch_continuations, is_last);
+                    } else {
+                        @compileError("unsupported HIR union payload: " ++ @typeName(P));
+                    }
+                },
+            }
+        },
+        else => @compileError("unsupported HIR plain node type: " ++ @typeName(T)),
+    }
 }
 
 /// 按 `format` 将单个语法解析事件写入 `out`。
@@ -1040,6 +1597,7 @@ test "writeParserHelp 展示标准输入默认用法与选项" {
     try std.testing.expect(std.mem.indexOf(u8, out, "Usage: cjfrontend parser [options]") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "-f, --format <format>") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "-t <type>") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "event, tree, or hir") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "--output") == null);
     try std.testing.expect(std.mem.indexOf(u8, out, "-s, --source-file <file>") != null);
 }
@@ -1059,6 +1617,30 @@ test "parseParserArgs 校验帮助参数、-f/--format、-t 与 -s/--source-file
         try std.testing.expectEqual(@as(?OutputFormat, null), bundle.parsed.format);
         try std.testing.expectEqual(ParseOutputType.tree, bundle.parsed.output_type);
         try std.testing.expectEqual(@as(?[]const u8, null), bundle.parsed.source_file);
+    }
+
+    // -t hir 与 --source-file / --format 组合
+    {
+        const raw = [_][]const u8{ "-t", "hir", "--source-file=foo.cj", "--format=plain" };
+        var iter = clap.args.SliceIterator{ .args = &raw };
+        var diag = clap.Diagnostic{};
+        var bundle = try parseParserArgs(gpa, &iter, &diag);
+        defer bundle.res.deinit();
+
+        try std.testing.expectEqual(@as(?OutputFormat, .plain), bundle.parsed.format);
+        try std.testing.expectEqual(ParseOutputType.hir, bundle.parsed.output_type);
+        try std.testing.expectEqualStrings("foo.cj", bundle.parsed.source_file.?);
+    }
+
+    // -t=hir 形式
+    {
+        const raw = [_][]const u8{"-t=hir"};
+        var iter = clap.args.SliceIterator{ .args = &raw };
+        var diag = clap.Diagnostic{};
+        var bundle = try parseParserArgs(gpa, &iter, &diag);
+        defer bundle.res.deinit();
+
+        try std.testing.expectEqual(ParseOutputType.hir, bundle.parsed.output_type);
     }
 
     // --source-file=path、--format=plain 与 -t event
@@ -1436,4 +2018,218 @@ test "parseSource tree 模式容忍语法错误与非法 UTF-8 字节" {
         defer parsed.deinit();
         try std.testing.expectEqualStrings("source_file", parsed.value.object.get("kind").?.string);
     }
+}
+
+test "parseSource hir 模式 plain 输出类 tree 框线格式" {
+    const gpa = std.testing.allocator;
+
+    // 空输入
+    {
+        var aw: Io.Writer.Allocating = .init(gpa);
+        defer aw.deinit();
+        const ok = try parseSource(gpa, "", .plain, .hir, &aw.writer);
+        try std.testing.expect(ok);
+        try std.testing.expectEqualStrings("hir_file\n", aw.written());
+    }
+
+    // 含 package、import、函数与二元表达式的源码
+    {
+        const src =
+            \\package a.b
+            \\import std.io.*
+            \\public func add(a: Int64, b: Int64): Int64 { a + b }
+            \\
+        ;
+        var aw: Io.Writer.Allocating = .init(gpa);
+        defer aw.deinit();
+        const ok = try parseSource(gpa, src, .plain, .hir, &aw.writer);
+        try std.testing.expect(ok);
+        const out = aw.written();
+        try std.testing.expect(std.mem.startsWith(u8, out, "hir_file\n├── package [0..11]"));
+        try std.testing.expect(std.mem.indexOf(u8, out, "├── imports\n") != null);
+        try std.testing.expect(std.mem.indexOf(u8, out, "└── items\n") != null);
+        try std.testing.expect(std.mem.indexOf(u8, out, "func #0 ") != null);
+        try std.testing.expect(std.mem.indexOf(u8, out, "modifiers=[public]") != null);
+        try std.testing.expect(std.mem.indexOf(u8, out, "binary #") != null);
+        try std.testing.expect(std.mem.indexOf(u8, out, "op=add") != null);
+    }
+
+    // 含带类型实参的路径
+    {
+        const src = "let xs: Array<Int64> = []\n";
+        var aw: Io.Writer.Allocating = .init(gpa);
+        defer aw.deinit();
+        const ok = try parseSource(gpa, src, .plain, .hir, &aw.writer);
+        try std.testing.expect(ok);
+        const out = aw.written();
+        try std.testing.expect(std.mem.indexOf(u8, out, "type_args\n") != null);
+        try std.testing.expect(std.mem.indexOf(u8, out, "\"Int64\"") != null);
+    }
+
+    // 含 lowering 诊断与关联信息的 plain 输出
+    {
+        const related = [_]common.RelatedInfo{.{
+            .range = .{ .start = 0, .end = 3 },
+            .message = "related note",
+        }};
+        const diags = [_]common.Diagnostic{.{
+            .file = .invalid,
+            .range = .{ .start = 8, .end = 10 },
+            .severity = .err,
+            .source = .parser,
+            .message = "invalid integer literal `0x`",
+            .related = &related,
+        }};
+        const lowered: frontend.LoweredFile = .{
+            .hir_file = .{ .file = .invalid, .version = 0 },
+            .lowered_items = &.{},
+            .diagnostics = &diags,
+        };
+
+        var aw: Io.Writer.Allocating = .init(gpa);
+        defer aw.deinit();
+        try writeHir(gpa, &aw.writer, .plain, lowered);
+        const out = aw.written();
+        try std.testing.expect(std.mem.indexOf(u8, out, "└── diagnostics\n") != null);
+        try std.testing.expect(std.mem.indexOf(u8, out, "err [8..10] (parser) \"invalid integer literal `0x`\"\n") != null);
+        try std.testing.expect(std.mem.indexOf(u8, out, "related [0..3] message=\"related note\"\n") != null);
+    }
+}
+
+test "parseSource hir 模式 json 输出合法嵌套 JSON 并完整保留 HIR 字段" {
+    const gpa = std.testing.allocator;
+    const src =
+        \\package demo
+        \\import std.core.String as Str
+        \\func add(a: Int64, b: Int64): Int64 { a + b }
+        \\
+    ;
+
+    var aw: Io.Writer.Allocating = .init(gpa);
+    defer aw.deinit();
+    const ok = try parseSource(gpa, src, .json, .hir, &aw.writer);
+    try std.testing.expect(ok);
+
+    const written = aw.written();
+    try std.testing.expect(written.len > 0 and written[written.len - 1] == '\n');
+    const trimmed = written[0 .. written.len - 1];
+    try std.testing.expect(std.mem.indexOfScalar(u8, trimmed, '\n') == null);
+
+    const parsed = try std.json.parseFromSlice(std.json.Value, gpa, trimmed, .{});
+    defer parsed.deinit();
+
+    const root = parsed.value.object;
+    const pkg = root.get("package").?.object;
+    try std.testing.expectEqualStrings("demo", pkg.get("name").?.array.items[0].object.get("text").?.string);
+    try std.testing.expect(root.get("features").? == .null);
+
+    const imports = root.get("imports").?.array.items;
+    try std.testing.expectEqual(@as(usize, 1), imports.len);
+    const alias_obj = imports[0].object.get("kind").?.object.get("alias").?.object;
+    try std.testing.expectEqualStrings("String", alias_obj.get("name").?.object.get("text").?.string);
+    try std.testing.expectEqualStrings("Str", alias_obj.get("alias").?.object.get("text").?.string);
+
+    const items = root.get("items").?.array.items;
+    try std.testing.expectEqual(@as(usize, 1), items.len);
+    const func_obj = items[0].object.get("func").?.object;
+    try std.testing.expectEqual(@as(i64, 0), func_obj.get("id").?.integer);
+    try std.testing.expectEqualStrings("add", func_obj.get("name").?.object.get("ident").?.object.get("text").?.string);
+    try std.testing.expectEqual(@as(usize, 2), func_obj.get("params").?.array.items.len);
+    try std.testing.expectEqual(@as(usize, 0), root.get("diagnostics").?.array.items.len);
+}
+
+test "parseSource hir 模式容忍语法错误、非法字面量与非法 UTF-8 字节" {
+    const gpa = std.testing.allocator;
+
+    // 含 lowering 诊断的 json 输出保留诊断字段且合法
+    {
+        const diags = [_]common.Diagnostic{.{
+            .file = .invalid,
+            .range = .{ .start = 8, .end = 10 },
+            .severity = .err,
+            .source = .parser,
+            .message = "invalid integer literal `0x`",
+        }};
+        const lowered: frontend.LoweredFile = .{
+            .hir_file = .{ .file = .invalid, .version = 0 },
+            .lowered_items = &.{},
+            .diagnostics = &diags,
+        };
+
+        var aw: Io.Writer.Allocating = .init(gpa);
+        defer aw.deinit();
+        try writeHir(gpa, &aw.writer, .json, lowered);
+
+        const parsed = try std.json.parseFromSlice(
+            std.json.Value,
+            gpa,
+            std.mem.trimEnd(u8, aw.written(), "\n"),
+            .{},
+        );
+        defer parsed.deinit();
+        const diag_arr = parsed.value.object.get("diagnostics").?.array.items;
+        try std.testing.expectEqual(@as(usize, 1), diag_arr.len);
+        try std.testing.expectEqualStrings("err", diag_arr[0].object.get("severity").?.string);
+        try std.testing.expectEqualStrings("invalid integer literal `0x`", diag_arr[0].object.get("message").?.string);
+    }
+
+    // 残缺语法输入仍正常完成 lowering 并输出合法 JSON
+    {
+        var aw: Io.Writer.Allocating = .init(gpa);
+        defer aw.deinit();
+        try std.testing.expect(try parseSource(gpa, "let = 1", .json, .hir, &aw.writer));
+
+        const parsed = try std.json.parseFromSlice(
+            std.json.Value,
+            gpa,
+            std.mem.trimEnd(u8, aw.written(), "\n"),
+            .{},
+        );
+        defer parsed.deinit();
+        try std.testing.expectEqual(@as(usize, 1), parsed.value.object.get("items").?.array.items.len);
+    }
+
+    // 非法 UTF-8 字节在 plain 与 json 下均正常输出
+    {
+        const bad_utf8 = [_]u8{ 0xff, '\n' };
+        var plain_out: Io.Writer.Allocating = .init(gpa);
+        defer plain_out.deinit();
+        try std.testing.expect(try parseSource(gpa, &bad_utf8, .plain, .hir, &plain_out.writer));
+        try std.testing.expect(std.mem.startsWith(u8, plain_out.written(), "hir_file\n"));
+
+        var json_out: Io.Writer.Allocating = .init(gpa);
+        defer json_out.deinit();
+        try std.testing.expect(try parseSource(gpa, &bad_utf8, .json, .hir, &json_out.writer));
+        const parsed = try std.json.parseFromSlice(
+            std.json.Value,
+            gpa,
+            std.mem.trimEnd(u8, json_out.written(), "\n"),
+            .{},
+        );
+        defer parsed.deinit();
+        try std.testing.expect(parsed.value.object.get("items").? == .array);
+    }
+}
+
+test "parseTokenJsonStream hir 模式衔接 lexSource json 输出" {
+    const gpa = std.testing.allocator;
+    const src = "let x = 1\n";
+
+    var lex_out: Io.Writer.Allocating = .init(gpa);
+    defer lex_out.deinit();
+    try std.testing.expect(try lexSource(gpa, src, .json, &lex_out.writer));
+
+    var hir_json: Io.Writer.Allocating = .init(gpa);
+    defer hir_json.deinit();
+    var reader: Io.Reader = .fixed(lex_out.written());
+    try std.testing.expect(try parseTokenJsonStream(gpa, &reader, .json, .hir, &hir_json.writer));
+
+    const parsed = try std.json.parseFromSlice(
+        std.json.Value,
+        gpa,
+        std.mem.trimEnd(u8, hir_json.written(), "\n"),
+        .{},
+    );
+    defer parsed.deinit();
+    try std.testing.expectEqual(@as(usize, 1), parsed.value.object.get("items").?.array.items.len);
 }
