@@ -15,6 +15,7 @@ const db_mod = @import("../db/Database.zig");
 const type_interner_mod = @import("../interner/TypeInterner.zig");
 const access_mod = @import("access.zig");
 const subtype_mod = @import("../typeck/subtype.zig");
+const literal_mod = @import("../typeck/literal.zig");
 
 const CallableHeaderSig = pkg_state_mod.CallableHeaderSig;
 const CallableParamSig = pkg_state_mod.CallableParamSig;
@@ -77,6 +78,7 @@ const LocalAliasEvalCtx = struct {
     file_imports: *std.AutoHashMapUnmanaged(common.FileId, FileImportBundle),
     extends_buf: *std.ArrayListUnmanaged(ExtendEntry),
     diags: *std.ArrayListUnmanaged(common.Diagnostic),
+    reported_cycles: std.AutoHashMapUnmanaged(DefId, void) = .empty,
 };
 
 /// 按需求值本包内的 `type_alias` 声明（支持前向引用并接入 `db.type_alias_cache` 三色环路截断）。
@@ -86,7 +88,30 @@ fn evalLocalTypeAlias(raw_ctx: *anyopaque, def_id: DefId) PlatformError!TypeId {
     if (ctx.db.type_alias_cache.get(def_id)) |st| {
         return switch (st) {
             .computed => |ty| ty,
-            .computing => TypeInterner.err_ty,
+            .computing => blk: {
+                if (!ctx.reported_cycles.contains(def_id)) {
+                    try ctx.reported_cycles.put(ctx.arena, def_id, {});
+                    if (ctx.state.getDef(def_id.idx)) |entry| {
+                        if (entry.origin) |origin| {
+                            const fid = origin.fileId();
+                            const lowered = try ctx.db.lower(fid);
+                            const idx = origin.itemId().index();
+                            const r = if (idx < lowered.lowered_items.len)
+                                unwrapMacroItem(lowered.lowered_items[idx].item).range()
+                            else
+                                common.TextRange.zero;
+                            try ctx.diags.append(ctx.arena, .{
+                                .file = fid,
+                                .range = r,
+                                .severity = .err,
+                                .source = .typeck,
+                                .message = "检测到循环类型别名定义",
+                            });
+                        }
+                    }
+                }
+                break :blk TypeInterner.err_ty;
+            },
             .uncomputed => unreachable,
         };
     }
@@ -472,6 +497,14 @@ pub fn buildPackageState(db: *Database, pkg: PackageId) PlatformError!*PackageSt
                             }
                         }
                     }
+                } else {
+                    try diags.append(a, .{
+                        .file = fid,
+                        .range = fi.range,
+                        .severity = .err,
+                        .source = .name_res,
+                        .message = "找不到要导入的包",
+                    });
                 }
                 continue;
             }
@@ -479,6 +512,7 @@ pub fn buildPackageState(db: *Database, pkg: PackageId) PlatformError!*PackageSt
             // 单导入或别名导入：优先匹配包成员，其次匹配子包本身
             const bind_name = if (fi.kind == .alias) fi.alias_name else fi.target_name;
             var resolved_member = false;
+            var import_diag_emitted = false;
             if (parent_pkg_opt) |tgt_pkg| {
                 if (tgt_pkg == pkg) {
                     try diags.append(a, .{
@@ -509,9 +543,11 @@ pub fn buildPackageState(db: *Database, pkg: PackageId) PlatformError!*PackageSt
                         const rel = db.pkg_interner.relation(pkg, tgt_pkg);
                         const entries = tgt_state.lookupTop(fi.target_name);
                         if (entries.len > 0) {
-                            resolved_member = true;
+                            var visible_count: usize = 0;
+                            var reexport_ok_count: usize = 0;
                             for (entries) |entry| {
                                 if (!access_mod.isVisibleInRelation(entry.vis, rel)) continue;
+                                visible_count += 1;
                                 const gop = try explicit_acc.getOrPut(a, bind_name);
                                 if (!gop.found_existing) gop.value_ptr.* = .empty;
                                 try gop.value_ptr.append(a, .{
@@ -522,6 +558,7 @@ pub fn buildPackageState(db: *Database, pkg: PackageId) PlatformError!*PackageSt
                                     .source_file = fid,
                                 });
                                 if (is_reexport and imp_vis.isNoMoreOpenThan(entry.vis)) {
+                                    reexport_ok_count += 1;
                                     const tgop = try top_export_lists.getOrPut(a, bind_name);
                                     if (!tgop.found_existing) tgop.value_ptr.* = .empty;
                                     try tgop.value_ptr.append(a, .{
@@ -533,7 +570,37 @@ pub fn buildPackageState(db: *Database, pkg: PackageId) PlatformError!*PackageSt
                                     });
                                 }
                             }
+                            if (visible_count > 0) {
+                                resolved_member = true;
+                                if (is_reexport and reexport_ok_count == 0) {
+                                    try diags.append(a, .{
+                                        .file = fid,
+                                        .range = fi.range,
+                                        .severity = .err,
+                                        .source = .name_res,
+                                        .message = "重导出可见性高于被导入符号的可见性",
+                                    });
+                                }
+                            } else if (as_pkg_opt == null) {
+                                resolved_member = true;
+                                try diags.append(a, .{
+                                    .file = fid,
+                                    .range = fi.range,
+                                    .severity = .err,
+                                    .source = .name_res,
+                                    .message = "导入的符号在当前包不可访问",
+                                });
+                            }
                         }
+                    } else if (as_pkg_opt == null) {
+                        import_diag_emitted = true;
+                        try diags.append(a, .{
+                            .file = fid,
+                            .range = fi.range,
+                            .severity = .err,
+                            .source = .name_res,
+                            .message = "目标包访问级别不足，无法导入",
+                        });
                     }
                 } else |_| {}
             }
@@ -563,7 +630,37 @@ pub fn buildPackageState(db: *Database, pkg: PackageId) PlatformError!*PackageSt
                         try deps_set.put(a, imp_pkg, {});
                         try deps_list.append(a, imp_pkg);
                     }
+                    if (db.building_pkgs.contains(imp_pkg)) {
+                        try diags.append(a, .{
+                            .file = fid,
+                            .range = fi.range,
+                            .severity = .err,
+                            .source = .name_res,
+                            .message = "检测到包间循环 import 依赖",
+                        });
+                        continue;
+                    }
+                    if (db.packageState(imp_pkg)) |imp_state| {
+                        if (!access_mod.canImportPackage(&db.pkg_interner, pkg, imp_pkg, imp_state.pkg_vis)) {
+                            try diags.append(a, .{
+                                .file = fid,
+                                .range = fi.range,
+                                .severity = .err,
+                                .source = .name_res,
+                                .message = "目标包访问级别不足，无法导入",
+                            });
+                            continue;
+                        }
+                    } else |_| {}
                     try bundle.explicit_pkgs.put(a, bind_name, imp_pkg);
+                } else if (!import_diag_emitted) {
+                    try diags.append(a, .{
+                        .file = fid,
+                        .range = fi.range,
+                        .severity = .err,
+                        .source = .name_res,
+                        .message = "找不到要导入的包或符号",
+                    });
                 }
             }
         }
@@ -629,6 +726,10 @@ pub fn buildPackageState(db: *Database, pkg: PackageId) PlatformError!*PackageSt
     }
 
     state.extends = try extends_buf.toOwnedSlice(a);
+
+    // 5. 校验本包名义类型的继承合法性与循环继承
+    try validateNominalInheritance(db, a, state, &diags);
+
     state.diagnostics = try diags.toOwnedSlice(a);
 
     // 将本包依赖登记到 Database 反向依赖图
@@ -1357,7 +1458,7 @@ fn buildHeaderForDef(
                     try state.callable_headers.put(a, entry.id.idx, sig);
                 },
                 .main => |m| {
-                    const params = try resolveCallableParams(&env, a, m.params);
+                    const params = try resolveCallableParams(&env, a, m.params, diags, fid);
                     const ret = if (m.ret_type) |rt| try resolveHirTypeInEnv(&env, rt) else null;
                     const sig = try a.create(CallableHeaderSig);
                     sig.* = .{
@@ -1373,7 +1474,10 @@ fn buildHeaderForDef(
                 .extend_ => |ex| {
                     const target_ty = try resolveHirTypeInEnv(&env, ex.target);
                     const target_kind: ?ExtendTargetKind = switch (db.types.get(target_ty)) {
-                        .nominal => |n| .{ .nominal = n.def },
+                        .nominal => |n| blk: {
+                            const te = db.getDef(n.def) catch break :blk null;
+                            break :blk if (te.kind == .interface_) null else .{ .nominal = n.def };
+                        },
                         .prim => |p| .{ .prim = p },
                         else => null,
                     };
@@ -1472,6 +1576,14 @@ fn buildHeaderForDef(
                             .constraint_types = try ct_buf.toOwnedSlice(a),
                             .doc = entry.doc,
                         });
+                    } else if (target_ty != TypeInterner.err_ty) {
+                        try diags.append(a, .{
+                            .file = fid,
+                            .range = ex.target.range(),
+                            .severity = .err,
+                            .source = .typeck,
+                            .message = "该类型不支持 extend 扩展声明",
+                        });
                     }
                 },
                 else => {},
@@ -1490,7 +1602,7 @@ fn buildHeaderForDef(
                     try state.prop_types.put(a, entry.id.idx, pty);
                 },
                 .init => |in| {
-                    const params = try resolveCallableParams(&env, a, in.params);
+                    const params = try resolveCallableParams(&env, a, in.params, diags, fid);
                     const ret_ty = if (entry.flags.is_static)
                         TypeInterner.unit_ty
                     else
@@ -1508,7 +1620,7 @@ fn buildHeaderForDef(
                     try state.callable_headers.put(a, entry.id.idx, sig);
                 },
                 .primary_ctor => |pc| {
-                    const params = try resolveCallableParams(&env, a, pc.params);
+                    const params = try resolveCallableParams(&env, a, pc.params, diags, fid);
                     const ret_ty = try makeOwnerSelfType(db, entry.owner.?, owner_refs);
                     const sig = try a.create(CallableHeaderSig);
                     sig.* = .{
@@ -1608,6 +1720,182 @@ fn buildHeaderForDef(
     }
 }
 
+/// 校验本包名义类型的直接父类型种类合法性与循环继承关系。
+fn validateNominalInheritance(
+    db: *Database,
+    a: std.mem.Allocator,
+    state: *const PackageState,
+    diags: *std.ArrayListUnmanaged(common.Diagnostic),
+) PlatformError!void {
+    for (state.defs) |entry| {
+        if (entry.kind != .class_ and entry.kind != .struct_ and entry.kind != .enum_ and entry.kind != .interface_) continue;
+        const nh = state.nominal_headers.get(entry.id.idx) orelse continue;
+        const origin = entry.origin orelse continue;
+        const fid = origin.fileId();
+        const lowered = try db.lower(fid);
+        const item_idx = origin.itemId().index();
+        const decl_range = if (item_idx < lowered.lowered_items.len)
+            unwrapMacroItem(lowered.lowered_items[item_idx].item).range()
+        else
+            common.TextRange.zero;
+
+        var class_super_count: usize = 0;
+        for (nh.supertypes) |st_ty| {
+            if (st_ty == TypeInterner.err_ty) continue;
+            const st_data = db.types.get(st_ty);
+            if (st_data != .nominal) {
+                try diags.append(a, .{
+                    .file = fid,
+                    .range = decl_range,
+                    .severity = .err,
+                    .source = .typeck,
+                    .message = "父类型列表中只允许出现类或接口类型",
+                });
+                continue;
+            }
+            const super_entry = db.getDef(st_data.nominal.def) catch continue;
+            switch (entry.kind) {
+                .class_ => {
+                    if (super_entry.kind == .class_) {
+                        class_super_count += 1;
+                        if (class_super_count > 1) {
+                            try diags.append(a, .{
+                                .file = fid,
+                                .range = decl_range,
+                                .severity = .err,
+                                .source = .typeck,
+                                .message = "类声明最多只能继承一个直接父类",
+                            });
+                        }
+                        const is_object = db.types.known.object_class != null and DefId.eql(super_entry.id, db.types.known.object_class.?);
+                        if (!is_object) {
+                            if (!super_entry.flags.is_open and !super_entry.flags.is_abstract) {
+                                try diags.append(a, .{
+                                    .file = fid,
+                                    .range = decl_range,
+                                    .severity = .err,
+                                    .source = .typeck,
+                                    .message = "不能继承未声明 open 或 abstract 的类",
+                                });
+                            } else if (super_entry.flags.is_sealed and super_entry.id.pkg != state.pkg_id) {
+                                try diags.append(a, .{
+                                    .file = fid,
+                                    .range = decl_range,
+                                    .severity = .err,
+                                    .source = .typeck,
+                                    .message = "不能在包外继承 sealed 类",
+                                });
+                            }
+                        }
+                    } else if (super_entry.kind != .interface_) {
+                        try diags.append(a, .{
+                            .file = fid,
+                            .range = decl_range,
+                            .severity = .err,
+                            .source = .typeck,
+                            .message = "类声明只能继承类或实现接口",
+                        });
+                    }
+                },
+                .struct_, .enum_, .interface_ => {
+                    if (super_entry.kind != .interface_) {
+                        try diags.append(a, .{
+                            .file = fid,
+                            .range = decl_range,
+                            .severity = .err,
+                            .source = .typeck,
+                            .message = "结构体、枚举与接口只能继承或实现接口类型",
+                        });
+                    }
+                },
+                else => {},
+            }
+        }
+
+        // 检测继承链环路（沿 NominalHeader.supertypes 遍历判断是否回到 entry.id）
+        var visited: std.AutoHashMapUnmanaged(DefId, void) = .empty;
+        defer visited.deinit(db.gpa);
+        var worklist: std.ArrayListUnmanaged(DefId) = .empty;
+        defer worklist.deinit(db.gpa);
+
+        for (nh.supertypes) |st_ty| {
+            if (db.types.get(st_ty) == .nominal) {
+                try worklist.append(db.gpa, db.types.get(st_ty).nominal.def);
+            }
+        }
+        var has_cycle = false;
+        while (worklist.items.len > 0) {
+            const cur = worklist.pop().?;
+            if (DefId.eql(cur, entry.id)) {
+                has_cycle = true;
+                break;
+            }
+            if (visited.contains(cur)) continue;
+            try visited.put(db.gpa, cur, {});
+            const cur_nh = if (cur.pkg == state.pkg_id)
+                state.nominal_headers.get(cur.idx)
+            else
+                db.nominalHeaderOf(cur) catch null;
+            if (cur_nh) |cnh| {
+                for (cnh.supertypes) |st_ty| {
+                    if (db.types.get(st_ty) == .nominal) {
+                        try worklist.append(db.gpa, db.types.get(st_ty).nominal.def);
+                    }
+                }
+            }
+        }
+        if (has_cycle) {
+            try diags.append(a, .{
+                .file = fid,
+                .range = decl_range,
+                .severity = .err,
+                .source = .typeck,
+                .message = "检测到循环继承关系",
+            });
+        }
+    }
+}
+
+/// 单层显式类型消解结果（区分成功、静默传递错误与各类具体诊断错误）。
+pub const TypeResolveResult = union(enum) {
+    ok: TypeId,
+    /// 子节点已出错或循环别名已产生诊断，不再重复报错。
+    err_silent,
+    this_outside_type,
+    invalid_varray_size,
+    invalid_cpointer_args,
+    invalid_cfunc_args,
+    unexpected_type_args,
+    wrong_type_arg_count,
+    not_a_type,
+    inaccessible_type,
+    unknown_type,
+
+    /// 返回当前消解结果对应的规范化 `TypeId`（非 `.ok` 时返回 `TypeInterner.err_ty`）。
+    pub inline fn typeId(self: TypeResolveResult) TypeId {
+        return switch (self) {
+            .ok => |t| t,
+            else => TypeInterner.err_ty,
+        };
+    }
+
+    /// 返回对应的中文诊断提示；成功或静默传递错误返回 `null`。
+    pub fn diagnosticMessage(self: TypeResolveResult) ?[]const u8 {
+        return switch (self) {
+            .ok, .err_silent => null,
+            .this_outside_type => "This 类型只能出现在类型或 extend 声明内部",
+            .invalid_varray_size => "VArray 长度必须为合法非负整数",
+            .invalid_cpointer_args => "CPointer 必须恰好包含 1 个类型实参",
+            .invalid_cfunc_args => "CFunc 必须恰好包含 1 个函数类型实参",
+            .unexpected_type_args => "非泛型类型不允许提供类型实参",
+            .wrong_type_arg_count => "泛型类型实参个数与声明不匹配",
+            .not_a_type => "该标识符不是类型声明",
+            .inaccessible_type => "目标类型在当前作用域不可访问",
+            .unknown_type => "未找到指定的类型名称",
+        };
+    }
+};
+
 /// 构造 `FuncItem` 的头部签名 `CallableHeaderSig`（含无函数体返回类型强校验）。
 pub fn buildFuncHeaderSig(
     env: *const TypeResolveEnv,
@@ -1619,7 +1907,7 @@ pub fn buildFuncHeaderSig(
     diags: *std.ArrayListUnmanaged(common.Diagnostic),
     fid: common.FileId,
 ) PlatformError!*const CallableHeaderSig {
-    const params = try resolveCallableParams(env, a, f.params);
+    const params = try resolveCallableParams(env, a, f.params, diags, fid);
     const wbs = try resolveWhereBounds(env, a, f.where_clause);
     var explicit_ret: ?TypeId = null;
     if (f.ret_type) |rt| {
@@ -1649,17 +1937,32 @@ pub fn buildFuncHeaderSig(
     return sig;
 }
 
-/// 消解形参列表为 `CallableParamSig` 切片。
+/// 消解形参列表为 `CallableParamSig` 切片（形参省略显式类型标注时发射诊断）。
 pub fn resolveCallableParams(
     env: *const TypeResolveEnv,
     a: std.mem.Allocator,
     params: []const common.Param,
+    diags: ?*std.ArrayListUnmanaged(common.Diagnostic),
+    fid: common.FileId,
 ) PlatformError![]const CallableParamSig {
     var out: std.ArrayListUnmanaged(CallableParamSig) = .empty;
     for (params) |param| {
         if (unwrapHirParam(param)) |hp| {
             const name_id = if (hp.name) |n| try env.db.strings.intern(n.text) else null;
-            const pty = if (hp.ty) |t| try resolveHirTypeInEnv(env, t) else TypeInterner.err_ty;
+            const pty = if (hp.ty) |t|
+                try resolveHirTypeInEnv(env, t)
+            else blk: {
+                if (diags) |d_list| {
+                    try d_list.append(a, .{
+                        .file = fid,
+                        .range = hp.range,
+                        .severity = .err,
+                        .source = .typeck,
+                        .message = "函数或构造器形参缺少显式类型标注",
+                    });
+                }
+                break :blk TypeInterner.err_ty;
+            };
             try out.append(a, .{
                 .name = name_id,
                 .ty = pty,
@@ -1699,7 +2002,7 @@ pub fn resolveHirTypeInEnv(env: *const TypeResolveEnv, ht: *const common.HirType
             TypeInterner.err_ty,
         .option => |opt| blk: {
             const inner = try resolveHirTypeInEnv(env, opt.inner);
-            break :blk try env.db.types.internOption(inner);
+            break :blk if (inner == TypeInterner.err_ty) TypeInterner.err_ty else try env.db.types.internOption(inner);
         },
         .tuple => |tup| blk: {
             const elems = try env.db.gpa.alloc(TypeId, tup.elements.len);
@@ -1722,40 +2025,56 @@ pub fn resolveHirTypeInEnv(env: *const TypeResolveEnv, ht: *const common.HirType
         },
         .varray => |va| blk: {
             const elem = try resolveHirTypeInEnv(env, va.elem);
-            const len = std.fmt.parseInt(u64, va.size, 10) catch 0;
-            break :blk try env.db.types.intern(.{ .varray = .{ .elem = elem, .len = len } });
+            const mag = literal_mod.parseIntegerMagnitude(va.size) orelse break :blk TypeInterner.err_ty;
+            if (mag > @as(u128, @intCast(std.math.maxInt(i64)))) break :blk TypeInterner.err_ty;
+            break :blk try env.db.types.intern(.{ .varray = .{ .elem = elem, .len = @intCast(mag) } });
         },
-        .path => |p| try resolvePathTypeInEnv(env, p),
+        .path => |p| blk: {
+            if (p.segments.len == 0) break :blk TypeInterner.err_ty;
+            const last_seg = p.segments[p.segments.len - 1];
+            const args = try env.db.gpa.alloc(TypeId, last_seg.type_args.len);
+            defer env.db.gpa.free(args);
+            for (last_seg.type_args, 0..) |*ta, i| {
+                args[i] = try resolveHirTypeInEnv(env, ta);
+            }
+            break :blk (try resolvePathTypeSingleLayer(env, p, args)).typeId();
+        },
     };
 }
 
-/// 消解路径类型（支持内建基础类型、`CPointer<T>`、`CFunc<(...) -> R>`、泛型形参、包限定名与类型别名展开）。
-fn resolvePathTypeInEnv(env: *const TypeResolveEnv, p: common.PathType) PlatformError!TypeId {
-    if (p.segments.len == 0) return TypeInterner.err_ty;
+/// 单层路径类型消解（调用方先消解末段类型实参 `resolved_args`），返回带精确失败原因的 `TypeResolveResult`。
+pub fn resolvePathTypeSingleLayer(
+    env: *const TypeResolveEnv,
+    p: common.PathType,
+    resolved_args: []const TypeId,
+) PlatformError!TypeResolveResult {
+    if (p.segments.len == 0) return .err_silent;
     const first = p.segments[0];
 
     // 1. 单段内建关键字与特殊互操作泛型
     if (p.segments.len == 1 and !first.name.is_raw) {
         if (PrimKind.fromKeyword(first.name.text)) |pk| {
-            return TypeInterner.prim(pk);
+            if (resolved_args.len > 0) return .unexpected_type_args;
+            return .{ .ok = TypeInterner.prim(pk) };
         }
-        if (std.mem.eql(u8, first.name.text, "CPointer") and first.type_args.len == 1) {
-            const inner = try resolveHirTypeInEnv(env, &first.type_args[0]);
-            return try env.db.types.intern(.{ .cpointer = inner });
+        if (std.mem.eql(u8, first.name.text, "CPointer")) {
+            if (resolved_args.len != 1) return .invalid_cpointer_args;
+            if (resolved_args[0] == TypeInterner.err_ty) return .err_silent;
+            return .{ .ok = try env.db.types.intern(.{ .cpointer = resolved_args[0] }) };
         }
-        if (std.mem.eql(u8, first.name.text, "CFunc") and first.type_args.len == 1) {
-            const inner = try resolveHirTypeInEnv(env, &first.type_args[0]);
-            if (env.db.types.get(inner) == .func) {
-                const fd = env.db.types.get(inner).func;
-                return try env.db.types.intern(.{ .func = .{ .params = fd.params, .ret = fd.ret, .is_cfunc = true } });
-            }
-            return inner;
+        if (std.mem.eql(u8, first.name.text, "CFunc")) {
+            if (resolved_args.len != 1) return .invalid_cfunc_args;
+            if (resolved_args[0] == TypeInterner.err_ty) return .err_silent;
+            if (env.db.types.get(resolved_args[0]) != .func) return .invalid_cfunc_args;
+            const fd = env.db.types.get(resolved_args[0]).func;
+            return .{ .ok = try env.db.types.intern(.{ .func = .{ .params = fd.params, .ret = fd.ret, .is_cfunc = true } }) };
         }
         if (std.mem.eql(u8, first.name.text, "This")) {
+            if (resolved_args.len > 0) return .unexpected_type_args;
             return if (env.enclosing_this) |owner_def|
-                try env.db.types.intern(.{ .class_this = owner_def })
+                .{ .ok = try env.db.types.intern(.{ .class_this = owner_def }) }
             else
-                TypeInterner.err_ty;
+                .this_outside_type;
         }
     }
 
@@ -1766,70 +2085,104 @@ fn resolvePathTypeInEnv(env: *const TypeResolveEnv, p: common.PathType) Platform
         for (env.type_param_scopes) |tps| {
             for (tps.names, 0..) |nm, idx| {
                 if (nm == first_id) {
-                    return try env.db.types.intern(.{ .type_param = tps.refs[idx] });
+                    if (resolved_args.len > 0) return .unexpected_type_args;
+                    return .{ .ok = try env.db.types.intern(.{ .type_param = tps.refs[idx] }) };
                 }
             }
         }
     }
 
-    // 3. 解析目标类型 DefId（支持 pkg.Type 限定名与当前包/导入查找）
+    // 3. 解析目标类型 DefId（区分未找到、不可访问与非类型符号）
     var target_def: ?DefId = null;
-    const last_seg = p.segments[p.segments.len - 1];
+    var found_inaccessible = false;
+    var found_non_type = false;
+
     if (p.segments.len == 1) {
-        target_def = try lookupTypeDefInEnv(env, first_id);
+        const lookup = try lookupTypeDefDetailedInEnv(env, first_id);
+        target_def = lookup.def;
+        found_inaccessible = lookup.inaccessible;
+        found_non_type = lookup.non_type;
     } else if (p.segments.len == 2) {
+        const last_seg = p.segments[1];
         if (env.explicit_pkg_imports.get(first_id)) |tgt_pkg| {
             if (env.db.packageState(tgt_pkg)) |ps| {
+                const rel = env.db.pkg_interner.relation(env.pkg_state.pkg_id, tgt_pkg);
                 const type_name = try env.db.strings.intern(last_seg.name.text);
                 for (ps.lookupTop(type_name)) |exp| {
+                    if (!access_mod.isVisibleInRelation(exp.vis, rel)) {
+                        if (isTypeDefKind(env.db, exp.def)) found_inaccessible = true;
+                        continue;
+                    }
                     if (isTypeDefKind(env.db, exp.def)) {
                         target_def = exp.def;
                         break;
                     }
+                    found_non_type = true;
                 }
             } else |_| {}
         }
     }
 
-    const def = target_def orelse return TypeInterner.err_ty;
+    const def = target_def orelse {
+        if (found_inaccessible) return .inaccessible_type;
+        if (found_non_type) return .not_a_type;
+        return .unknown_type;
+    };
 
-    // 消解末段类型实参
-    const args = try env.db.gpa.alloc(TypeId, last_seg.type_args.len);
-    defer env.db.gpa.free(args);
-    for (last_seg.type_args, 0..) |*ta, i| {
-        args[i] = try resolveHirTypeInEnv(env, ta);
+    const def_entry = env.db.getDef(def) catch return .err_silent;
+    const expected_tparams = def_entry.type_param_names.len;
+    if (resolved_args.len != expected_tparams) {
+        return if (expected_tparams == 0) .unexpected_type_args else .wrong_type_arg_count;
     }
 
     // 若目标是 type_alias，则按需展开目标类型并替换泛型形参（支持同包前向引用并截断循环别名）
-    const def_entry = env.db.getDef(def) catch return TypeInterner.err_ty;
     if (def_entry.kind == .type_alias) {
         const alias_target = if (def.pkg == env.pkg_state.pkg_id and env.local_alias_eval != null and env.local_alias_ctx != null)
             try env.local_alias_eval.?(env.local_alias_ctx.?, def)
         else
-            env.db.typeAliasTargetOf(def) catch return TypeInterner.err_ty;
-        if (alias_target == TypeInterner.err_ty) return TypeInterner.err_ty;
-        if (args.len == 0) return alias_target;
-        const tah = env.db.typeAliasHeaderOf(def) catch return alias_target;
-        return subtype_mod.substituteNominalParams(env.db, alias_target, tah.type_params, args);
+            env.db.typeAliasTargetOf(def) catch return .err_silent;
+        if (alias_target == TypeInterner.err_ty) return .err_silent;
+        if (resolved_args.len == 0) return .{ .ok = alias_target };
+        const tah = env.db.typeAliasHeaderOf(def) catch return .{ .ok = alias_target };
+        return .{ .ok = try subtype_mod.substituteNominalParams(env.db, alias_target, tah.type_params, resolved_args) };
     }
 
-    const arg_list = try env.db.types.internList(args);
-    return try env.db.types.intern(.{ .nominal = .{ .def = def, .args = arg_list } });
+    const arg_list = try env.db.types.internList(resolved_args);
+    return .{ .ok = try env.db.types.intern(.{ .nominal = .{ .def = def, .args = arg_list } }) };
 }
 
-/// 在 `TypeResolveEnv` 的作用域链（本包顶层 -> 显式导入 -> 通配符导入与 `std.core`）中查找首个可见类型声明 `DefId`。
-pub fn lookupTypeDefInEnv(env: *const TypeResolveEnv, name: InternedId) PlatformError!?DefId {
+/// 详细查找类型声明返回结果。
+const TypeLookupDetail = struct {
+    def: ?DefId = null,
+    inaccessible: bool = false,
+    non_type: bool = false,
+};
+
+/// 在 `TypeResolveEnv` 中查找类型声明，同时区分“不可访问”和“同名非类型符号”。
+fn lookupTypeDefDetailedInEnv(env: *const TypeResolveEnv, name: InternedId) PlatformError!TypeLookupDetail {
+    var detail: TypeLookupDetail = .{};
     // 1. 当前包顶层（含本文件 private 与包内非私有声明）
     for (env.pkg_state.lookupTop(name)) |exp| {
         if (exp.vis == .private) {
-            if (exp.source_file == null or !common.FileId.eql(exp.source_file.?, env.file)) continue;
+            if (exp.source_file == null or !common.FileId.eql(exp.source_file.?, env.file)) {
+                if (isTypeDefKind(env.db, exp.def)) detail.inaccessible = true;
+                continue;
+            }
         }
-        if (isTypeDefKind(env.db, exp.def)) return exp.def;
+        if (isTypeDefKind(env.db, exp.def)) {
+            detail.def = exp.def;
+            return detail;
+        }
+        detail.non_type = true;
     }
     // 2. 当前文件显式具名/别名导入
     if (env.explicit_imports.get(name)) |entries| {
         for (entries) |exp| {
-            if (isTypeDefKind(env.db, exp.def)) return exp.def;
+            if (isTypeDefKind(env.db, exp.def)) {
+                detail.def = exp.def;
+                return detail;
+            }
+            detail.non_type = true;
         }
     }
     // 3. 当前文件通配符导入（含隐式 std.core）
@@ -1837,11 +2190,23 @@ pub fn lookupTypeDefInEnv(env: *const TypeResolveEnv, name: InternedId) Platform
         const ps = env.db.packageState(gp) catch continue;
         const rel = env.db.pkg_interner.relation(env.pkg_state.pkg_id, gp);
         for (ps.lookupTop(name)) |exp| {
-            if (!access_mod.isVisibleInRelation(exp.vis, rel)) continue;
-            if (isTypeDefKind(env.db, exp.def)) return exp.def;
+            if (!access_mod.isVisibleInRelation(exp.vis, rel)) {
+                if (isTypeDefKind(env.db, exp.def)) detail.inaccessible = true;
+                continue;
+            }
+            if (isTypeDefKind(env.db, exp.def)) {
+                detail.def = exp.def;
+                return detail;
+            }
+            detail.non_type = true;
         }
     }
-    return null;
+    return detail;
+}
+
+/// 在 `TypeResolveEnv` 的作用域链（本包顶层 -> 显式导入 -> 通配符导入与 `std.core`）中查找首个可见类型声明 `DefId`。
+pub fn lookupTypeDefInEnv(env: *const TypeResolveEnv, name: InternedId) PlatformError!?DefId {
+    return (try lookupTypeDefDetailedInEnv(env, name)).def;
 }
 
 /// 判定给定 `DefId` 是否属于类型声明（`class`/`struct`/`enum`/`interface`/`type_alias`）。

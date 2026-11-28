@@ -99,6 +99,10 @@ pub const Database = struct {
     /// 跨文件省略返回类型与省略绑定类型的记忆化推导缓存（键含 `DefId.pkg_gen`）。
     inferred_ret_cache: std.AutoHashMapUnmanaged(DefId, InferState) = .empty,
     inferred_var_cache: std.AutoHashMapUnmanaged(DefId, InferState) = .empty,
+    /// 当前活跃的按需推导调用链（同时涵盖省略返回类型函数与省略类型变量，用于精确切分实际参与环路的成员）。
+    active_infer_chain: std.ArrayListUnmanaged(DefId) = .empty,
+    /// 记录在省略返回类型或省略变量类型推导中参与递归环路的声明 `DefId`（供类型检查阶段发射循环推导诊断）。
+    cyclic_inferred_defs: std.AutoHashMapUnmanaged(DefId, void) = .empty,
     /// 类型别名展开三色缓存（拦截循环 `type A = B; type B = A`）。
     type_alias_cache: std.AutoHashMapUnmanaged(DefId, InferState) = .empty,
 
@@ -148,6 +152,8 @@ pub const Database = struct {
         self.building_pkg_states.deinit(self.gpa);
         self.inferred_ret_cache.deinit(self.gpa);
         self.inferred_var_cache.deinit(self.gpa);
+        self.active_infer_chain.deinit(self.gpa);
+        self.cyclic_inferred_defs.deinit(self.gpa);
         self.type_alias_cache.deinit(self.gpa);
 
         self.types.deinit();
@@ -226,6 +232,8 @@ pub const Database = struct {
         // 1. 清空推导缓存并失效全部文件语义层与视图层
         self.inferred_ret_cache.clearRetainingCapacity();
         self.inferred_var_cache.clearRetainingCapacity();
+        self.active_infer_chain.clearRetainingCapacity();
+        self.cyclic_inferred_defs.clearRetainingCapacity();
         self.type_alias_cache.clearRetainingCapacity();
 
         var fs_it = self.file_states.valueIterator();
@@ -433,6 +441,7 @@ pub const Database = struct {
             for (ps.defs) |de| {
                 _ = self.inferred_ret_cache.fetchRemove(de.id);
                 _ = self.inferred_var_cache.fetchRemove(de.id);
+                _ = self.cyclic_inferred_defs.fetchRemove(de.id);
             }
         }
     }
@@ -444,6 +453,7 @@ pub const Database = struct {
         for (defs) |def_id| {
             _ = self.inferred_ret_cache.fetchRemove(def_id);
             _ = self.inferred_var_cache.fetchRemove(def_id);
+            _ = self.cyclic_inferred_defs.fetchRemove(def_id);
             _ = self.type_alias_cache.fetchRemove(def_id);
         }
     }
@@ -481,6 +491,7 @@ pub const Database = struct {
                 for (ps.defs) |de| {
                     _ = self.inferred_ret_cache.fetchRemove(de.id);
                     _ = self.inferred_var_cache.fetchRemove(de.id);
+                    _ = self.cyclic_inferred_defs.fetchRemove(de.id);
                     _ = self.type_alias_cache.fetchRemove(de.id);
                 }
                 _ = self.packages.fetchRemove(pkg);
@@ -704,6 +715,19 @@ pub const Database = struct {
         return ps.prop_types.get(def.idx) orelse error.InvalidDefId;
     }
 
+    /// 将 `active_infer_chain` 中自目标环路入口 `cycle_head` 起至当前末尾的全部成员登记到 `cyclic_inferred_defs`。
+    pub fn markInferCycleFrom(self: *Database, cycle_head: DefId) std.mem.Allocator.Error!void {
+        try self.cyclic_inferred_defs.put(self.gpa, cycle_head, {});
+        for (self.active_infer_chain.items, 0..) |item, idx| {
+            if (DefId.eql(item, cycle_head)) {
+                for (self.active_infer_chain.items[idx..]) |member| {
+                    try self.cyclic_inferred_defs.put(self.gpa, member, {});
+                }
+                return;
+            }
+        }
+    }
+
     /// 按需获取函数、方法或构造器的返回类型：显式标注时 `O(1)` 返回；
     /// 省略返回类型时触发按需推导与三色环路截断。
     pub fn returnTypeOf(self: *Database, def: DefId) PlatformError!TypeId {
@@ -713,12 +737,17 @@ pub const Database = struct {
         if (self.inferred_ret_cache.get(def)) |st| {
             return switch (st) {
                 .computed => |ty| ty,
-                .computing => TypeInterner.err_ty,
+                .computing => blk: {
+                    try self.markInferCycleFrom(def);
+                    break :blk TypeInterner.err_ty;
+                },
                 .uncomputed => unreachable,
             };
         }
 
         try self.inferred_ret_cache.put(self.gpa, def, .computing);
+        try self.active_infer_chain.append(self.gpa, def);
+        defer _ = self.active_infer_chain.pop();
         const inferred = checker_mod.inferFuncReturnType(self, def) catch |err| {
             _ = self.inferred_ret_cache.fetchRemove(def);
             return err;
@@ -737,12 +766,17 @@ pub const Database = struct {
         if (self.inferred_var_cache.get(def)) |st| {
             return switch (st) {
                 .computed => |ty| ty,
-                .computing => TypeInterner.err_ty,
+                .computing => blk: {
+                    try self.markInferCycleFrom(def);
+                    break :blk TypeInterner.err_ty;
+                },
                 .uncomputed => unreachable,
             };
         }
 
         try self.inferred_var_cache.put(self.gpa, def, .computing);
+        try self.active_infer_chain.append(self.gpa, def);
+        defer _ = self.active_infer_chain.pop();
         const inferred = checker_mod.inferVarType(self, def) catch |err| {
             _ = self.inferred_var_cache.fetchRemove(def);
             return err;

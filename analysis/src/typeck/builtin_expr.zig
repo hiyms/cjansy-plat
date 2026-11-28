@@ -95,6 +95,9 @@ pub fn checkArrayLit(
         .has_error => TypeInterner.err_ty,
     };
     const arr_ty = try db.types.internArray(joined);
+    if (expected) |exp| {
+        try checker.checkAssignable(al.range, arr_ty, exp);
+    }
     checker.setNodeType(al.id, arr_ty);
     return arr_ty;
 }
@@ -119,13 +122,18 @@ pub fn checkCoalescing(
         return TypeInterner.err_ty;
     };
 
-    const rhs_target = if (expected) |exp| blk: {
-        if (try subtype_mod.isSubtype(db, file, payload, exp, .{})) break :blk exp;
-        break :blk payload;
-    } else payload;
+    if (expected) |exp| {
+        if (try subtype_mod.isSubtype(db, file, payload, exp, .{})) {
+            _ = try checker.checkExpr(bin.rhs, exp);
+            return exp;
+        }
+        _ = try checker.checkExpr(bin.rhs, payload);
+        try checker.checkAssignable(bin.range, payload, exp);
+        return payload;
+    }
 
-    _ = try checker.checkExpr(bin.rhs, rhs_target);
-    return rhs_target;
+    _ = try checker.checkExpr(bin.rhs, payload);
+    return payload;
 }
 
 /// 检查区间表达式 `a..b:step` / `a..=b:step` 并绑定至 `std.core.Range<T>`。
@@ -156,16 +164,42 @@ pub fn checkRangeExpr(
     if (elem_ty == null) {
         const start_ty = if (re.start) |s| try checker.synthExpr(s, .none) else null;
         const end_ty = if (re.end) |e| try checker.synthExpr(e, .none) else null;
-        if (start_ty != null and start_ty.? != TypeInterner.nothing_ty and !db.types.hasIdeal(start_ty.?)) {
+        if (start_ty != null and start_ty.? != TypeInterner.err_ty and start_ty.? != TypeInterner.nothing_ty and !db.types.hasIdeal(start_ty.?)) {
             elem_ty = start_ty.?;
-        } else if (end_ty != null and end_ty.? != TypeInterner.nothing_ty and !db.types.hasIdeal(end_ty.?)) {
+            if (re.end) |e| {
+                if (end_ty != null and end_ty.? != TypeInterner.err_ty) {
+                    if (db.types.hasIdeal(end_ty.?)) {
+                        _ = try checker.checkExpr(e, elem_ty.?);
+                    } else {
+                        try checker.checkAssignable(e.range(), end_ty.?, elem_ty.?);
+                    }
+                }
+            }
+        } else if (end_ty != null and end_ty.? != TypeInterner.err_ty and end_ty.? != TypeInterner.nothing_ty and !db.types.hasIdeal(end_ty.?)) {
             elem_ty = end_ty.?;
+            if (re.start) |s| {
+                if (start_ty != null and start_ty.? != TypeInterner.err_ty) {
+                    if (db.types.hasIdeal(start_ty.?)) {
+                        _ = try checker.checkExpr(s, elem_ty.?);
+                    } else {
+                        try checker.checkAssignable(s.range(), start_ty.?, elem_ty.?);
+                    }
+                }
+            }
+        } else if ((start_ty != null and start_ty.? == TypeInterner.err_ty) or (end_ty != null and end_ty.? == TypeInterner.err_ty)) {
+            elem_ty = TypeInterner.err_ty;
         } else {
             elem_ty = TypeInterner.int64_ty;
         }
     } else {
         if (re.start) |s| _ = try checker.checkExpr(s, elem_ty.?);
         if (re.end) |e| _ = try checker.checkExpr(e, elem_ty.?);
+    }
+
+    if (elem_ty) |et| {
+        if (et != TypeInterner.err_ty and !try isValidRangeElementType(db, file, et)) {
+            try checker.emitDiag(re.range, .err, "区间表达式起止类型必须为整数、Rune 或实现 Countable 接口");
+        }
     }
 
     if (re.step) |st| {
@@ -180,10 +214,30 @@ pub fn checkRangeExpr(
     if (db.types.known.range_struct) |range_def| {
         const args = try db.types.internList(&.{elem_ty.?});
         const range_ty = try db.types.intern(.{ .nominal = .{ .def = range_def, .args = args } });
+        if (expected) |exp| {
+            try checker.checkAssignable(re.range, range_ty, exp);
+        }
         checker.setNodeType(re.id, range_ty);
         return range_ty;
     }
     return TypeInterner.err_ty;
+}
+
+/// 判定类型是否满足 `Range<T>` 元素约束（整数类型、`Rune` 或实现 `Countable` 接口）。
+fn isValidRangeElementType(db: anytype, file: common.FileId, ty: TypeId) PlatformError!bool {
+    return switch (db.types.get(ty)) {
+        .ideal_int => true,
+        .prim => |pk| pk.isInteger() or pk == .rune or pk == .nothing,
+        .nominal, .type_param => blk: {
+            if (db.types.known.countable_iface) |cnt_def| {
+                const promoted = try subtype_mod.promote(db, db.gpa, file, ty, cnt_def);
+                defer db.gpa.free(promoted);
+                break :blk promoted.len > 0;
+            }
+            break :blk false;
+        },
+        else => false,
+    };
 }
 
 /// 检查 `for (pattern in iterable) where guard { body }`（返回类型恒为 `Unit`）。
@@ -222,6 +276,9 @@ pub fn checkForInExpr(
                 }
             },
             else => {},
+        }
+        if (elem_ty == TypeInterner.err_ty) {
+            try checker.emitDiag(fi.iterable.range(), .err, "for-in 迭代源类型未实现 Iterable 接口");
         }
     }
 
@@ -274,6 +331,8 @@ pub fn checkTryExpr(
                 if (res.init) |ie| _ = try checker.checkExpr(ie, r_ty);
             } else if (res.init) |ie| {
                 r_ty = try db.types.replaceIdeal(try checker.synthExpr(ie, .none));
+            } else {
+                try checker.emitDiag(res.range, .err, "资源声明缺少类型标注或初始化表达式");
             }
             if (res_ty_opt) |res_iface_ty| {
                 if (r_ty != TypeInterner.err_ty and !try subtype_mod.isSubtype(db, file, r_ty, res_iface_ty, .{})) {
@@ -298,6 +357,9 @@ pub fn checkTryExpr(
             }
         }
         if (te.finally) |fin| _ = try checker.synthBlock(fin, .unused);
+        if (expected) |exp| {
+            try checker.checkAssignable(te.range, TypeInterner.unit_ty, exp);
+        }
         checker.setNodeType(te.id, TypeInterner.unit_ty);
         return TypeInterner.unit_ty;
     }
@@ -406,12 +468,20 @@ pub fn checkSpawnExpr(
         break :blk rt;
     } else blk: {
         const task_ty = try checker.synthExpr(sp.task, .none);
-        break :blk if (db.types.get(task_ty) == .func) db.types.get(task_ty).func.ret else TypeInterner.unit_ty;
+        if (task_ty == TypeInterner.err_ty) break :blk TypeInterner.err_ty;
+        if (db.types.get(task_ty) == .func and db.types.getList(db.types.get(task_ty).func.params).len == 0) {
+            break :blk db.types.get(task_ty).func.ret;
+        }
+        try checker.emitDiag(sp.task.range(), .err, "spawn 任务表达式必须为无参函数类型");
+        break :blk TypeInterner.err_ty;
     };
 
     if (db.types.known.future_class) |fut_def| {
         const args = try db.types.internList(&.{task_ret});
         const fut_ty = try db.types.intern(.{ .nominal = .{ .def = fut_def, .args = args } });
+        if (expected) |exp| {
+            try checker.checkAssignable(sp.range, fut_ty, exp);
+        }
         checker.setNodeType(sp.id, fut_ty);
         return fut_ty;
     }

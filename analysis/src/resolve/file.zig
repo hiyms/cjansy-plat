@@ -16,6 +16,7 @@ const scope_mod = @import("scope.zig");
 const package_mod = @import("package.zig");
 const access_mod = @import("access.zig");
 const type_interner_mod = @import("../interner/TypeInterner.zig");
+const literal_mod = @import("../typeck/literal.zig");
 
 const CallableHeaderSig = pkg_state_mod.CallableHeaderSig;
 const Database = db_mod.Database;
@@ -146,57 +147,132 @@ const FileResolver = struct {
         });
     }
 
-    /// 消解单个 `HirType` 并写入 `resolved_types` 同时记录类型路径段定位。
+    /// 逐层消解单个 `HirType`、写入 `resolved_types`、记录类型路径段定位并在消解失败时发射诊断。
     fn resolveTypeNode(self: *FileResolver, item_id: common.ItemId, ht: *const common.HirType) PlatformError!TypeId {
         const env = self.currentTypeEnv();
-        const ty = try package_mod.resolveHirTypeInEnv(&env, ht);
-        try self.resolved_types.put(self.arena, .{ .item = item_id, .hir = ht.id() }, ty);
+        var ty: TypeId = TypeInterner.err_ty;
 
         switch (ht.*) {
-            .path => |p| {
-                if (p.segments.len == 1) {
-                    const seg = p.segments[0];
-                    const seg_id = try self.db.strings.intern(seg.name.text);
-                    const alias_hit: ?DefId = blk: {
-                        if (try package_mod.lookupTypeDefInEnv(&env, seg_id)) |td| {
-                            if (self.db.getDef(td)) |de| {
-                                if (de.kind == .type_alias) break :blk td;
-                            } else |_| {}
-                        }
-                        break :blk null;
-                    };
-                    if (alias_hit) |ad| {
-                        try self.recordOcc(seg.name.range, .{ .def = ad }, .type_ref, null);
-                    } else switch (self.db.types.get(ty)) {
-                        .prim => |pk| try self.recordOcc(seg.name.range, .{ .prim = pk }, .type_ref, null),
-                        .nominal => |n| try self.recordOcc(seg.name.range, .{ .def = n.def }, .type_ref, null),
-                        .type_param => |tp| try self.recordOcc(seg.name.range, .{ .type_param = tp }, .type_ref, null),
-                        else => {},
-                    }
-                    for (seg.type_args) |*ta| _ = try self.resolveTypeNode(item_id, ta);
-                } else if (p.segments.len >= 2) {
-                    const first_id = try self.db.strings.intern(p.segments[0].name.text);
-                    if (self.explicit_pkg_imports.get(first_id)) |tgt_pkg| {
-                        try self.recordOcc(p.segments[0].name.range, .{ .pkg = tgt_pkg }, .type_ref, null);
-                    }
-                    const last = p.segments[p.segments.len - 1];
-                    if (self.db.types.get(ty) == .nominal) {
-                        try self.recordOcc(last.name.range, .{ .def = self.db.types.get(ty).nominal.def }, .type_ref, null);
-                    }
-                    for (last.type_args) |*ta| _ = try self.resolveTypeNode(item_id, ta);
+            .this => {
+                if (env.enclosing_this) |owner_def| {
+                    ty = try self.db.types.intern(.{ .class_this = owner_def });
+                } else {
+                    try self.diagnostics.append(self.arena, .{
+                        .file = self.file,
+                        .range = ht.range(),
+                        .severity = .err,
+                        .source = .typeck,
+                        .message = "This 类型只能出现在类型或 extend 声明内部",
+                    });
                 }
             },
-            .option => |o| _ = try self.resolveTypeNode(item_id, o.inner),
+            .option => |o| {
+                const inner = try self.resolveTypeNode(item_id, o.inner);
+                ty = if (inner == TypeInterner.err_ty) TypeInterner.err_ty else try self.db.types.internOption(inner);
+            },
             .tuple => |t| {
-                for (t.elements) |el| _ = try self.resolveTypeNode(item_id, el.ty);
+                const elems = try self.db.gpa.alloc(TypeId, t.elements.len);
+                defer self.db.gpa.free(elems);
+                for (t.elements, 0..) |el, i| {
+                    elems[i] = try self.resolveTypeNode(item_id, el.ty);
+                }
+                ty = try self.db.types.intern(.{ .tuple = try self.db.types.internList(elems) });
             },
             .func => |f| {
-                for (f.params) |param| _ = try self.resolveTypeNode(item_id, param.ty);
-                _ = try self.resolveTypeNode(item_id, f.ret);
+                const params = try self.db.gpa.alloc(TypeId, f.params.len);
+                defer self.db.gpa.free(params);
+                for (f.params, 0..) |param, i| {
+                    params[i] = try self.resolveTypeNode(item_id, param.ty);
+                }
+                const ret = try self.resolveTypeNode(item_id, f.ret);
+                ty = try self.db.types.intern(.{ .func = .{
+                    .params = try self.db.types.internList(params),
+                    .ret = ret,
+                    .is_cfunc = false,
+                } });
             },
-            .varray => |v| _ = try self.resolveTypeNode(item_id, v.elem),
-            .this => {},
+            .varray => |v| {
+                const elem = try self.resolveTypeNode(item_id, v.elem);
+                if (literal_mod.parseIntegerMagnitude(v.size)) |mag| {
+                    if (mag <= @as(u128, @intCast(std.math.maxInt(i64)))) {
+                        ty = try self.db.types.intern(.{ .varray = .{ .elem = elem, .len = @intCast(mag) } });
+                    } else {
+                        try self.diagnostics.append(self.arena, .{
+                            .file = self.file,
+                            .range = v.range,
+                            .severity = .err,
+                            .source = .typeck,
+                            .message = "VArray 长度超出 Int64 非负整数范围",
+                        });
+                    }
+                } else {
+                    try self.diagnostics.append(self.arena, .{
+                        .file = self.file,
+                        .range = v.range,
+                        .severity = .err,
+                        .source = .typeck,
+                        .message = "VArray 长度必须为合法非负整数",
+                    });
+                }
+            },
+            .path => |p| {
+                if (p.segments.len > 0) {
+                    const last_idx = p.segments.len - 1;
+                    for (p.segments[0..last_idx]) |seg| {
+                        for (seg.type_args) |*ta| _ = try self.resolveTypeNode(item_id, ta);
+                    }
+                    const last_seg = p.segments[last_idx];
+                    const resolved_args = try self.db.gpa.alloc(TypeId, last_seg.type_args.len);
+                    defer self.db.gpa.free(resolved_args);
+                    for (last_seg.type_args, 0..) |*ta, i| {
+                        resolved_args[i] = try self.resolveTypeNode(item_id, ta);
+                    }
+
+                    const res = try package_mod.resolvePathTypeSingleLayer(&env, p, resolved_args);
+                    ty = res.typeId();
+                    if (res.diagnosticMessage()) |msg| {
+                        try self.diagnostics.append(self.arena, .{
+                            .file = self.file,
+                            .range = last_seg.name.range,
+                            .severity = .err,
+                            .source = .name_res,
+                            .message = msg,
+                        });
+                    } else if (res == .ok) {
+                        if (p.segments.len == 1) {
+                            const seg = p.segments[0];
+                            const seg_id = try self.db.strings.intern(seg.name.text);
+                            const alias_hit: ?DefId = blk: {
+                                if (try package_mod.lookupTypeDefInEnv(&env, seg_id)) |td| {
+                                    if (self.db.getDef(td)) |de| {
+                                        if (de.kind == .type_alias) break :blk td;
+                                    } else |_| {}
+                                }
+                                break :blk null;
+                            };
+                            if (alias_hit) |ad| {
+                                try self.recordOcc(seg.name.range, .{ .def = ad }, .type_ref, null);
+                            } else switch (self.db.types.get(ty)) {
+                                .prim => |pk| try self.recordOcc(seg.name.range, .{ .prim = pk }, .type_ref, null),
+                                .nominal => |n| try self.recordOcc(seg.name.range, .{ .def = n.def }, .type_ref, null),
+                                .type_param => |tp| try self.recordOcc(seg.name.range, .{ .type_param = tp }, .type_ref, null),
+                                else => {},
+                            }
+                        } else if (p.segments.len >= 2) {
+                            const first_id = try self.db.strings.intern(p.segments[0].name.text);
+                            if (self.explicit_pkg_imports.get(first_id)) |tgt_pkg| {
+                                try self.recordOcc(p.segments[0].name.range, .{ .pkg = tgt_pkg }, .type_ref, null);
+                            }
+                            if (self.db.types.get(ty) == .nominal) {
+                                try self.recordOcc(last_seg.name.range, .{ .def = self.db.types.get(ty).nominal.def }, .type_ref, null);
+                            }
+                        }
+                    }
+                }
+            },
         }
+
+        try self.resolved_types.put(self.arena, .{ .item = item_id, .hir = ht.id() }, ty);
         return ty;
     }
 
@@ -750,6 +826,12 @@ const FileResolver = struct {
                         const sig = try package_mod.buildFuncHeaderSig(&env, self.arena, .{ .local = fn_sym }, tp_refs, f, false, &self.diagnostics, self.file);
                         try self.local_callables.append(self.arena, sig.*);
 
+                        if (f.where_clause) |wc| {
+                            for (wc.constraints) |c| {
+                                _ = try self.resolveTypeNode(item_id, c.subject);
+                                for (c.bounds) |*b| _ = try self.resolveTypeNode(item_id, b);
+                            }
+                        }
                         try self.walkFuncBody(item_id, block_scope, f.params, f.ret_type, f.body);
                     }
                 },
@@ -1172,23 +1254,23 @@ fn resolveTopItem(
     switch (item.*) {
         .class => |c| {
             const def_id = def_opt orelse return;
-            try resolveContainerItem(r, root_scope, item_id, def_id, c.range, null, c.supertypes, c.where_clause, c.members);
+            try resolveContainerItem(r, root_scope, item_id, def_id, c.range, null, c.supertypes, c.where_clause, &.{}, c.members);
         },
         .struct_ => |s| {
             const def_id = def_opt orelse return;
-            try resolveContainerItem(r, root_scope, item_id, def_id, s.range, null, s.interfaces, s.where_clause, s.members);
+            try resolveContainerItem(r, root_scope, item_id, def_id, s.range, null, s.interfaces, s.where_clause, &.{}, s.members);
         },
         .enum_ => |e| {
             const def_id = def_opt orelse return;
-            try resolveContainerItem(r, root_scope, item_id, def_id, e.range, null, e.interfaces, e.where_clause, e.members);
+            try resolveContainerItem(r, root_scope, item_id, def_id, e.range, null, e.interfaces, e.where_clause, e.variants, e.members);
         },
         .interface => |i| {
             const def_id = def_opt orelse return;
-            try resolveContainerItem(r, root_scope, item_id, def_id, i.range, null, i.interfaces, i.where_clause, i.members);
+            try resolveContainerItem(r, root_scope, item_id, def_id, i.range, null, i.interfaces, i.where_clause, &.{}, i.members);
         },
         .extend_ => |ex| {
             const def_id = def_opt orelse return;
-            try resolveContainerItem(r, root_scope, item_id, def_id, ex.range, ex.target, ex.interfaces, ex.where_clause, ex.members);
+            try resolveContainerItem(r, root_scope, item_id, def_id, ex.range, ex.target, ex.interfaces, ex.where_clause, &.{}, ex.members);
         },
         .type_alias => |ta| {
             const def_id = def_opt orelse return;
@@ -1227,6 +1309,14 @@ fn resolveTopItem(
             if (b.ty) |t| _ = try r.resolveTypeNode(item_id, t);
             if (b.init) |ie| try r.walkExpr(item_id, root_scope, ie);
         },
+        .foreign => |fg| {
+            for (fg.members) |*mem| {
+                if (mem.* == .func) {
+                    const f = mem.func;
+                    try r.walkFuncBody(item_id, root_scope, f.params, f.ret_type, null);
+                }
+            }
+        },
         else => {},
     }
 }
@@ -1241,6 +1331,7 @@ fn resolveContainerItem(
     extend_target: ?*const common.HirType,
     supers: []const common.HirType,
     where_clause: ?*const common.WhereClause,
+    variants: []const common.EnumVariant,
     members: []const common.HirItem,
 ) PlatformError!void {
     const entry = r.pkg_state.getDef(def_id.idx) orelse return;
@@ -1266,6 +1357,15 @@ fn resolveContainerItem(
             for (c.bounds) |*b| _ = try r.resolveTypeNode(item_id, b);
         }
     }
+    for (variants) |*v| {
+        if (package_mod.unwrapEnumCtor(v)) |ctor| {
+            for (ctor.payload) |pl| {
+                if (pl == .ty) {
+                    _ = try r.resolveTypeNode(item_id, pl.ty.ty);
+                }
+            }
+        }
+    }
 
     for (members, 0..) |*mem, m_idx| {
         switch (mem.*) {
@@ -1284,6 +1384,12 @@ fn resolveContainerItem(
                 defer if (pushed) {
                     _ = r.tp_scopes.pop();
                 };
+                if (f.where_clause) |wc| {
+                    for (wc.constraints) |c| {
+                        _ = try r.resolveTypeNode(item_id, c.subject);
+                        for (c.bounds) |*b| _ = try r.resolveTypeNode(item_id, b);
+                    }
+                }
                 try r.walkFuncBody(item_id, body_scope, f.params, f.ret_type, f.body);
             },
             .init => |in| try r.walkFuncBody(item_id, body_scope, in.params, null, in.body),

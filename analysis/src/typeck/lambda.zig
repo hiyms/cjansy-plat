@@ -42,7 +42,9 @@ pub fn checkLambda(
     const unboxed = db.types.unboxOption(target_ty);
     const t_data = db.types.get(unboxed);
     if (t_data != .func) {
-        return synthLambda(checker, lam);
+        const syn = try synthLambda(checker, lam);
+        try checker.checkAssignable(lam.range, syn, target_ty);
+        return syn;
     }
 
     const tgt_params = db.types.getList(t_data.func.params);
@@ -72,6 +74,10 @@ pub fn checkLambda(
             checker.setNodeType(hp.id, p_ty);
             idx += 1;
         }
+    }
+
+    if (idx != tgt_params.len) {
+        try checker.emitDiag(lam.range, .err, "Lambda 表达式形参个数与期望函数类型不匹配");
     }
 
     const tgt_ret = t_data.func.ret;

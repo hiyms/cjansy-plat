@@ -44,6 +44,8 @@ pub const CallResolveRequest = struct {
     expected_ret: ?TypeId = null,
     /// 成员调用或扩展调用时的接收者类型。
     receiver_ty: ?TypeId = null,
+    /// 可选预计算实参类型切片（用于二元运算符重载等已提前求值实参的场景，避免重复综合与重复诊断）。
+    precomputed_arg_tys: ?[]const TypeId = null,
 };
 
 /// 重载决议结果（所有切片均借用自 `checker` 临时内存池，在当前声明项检查结束前有效，调用者不得释放）。
@@ -58,9 +60,24 @@ pub const CallResolveOutcome = union(enum) {
     },
     no_match: struct {
         inaccessible_candidates: []const DefId,
+        /// 接收者、显式类型实参或任一实参已含错误类型（用于避免产生重复的级联噪音诊断）。
+        has_err_arg: bool = false,
+        /// 存在形参完全匹配、仅返回类型不满足外层期望类型的候选。
+        matched_ignoring_expected_ret: bool = false,
+        /// 显式类型实参个数与候选泛型形参个数不匹配。
+        wrong_type_arg_count: bool = false,
+        /// 泛型类型实参不满足候选的 `where` 约束上界。
+        where_constraint_failed: bool = false,
     },
     /// 最高 `scope_level` 下存在多个同等具体候选（或存在多个合法枚举构造器）导致二义性。
     ambiguous: []const SymbolRef,
+};
+
+/// 单候选匹配失败时记录的诊断辅助原因。
+const MatchFailureStats = struct {
+    matched_ignoring_expected_ret: bool = false,
+    wrong_type_arg_count: bool = false,
+    where_constraint_failed: bool = false,
 };
 
 const MatchedCandidate = struct {
@@ -129,18 +146,41 @@ pub fn resolveCallOverload(
         }
     }.cmp);
 
-    // 构造完整实参列表（尾随闭包与需要上下文目标类型的数组字面量延迟到形参匹配或重检阶段）
+    // 构造完整实参列表（含未标注形参的 Lambda 与空数组字面量延迟到形参匹配或重检阶段）
     const total_args = req.args.len + @as(usize, if (req.trailing_lambda != null) 1 else 0);
     const arg_tys = try scratch.alloc(TypeId, total_args);
-    for (req.args, 0..) |arg, i| {
-        arg_tys[i] = if (arg.value.* == .array_lit and arg.value.array_lit.elements.len == 0)
-            TypeInterner.quest_ty
-        else
-            try checker.synthExpr(arg.value, .expr_arg);
+    if (req.precomputed_arg_tys) |pre| {
+        for (0..total_args) |i| {
+            arg_tys[i] = if (i < pre.len) pre[i] else TypeInterner.err_ty;
+        }
+    } else {
+        for (req.args, 0..) |arg, i| {
+            arg_tys[i] = if ((arg.value.* == .array_lit and arg.value.array_lit.elements.len == 0) or
+                (arg.value.* == .lambda and lambdaHasUnannotatedParam(arg.value.lambda)))
+                TypeInterner.quest_ty
+            else
+                try checker.synthExpr(arg.value, .expr_arg);
+        }
+        if (req.trailing_lambda) |tl| {
+            arg_tys[req.args.len] = if (tl.* == .lambda and lambdaHasUnannotatedParam(tl.lambda))
+                TypeInterner.quest_ty
+            else
+                try checker.synthExpr(tl, .expr_arg);
+        }
     }
-    if (req.trailing_lambda) |tl| {
-        arg_tys[req.args.len] = if (tl.* == .lambda) TypeInterner.quest_ty else try checker.synthExpr(tl, .expr_arg);
+
+    var has_err_arg = false;
+    if (req.receiver_ty) |rty| {
+        if (db.types.hasErr(rty)) has_err_arg = true;
     }
+    for (req.explicit_type_args) |eta| {
+        if (db.types.hasErr(eta)) has_err_arg = true;
+    }
+    for (arg_tys) |aty| {
+        if (db.types.hasErr(aty)) has_err_arg = true;
+    }
+
+    var fail_stats: MatchFailureStats = .{};
 
     // 3. 普通调用匹配 -> 无匹配时回退变长参数打包匹配
     for ([_]bool{ false, true }) |variadic_mode| {
@@ -157,7 +197,7 @@ pub fn resolveCallOverload(
                 else => continue,
             };
             const sig = db.callableHeaderSig(cref) catch continue;
-            if (try matchSingleCandidate(checker, scratch, req, cand, sig, arg_tys, variadic_mode)) |m| {
+            if (try matchSingleCandidate(checker, scratch, req, cand, sig, arg_tys, variadic_mode, &fail_stats)) |m| {
                 try legals.append(scratch, m);
                 if (matched_level == null) matched_level = cand.scope_level;
             }
@@ -204,7 +244,24 @@ pub fn resolveCallOverload(
         return .{ .ambiguous = refs };
     }
 
-    return .{ .no_match = .{ .inaccessible_candidates = try inaccessible.toOwnedSlice(scratch) } };
+    return .{ .no_match = .{
+        .inaccessible_candidates = try inaccessible.toOwnedSlice(scratch),
+        .has_err_arg = has_err_arg,
+        .matched_ignoring_expected_ret = fail_stats.matched_ignoring_expected_ret,
+        .wrong_type_arg_count = fail_stats.wrong_type_arg_count,
+        .where_constraint_failed = fail_stats.where_constraint_failed,
+    } };
+}
+
+/// 判定 Lambda 表达式是否存在省略类型标注的形参。
+fn lambdaHasUnannotatedParam(lam: common.LambdaExpr) bool {
+    const package_mod = @import("../resolve/package.zig");
+    for (lam.params) |param| {
+        if (package_mod.unwrapHirParam(param)) |hp| {
+            if (hp.ty == null) return true;
+        }
+    }
+    return false;
 }
 
 /// 匹配单个可调用候选（支持位置/命名/默认参数、尾随闭包、变长参数与泛型实参约束求解）。
@@ -216,6 +273,7 @@ fn matchSingleCandidate(
     sig: *const CallableHeaderSig,
     arg_tys: []const TypeId,
     variadic_mode: bool,
+    fail_stats: *MatchFailureStats,
 ) PlatformError!?MatchedCandidate {
     const db = checker.db;
     const params = sig.params;
@@ -223,6 +281,7 @@ fn matchSingleCandidate(
 
     // 显式类型实参个数检查
     if (req.explicit_type_args.len > 0 and req.explicit_type_args.len != sig.type_params.len) {
+        fail_stats.wrong_type_arg_count = true;
         return null;
     }
 
@@ -335,6 +394,22 @@ fn matchSingleCandidate(
             ret_ty = try subtype_mod.substituteNominalParams(db, er, receiver_tps, receiver_targs);
         }
     } else if (req.explicit_type_args.len == sig.type_params.len) {
+        // 校验显式类型实参是否满足 where 上界约束
+        const no_opt_box: subtype_mod.SubtypeOptions = .{ .implicit_boxed = true, .allow_option_box = false };
+        for (sig.where_bounds) |wb| {
+            const subj1 = try subtype_mod.substituteNominalParams(db, wb.subject, receiver_tps, receiver_targs);
+            const subj = try subtype_mod.substituteNominalParams(db, subj1, sig.type_params, req.explicit_type_args);
+            if (subj == TypeInterner.err_ty) continue;
+            for (wb.upper_bounds) |ub| {
+                const ub1 = try subtype_mod.substituteNominalParams(db, ub, receiver_tps, receiver_targs);
+                const ub_inst = try subtype_mod.substituteNominalParams(db, ub1, sig.type_params, req.explicit_type_args);
+                if (ub_inst == TypeInterner.err_ty) continue;
+                if (!try subtype_mod.isSubtype(db, req.file, subj, ub_inst, no_opt_box)) {
+                    fail_stats.where_constraint_failed = true;
+                    return null;
+                }
+            }
+        }
         resolved_type_args = try db.types.internList(req.explicit_type_args);
         for (0..total_args) |i| {
             const p_idx = arg_to_param[i];
@@ -383,7 +458,10 @@ fn matchSingleCandidate(
             const st_tv = try solver.addSolverTy(.{ .ty_var = tv });
             solved_args[i] = try solver.lowerToTypeId(st_tv, &pack);
         }
-        if (!try solver.checkWhereConstraints(sig.where_bounds, &pack, null, null, req.call_range)) return null;
+        if (!try solver.checkWhereConstraints(sig.where_bounds, &pack, null, null, req.call_range)) {
+            fail_stats.where_constraint_failed = true;
+            return null;
+        }
 
         resolved_type_args = try db.types.internList(solved_args);
         for (0..total_args) |i| {
@@ -400,7 +478,10 @@ fn matchSingleCandidate(
             ret_ty = try checker.queryReturnType(cand.ref.def);
         }
         if (ret_ty != TypeInterner.quest_ty and ret_ty != TypeInterner.err_ty) {
-            if (!try subtype_mod.isSubtype(db, req.file, ret_ty, exp_ret, .{})) return null;
+            if (!try subtype_mod.isSubtype(db, req.file, ret_ty, exp_ret, .{})) {
+                fail_stats.matched_ignoring_expected_ret = true;
+                return null;
+            }
         }
     }
 
@@ -474,7 +555,7 @@ fn isMoreSpecific(
     return false;
 }
 
-/// 校验第 `arg_idx` 个调用实参是否兼容目标形参类型 `param_ty`（支持数组字面量双向适配 `VArray<T, $N>`）。
+/// 校验第 `arg_idx` 个调用实参是否兼容目标形参类型 `param_ty`（支持数组字面量双向适配 `VArray<T, $N>` 与延迟 Lambda/空数组形参结构校验）。
 fn argMatchesParam(
     db: *db_mod.Database,
     req: CallResolveRequest,
@@ -482,7 +563,47 @@ fn argMatchesParam(
     arg_ty: TypeId,
     param_ty: TypeId,
 ) PlatformError!bool {
-    if (arg_ty == TypeInterner.quest_ty) return true;
+    if (arg_ty == TypeInterner.quest_ty) {
+        const arg_expr: ?*const common.HirExpr = if (arg_idx < req.args.len)
+            req.args[arg_idx].value
+        else
+            req.trailing_lambda;
+        if (arg_expr) |ae| {
+            const unboxed_p = db.types.unboxOption(param_ty);
+            switch (ae.*) {
+                .lambda => |lam| {
+                    if (db.types.get(unboxed_p) != .func) return false;
+                    const p_list = db.types.getList(db.types.get(unboxed_p).func.params);
+                    const package_mod = @import("../resolve/package.zig");
+                    var lam_arity: usize = 0;
+                    for (lam.params) |p| {
+                        if (package_mod.unwrapHirParam(p) != null) lam_arity += 1;
+                    }
+                    return lam_arity == p_list.len;
+                },
+                .array_lit => |al| {
+                    if (al.elements.len == 0) {
+                        return switch (db.types.get(unboxed_p)) {
+                            .varray => |va| va.len == 0,
+                            .nominal => |nom| blk: {
+                                if (db.types.known.array_struct) |arr_def| {
+                                    if (DefId.eql(nom.def, arr_def)) break :blk true;
+                                    const tgt_def = db.getDef(nom.def) catch break :blk false;
+                                    if (tgt_def.kind == .interface_) {
+                                        break :blk (try subtype_mod.downgrade(db, req.file, arr_def, unboxed_p)) != null;
+                                    }
+                                }
+                                break :blk false;
+                            },
+                            else => false,
+                        };
+                    }
+                },
+                else => {},
+            }
+        }
+        return true;
+    }
     if (try subtype_mod.isSubtype(db, req.file, arg_ty, param_ty, .{})) return true;
 
     // 数组字面量无目标类型综合时默认产出 Array<T>，目标形参为 VArray<T, $N> 时检查长度与元素兼容性
